@@ -214,10 +214,10 @@ private:
 		CPalette();
 		~CPalette();
 
-		void Invalidate(uint32);
 		void Free();
 
 		bool m_live;
+		uint32 m_generation = 0;
 
 		bool m_isIDTEX4;
 		uint32 m_cpsm;
@@ -430,6 +430,8 @@ private:
 
 	TextureCache m_textureCache;
 	PaletteList m_paletteCache;
+	//A CLUT transfer makes every palette stale: they stay live only while their generation is current.
+	uint32 m_paletteGeneration = 0;
 	FramebufferList m_framebuffers;
 	DepthbufferList m_depthbuffers;
 
@@ -474,6 +476,36 @@ private:
 	Framework::OpenGl::CBuffer m_vertexParamsBuffer;
 	Framework::OpenGl::CBuffer m_fragmentParamsBuffer;
 	VertexBuffer m_vertexBuffer;
+
+	//Draw data is appended to buffers allocated once instead of giving each draw new storage,
+	//which drivers such as Adreno's turn into a GPU memory allocation per draw.
+	enum
+	{
+		STREAM_SEGMENTS = 8,
+	};
+	struct STREAM_BUFFER
+	{
+		GLsizeiptr size = 0;
+		GLintptr offset = 0;
+		uint8* mapped = nullptr;
+		unsigned int segment = 0;
+		GLsync fences[STREAM_SEGMENTS] = {};
+	};
+	void CreateStreamBuffer(GLuint, STREAM_BUFFER&, GLenum, GLsizeiptr);
+	void ReleaseStreamBuffer(STREAM_BUFFER&);
+	GLintptr StreamData(GLuint, STREAM_BUFFER&, GLenum, const void*, GLsizeiptr, GLsizeiptr);
+	void UploadCvtBuffer(unsigned int, unsigned int, unsigned int, unsigned int, GLenum, GLenum, unsigned int);
+	bool m_hasBufferStorageExtension = false;
+
+	STREAM_BUFFER m_primStream;
+	STREAM_BUFFER m_vertexParamsStream;
+	STREAM_BUFFER m_fragmentParamsStream;
+	Framework::OpenGl::CBuffer m_unpackBuffer;
+	STREAM_BUFFER m_unpackStream;
+	GLintptr m_vertexParamsOffset = 0;
+	GLintptr m_fragmentParamsOffset = 0;
+	GLint m_uniformBufferAlignment = 256;
+
 
 	//If GPU has framebuffer fetch extension, some things will be done
 	//within the shader, such alpha blending

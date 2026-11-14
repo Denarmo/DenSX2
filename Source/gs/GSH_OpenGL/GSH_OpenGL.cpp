@@ -7,6 +7,9 @@
 #include "../GsPixelFormats.h"
 #include "../GsTransferRange.h"
 #include "GSH_OpenGL.h"
+#ifdef __ANDROID__
+#include <GLES2/gl2ext.h>
+#endif
 
 #ifdef USE_DUALSOURCE_BLENDING
 //Dual source blending constants
@@ -102,6 +105,11 @@ void CGSH_OpenGL::ReleaseImpl()
 	m_copyToFbTexture.Reset();
 	m_copyToFbVertexBuffer.Reset();
 	m_copyToFbVertexArray.Reset();
+	ReleaseStreamBuffer(m_primStream);
+	ReleaseStreamBuffer(m_vertexParamsStream);
+	ReleaseStreamBuffer(m_fragmentParamsStream);
+	ReleaseStreamBuffer(m_unpackStream);
+	m_unpackBuffer.Reset();
 	m_primBuffer.Reset();
 	m_primVertexArray.Reset();
 	m_vertexParamsBuffer.Reset();
@@ -304,6 +312,16 @@ void CGSH_OpenGL::InitializeRC()
 	m_vertexParamsBuffer = GenerateUniformBlockBuffer(sizeof(VERTEXPARAMS));
 	m_fragmentParamsBuffer = GenerateUniformBlockBuffer(sizeof(FRAGMENTPARAMS));
 
+	glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &m_uniformBufferAlignment);
+	if(m_uniformBufferAlignment <= 0) m_uniformBufferAlignment = 256;
+	CreateStreamBuffer(m_primBuffer, m_primStream, GL_ARRAY_BUFFER, 0x1000000);
+	CreateStreamBuffer(m_vertexParamsBuffer, m_vertexParamsStream, GL_UNIFORM_BUFFER, 0x400000);
+	CreateStreamBuffer(m_fragmentParamsBuffer, m_fragmentParamsStream, GL_UNIFORM_BUFFER, 0x400000);
+	m_unpackBuffer = Framework::OpenGl::CBuffer::Create();
+	CreateStreamBuffer(m_unpackBuffer, m_unpackStream, GL_PIXEL_UNPACK_BUFFER, 0x2000000);
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+	m_validGlState &= ~(GLSTATE_VERTEX_PARAMS | GLSTATE_FRAGMENT_PARAMS);
+
 	PresentBackbuffer();
 
 	CHECKGLERROR();
@@ -323,6 +341,10 @@ void CGSH_OpenGL::CheckExtensions()
 		else if(!strcmp(extensionName, "GL_ARM_shader_framebuffer_fetch_depth_stencil"))
 		{
 			m_hasFramebufferFetchDepthExtension = true;
+		}
+		else if(!strcmp(extensionName, "GL_EXT_buffer_storage"))
+		{
+			m_hasBufferStorageExtension = true;
 		}
 	}
 }
@@ -1726,16 +1748,18 @@ void CGSH_OpenGL::DoRenderPass()
 {
 	if((m_validGlState & GLSTATE_VERTEX_PARAMS) == 0)
 	{
-		glBindBuffer(GL_UNIFORM_BUFFER, m_vertexParamsBuffer);
-		glBufferData(GL_UNIFORM_BUFFER, sizeof(VERTEXPARAMS), &m_vertexParams, GL_STREAM_DRAW);
+		m_vertexParamsOffset = StreamData(m_vertexParamsBuffer, m_vertexParamsStream, GL_UNIFORM_BUFFER,
+		                                  &m_vertexParams, sizeof(VERTEXPARAMS), m_uniformBufferAlignment);
+		glBindBufferRange(GL_UNIFORM_BUFFER, 0, m_vertexParamsBuffer, m_vertexParamsOffset, sizeof(VERTEXPARAMS));
 		CHECKGLERROR();
 		m_validGlState |= GLSTATE_VERTEX_PARAMS;
 	}
 
 	if((m_validGlState & GLSTATE_FRAGMENT_PARAMS) == 0)
 	{
-		glBindBuffer(GL_UNIFORM_BUFFER, m_fragmentParamsBuffer);
-		glBufferData(GL_UNIFORM_BUFFER, sizeof(FRAGMENTPARAMS), &m_fragmentParams, GL_STREAM_DRAW);
+		m_fragmentParamsOffset = StreamData(m_fragmentParamsBuffer, m_fragmentParamsStream, GL_UNIFORM_BUFFER,
+		                                    &m_fragmentParams, sizeof(FRAGMENTPARAMS), m_uniformBufferAlignment);
+		glBindBufferRange(GL_UNIFORM_BUFFER, 1, m_fragmentParamsBuffer, m_fragmentParamsOffset, sizeof(FRAGMENTPARAMS));
 		CHECKGLERROR();
 		m_validGlState |= GLSTATE_FRAGMENT_PARAMS;
 	}
@@ -1812,11 +1836,8 @@ void CGSH_OpenGL::DoRenderPass()
 		m_validGlState |= GLSTATE_FRAMEBUFFER;
 	}
 
-	glBindBufferBase(GL_UNIFORM_BUFFER, 0, m_vertexParamsBuffer);
-	glBindBufferBase(GL_UNIFORM_BUFFER, 1, m_fragmentParamsBuffer);
-
-	glBindBuffer(GL_ARRAY_BUFFER, m_primBuffer);
-	glBufferData(GL_ARRAY_BUFFER, sizeof(PRIM_VERTEX) * m_vertexBuffer.size(), m_vertexBuffer.data(), GL_STREAM_DRAW);
+	auto vertexOffset = StreamData(m_primBuffer, m_primStream, GL_ARRAY_BUFFER,
+	                               m_vertexBuffer.data(), sizeof(PRIM_VERTEX) * m_vertexBuffer.size(), sizeof(PRIM_VERTEX));
 
 	glBindVertexArray(m_primVertexArray);
 
@@ -1841,9 +1862,80 @@ void CGSH_OpenGL::DoRenderPass()
 		break;
 	}
 
-	glDrawArrays(primitiveMode, 0, m_vertexBuffer.size());
+	glDrawArrays(primitiveMode, vertexOffset / sizeof(PRIM_VERTEX), m_vertexBuffer.size());
 
 	m_drawCallCount++;
+}
+
+void CGSH_OpenGL::CreateStreamBuffer(GLuint buffer, STREAM_BUFFER& stream, GLenum target, GLsizeiptr size)
+{
+	ReleaseStreamBuffer(stream);
+	stream = STREAM_BUFFER();
+#ifdef __ANDROID__
+	static auto bufferStorage = reinterpret_cast<PFNGLBUFFERSTORAGEEXTPROC>(eglGetProcAddress("glBufferStorageEXT"));
+	if(!m_hasBufferStorageExtension || !bufferStorage) return;
+	const GLbitfield flags = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT_EXT | GL_MAP_COHERENT_BIT_EXT;
+	glBindBuffer(target, buffer);
+	bufferStorage(target, size, nullptr, flags);
+	stream.mapped = reinterpret_cast<uint8*>(glMapBufferRange(target, 0, size, flags));
+	if(stream.mapped) stream.size = size;
+#endif
+}
+
+void CGSH_OpenGL::UploadCvtBuffer(unsigned int texX, unsigned int texY, unsigned int texWidth, unsigned int texHeight,
+                                  GLenum format, GLenum type, unsigned int bytesPerPixel)
+{
+	//Uploading from client memory makes some drivers (Adreno) allocate and map new memory for every update.
+	GLsizeiptr size = ((texWidth * bytesPerPixel + 3) & ~3) * texHeight;
+	if(!m_unpackStream.mapped || (size > (m_unpackStream.size / STREAM_SEGMENTS)))
+	{
+		glTexSubImage2D(GL_TEXTURE_2D, 0, texX, texY, texWidth, texHeight, format, type, m_pCvtBuffer);
+		return;
+	}
+	auto offset = StreamData(m_unpackBuffer, m_unpackStream, GL_PIXEL_UNPACK_BUFFER, m_pCvtBuffer, size, 16);
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_unpackBuffer);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, texX, texY, texWidth, texHeight, format, type, reinterpret_cast<const void*>(offset));
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+}
+
+void CGSH_OpenGL::ReleaseStreamBuffer(STREAM_BUFFER& stream)
+{
+	for(auto& fence : stream.fences)
+	{
+		if(fence) glDeleteSync(fence);
+		fence = nullptr;
+	}
+}
+
+GLintptr CGSH_OpenGL::StreamData(GLuint buffer, STREAM_BUFFER& stream, GLenum target, const void* data, GLsizeiptr size, GLsizeiptr alignment)
+{
+	if(!stream.mapped || (size > (stream.size / STREAM_SEGMENTS)))
+	{
+		glBindBuffer(target, buffer);
+		glBufferData(target, size, data, GL_STREAM_DRAW);
+		return 0;
+	}
+	GLintptr offset = ((stream.offset + alignment - 1) / alignment) * alignment;
+	if((offset + size) > stream.size) offset = 0;
+	//Before writing into a segment, wait until the GPU is done with what was written there on the previous lap.
+	auto segmentSize = stream.size / STREAM_SEGMENTS;
+	unsigned int lastSegment = (offset + size - 1) / segmentSize;
+	while(stream.segment != lastSegment)
+	{
+		stream.fences[stream.segment] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+		stream.segment = (stream.segment + 1) % STREAM_SEGMENTS;
+		if(auto& fence = stream.fences[stream.segment])
+		{
+			while(glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000) == GL_TIMEOUT_EXPIRED)
+			{
+			}
+			glDeleteSync(fence);
+			fence = nullptr;
+		}
+	}
+	memcpy(stream.mapped + offset, data, size);
+	stream.offset = offset + size;
+	return offset;
 }
 
 void CGSH_OpenGL::DrawToDepth(unsigned int primitiveType, uint64 primReg)

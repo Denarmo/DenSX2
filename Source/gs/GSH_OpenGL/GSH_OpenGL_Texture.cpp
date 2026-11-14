@@ -319,7 +319,7 @@ void CGSH_OpenGL::TexUpdater_Psm32(uint32 bufPtr, uint32 bufWidth, unsigned int 
 		dst += texWidth;
 	}
 
-	glTexSubImage2D(GL_TEXTURE_2D, 0, texX, texY, texWidth, texHeight, GL_RGBA, GL_UNSIGNED_BYTE, m_pCvtBuffer);
+	UploadCvtBuffer(texX, texY, texWidth, texHeight, GL_RGBA, GL_UNSIGNED_BYTE, 4);
 	CHECKGLERROR();
 }
 
@@ -345,7 +345,7 @@ void CGSH_OpenGL::TexUpdater_Psm16(uint32 bufPtr, uint32 bufWidth, unsigned int 
 		dst += texWidth;
 	}
 
-	glTexSubImage2D(GL_TEXTURE_2D, 0, texX, texY, texWidth, texHeight, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, m_pCvtBuffer);
+	UploadCvtBuffer(texX, texY, texWidth, texHeight, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, 2);
 	CHECKGLERROR();
 }
 
@@ -590,7 +590,7 @@ void CGSH_OpenGL::TexUpdater_Psm8(uint32 bufPtr, uint32 bufWidth, unsigned int t
 		dst += texWidth * 16;
 	}
 
-	glTexSubImage2D(GL_TEXTURE_2D, 0, texX, texY, texWidth, texHeight, GL_RED, GL_UNSIGNED_BYTE, m_pCvtBuffer);
+	UploadCvtBuffer(texX, texY, texWidth, texHeight, GL_RED, GL_UNSIGNED_BYTE, 1);
 	CHECKGLERROR();
 }
 
@@ -631,7 +631,7 @@ void CGSH_OpenGL::TexUpdater_Psm4(unsigned int bufPtr, unsigned int bufWidth, un
 
 		dst += texWidth * 16;
 	}
-	glTexSubImage2D(GL_TEXTURE_2D, 0, texX, texY, texWidth, texHeight, GL_RED, GL_UNSIGNED_BYTE, m_pCvtBuffer);
+	UploadCvtBuffer(texX, texY, texWidth, texHeight, GL_RED, GL_UNSIGNED_BYTE, 1);
 	CHECKGLERROR();
 }
 
@@ -652,7 +652,7 @@ void CGSH_OpenGL::TexUpdater_Psm48(uint32 bufPtr, uint32 bufWidth, unsigned int 
 		dst += texWidth;
 	}
 
-	glTexSubImage2D(GL_TEXTURE_2D, 0, texX, texY, texWidth, texHeight, GL_RED, GL_UNSIGNED_BYTE, m_pCvtBuffer);
+	UploadCvtBuffer(texX, texY, texWidth, texHeight, GL_RED, GL_UNSIGNED_BYTE, 1);
 	CHECKGLERROR();
 }
 
@@ -674,7 +674,7 @@ void CGSH_OpenGL::TexUpdater_Psm48H(uint32 bufPtr, uint32 bufWidth, unsigned int
 		dst += texWidth;
 	}
 
-	glTexSubImage2D(GL_TEXTURE_2D, 0, texX, texY, texWidth, texHeight, GL_RED, GL_UNSIGNED_BYTE, m_pCvtBuffer);
+	UploadCvtBuffer(texX, texY, texWidth, texHeight, GL_RED, GL_UNSIGNED_BYTE, 1);
 	CHECKGLERROR();
 }
 
@@ -706,13 +706,6 @@ void CGSH_OpenGL::CPalette::Free()
 	}
 }
 
-void CGSH_OpenGL::CPalette::Invalidate(uint32 csa)
-{
-	if(!m_live) return;
-
-	m_live = false;
-}
-
 /////////////////////////////////////////////////////////////
 // Palette Caching
 /////////////////////////////////////////////////////////////
@@ -722,14 +715,16 @@ GLuint CGSH_OpenGL::PalCache_Search(const TEX0& tex0)
 	for(auto paletteIterator(m_paletteCache.begin());
 	    paletteIterator != m_paletteCache.end(); paletteIterator++)
 	{
-		auto palette = *paletteIterator;
+		const auto& palette = *paletteIterator;
+		//Palettes used since the last invalidation are kept at the front.
+		if(palette->m_generation != m_paletteGeneration) break;
 		if(!palette->m_live) continue;
 		if(CGsPixelFormats::IsPsmIDTEX4(tex0.nPsm) != palette->m_isIDTEX4) continue;
 		if(tex0.nCPSM != palette->m_cpsm) continue;
 		if(tex0.nCSA != palette->m_csa) continue;
-		m_paletteCache.erase(paletteIterator);
-		m_paletteCache.push_front(palette);
-		return palette->m_texture;
+		auto texture = palette->m_texture;
+		m_paletteCache.splice(m_paletteCache.begin(), m_paletteCache, paletteIterator);
+		return texture;
 	}
 
 	return 0;
@@ -740,7 +735,7 @@ GLuint CGSH_OpenGL::PalCache_Search(unsigned int entryCount, const uint32* conte
 	for(auto paletteIterator(m_paletteCache.begin());
 	    paletteIterator != m_paletteCache.end(); paletteIterator++)
 	{
-		auto palette = *paletteIterator;
+		const auto& palette = *paletteIterator;
 
 		if(palette->m_texture == 0) continue;
 
@@ -750,10 +745,11 @@ GLuint CGSH_OpenGL::PalCache_Search(unsigned int entryCount, const uint32* conte
 		if(memcmp(contents, palette->m_contents, sizeof(uint32) * entryCount) != 0) continue;
 
 		palette->m_live = true;
+		palette->m_generation = m_paletteGeneration;
 
-		m_paletteCache.erase(paletteIterator);
-		m_paletteCache.push_front(palette);
-		return palette->m_texture;
+		auto texture = palette->m_texture;
+		m_paletteCache.splice(m_paletteCache.begin(), m_paletteCache, paletteIterator);
+		return texture;
 	}
 
 	return 0;
@@ -761,7 +757,7 @@ GLuint CGSH_OpenGL::PalCache_Search(unsigned int entryCount, const uint32* conte
 
 void CGSH_OpenGL::PalCache_Insert(const TEX0& tex0, const uint32* contents, GLuint textureHandle)
 {
-	auto texture = *m_paletteCache.rbegin();
+	const auto& texture = *m_paletteCache.rbegin();
 	texture->Free();
 
 	unsigned int entryCount = CGsPixelFormats::IsPsmIDTEX4(tex0.nPsm) ? 16 : 256;
@@ -771,16 +767,15 @@ void CGSH_OpenGL::PalCache_Insert(const TEX0& tex0, const uint32* contents, GLui
 	texture->m_csa = tex0.nCSA;
 	texture->m_texture = textureHandle;
 	texture->m_live = true;
+	texture->m_generation = m_paletteGeneration;
 	memcpy(texture->m_contents, contents, entryCount * sizeof(uint32));
 
-	m_paletteCache.pop_back();
-	m_paletteCache.push_front(texture);
+	m_paletteCache.splice(m_paletteCache.begin(), m_paletteCache, std::prev(m_paletteCache.end()));
 }
 
 void CGSH_OpenGL::PalCache_Invalidate(uint32 csa)
 {
-	std::for_each(std::begin(m_paletteCache), std::end(m_paletteCache),
-	              [csa](PalettePtr& palette) { palette->Invalidate(csa); });
+	m_paletteGeneration++;
 }
 
 void CGSH_OpenGL::PalCache_Flush()
