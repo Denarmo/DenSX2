@@ -237,7 +237,13 @@ BasicBlockPtr CEeExecutor::BlockFactory(CMIPS& context, uint32 start, uint32 end
 
 bool CEeExecutor::HandleAccessFault(intptr_t ptr)
 {
+#if defined(__aarch64__)
+	//Fault addresses come without the tag that Android's heap puts in the top byte of pointers.
+	constexpr uintptr_t addressMask = (static_cast<uintptr_t>(1) << 56) - 1;
+	ptrdiff_t addr = (static_cast<uintptr_t>(ptr) & addressMask) - (reinterpret_cast<uintptr_t>(m_ram) & addressMask);
+#else
 	ptrdiff_t addr = reinterpret_cast<uint8*>(ptr) - m_ram;
+#endif
 	if(addr >= 0 && addr < PS2::EE_RAM_SIZE)
 	{
 		addr &= ~(m_pageSize - 1);
