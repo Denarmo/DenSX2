@@ -57,13 +57,20 @@ void CGSH_OpenGL_Libretro::UpdatePresentation()
 
 void CGSH_OpenGL_Libretro::UpdatePresentationImpl()
 {
+	SetPresentationWindow();
+	NotifyPreferencesChanged();
+}
+
+void CGSH_OpenGL_Libretro::SetPresentationWindow()
+{
 	PRESENTATION_PARAMS presentationParams;
 	presentationParams.mode = g_presentation_mode;
 	presentationParams.windowWidth = GetCrtWidth() * g_res_factor;
 	presentationParams.windowHeight = GetCrtHeight() * g_res_factor;
+	m_presentationWidth = presentationParams.windowWidth;
+	m_presentationHeight = presentationParams.windowHeight;
 
 	SetPresentationParams(presentationParams);
-	NotifyPreferencesChanged();
 }
 
 void CGSH_OpenGL_Libretro::FlushMailBox()
@@ -104,6 +111,11 @@ void CGSH_OpenGL_Libretro::FlipImpl(const DISPLAY_INFO& dispInfo)
 		m_presentFramebuffer = g_hw_render.get_current_framebuffer();
 	else
 		return;
+
+	//Frames are reported at the current CRT size (PAL games switch to 512 lines after boot),
+	//so the presentation window has to follow it.
+	if((GetCrtWidth() * g_res_factor != m_presentationWidth) || (GetCrtHeight() * g_res_factor != m_presentationHeight))
+		SetPresentationWindow();
 
 	CGSH_OpenGL::FlipImpl(dispInfo);
 }

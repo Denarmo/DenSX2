@@ -40,13 +40,14 @@ struct retro_hw_render_callback g_hw_render
 };
 
 int g_res_factor = 1;
-CGSHandler::PRESENTATION_MODE g_presentation_mode = CGSHandler::PRESENTATION_MODE::PRESENTATION_MODE_FIT;
+//The frontend applies the aspect ratio, so the core fills the frame it reports.
+CGSHandler::PRESENTATION_MODE g_presentation_mode = CGSHandler::PRESENTATION_MODE::PRESENTATION_MODE_FILL;
 bool g_forceBilinearTextures = false;
 
 static std::vector<struct retro_variable> m_vars =
     {
         {"play_res_multi", "Resolution Multiplier; 1x|2x|4x|8x"},
-        {"play_presentation_mode", "Presentation Mode; Fit Screen|Fill Screen|Original Size"},
+        {"play_presentation_mode", "Presentation Mode; Fill Screen|Fit Screen|Original Size"},
         {"play_bilinear_filtering", "Force Bilinear Filtering; false|true"},
         {NULL, NULL},
 };
@@ -378,11 +379,11 @@ void updateVars()
 			break;
 			case 1:
 			{
-				CGSHandler::PRESENTATION_MODE presentation_mode = CGSHandler::PRESENTATION_MODE::PRESENTATION_MODE_FIT;
+				CGSHandler::PRESENTATION_MODE presentation_mode = CGSHandler::PRESENTATION_MODE::PRESENTATION_MODE_FILL;
 
 				std::string val(var.value);
-				if(val == "Fill Screen")
-					presentation_mode = CGSHandler::PRESENTATION_MODE::PRESENTATION_MODE_FILL;
+				if(val == "Fit Screen")
+					presentation_mode = CGSHandler::PRESENTATION_MODE::PRESENTATION_MODE_FIT;
 				else if(val == "Original Size")
 					presentation_mode = CGSHandler::PRESENTATION_MODE::PRESENTATION_MODE_ORIGINAL;
 

@@ -27,7 +27,10 @@ public:
 
 private:
 	void UpdatePresentationImpl();
+	void SetPresentationWindow();
 
 	bool m_holdPresent = false;
+	uint32 m_presentationWidth = 0;
+	uint32 m_presentationHeight = 0;
 	bool m_presentHeld = false;
 };
