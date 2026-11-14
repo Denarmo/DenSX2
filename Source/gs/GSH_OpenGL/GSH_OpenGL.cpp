@@ -195,6 +195,11 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
 	}
 
 	auto presentationViewport = GetPresentationViewport();
+	if(dispInfo.oddField && (dispLayer.height != 0))
+	{
+		//Without this, the picture moves up and down a line every field.
+		presentationViewport.offsetY += presentationViewport.height / static_cast<int32>(2 * dispLayer.height);
+	}
 	glViewport(presentationViewport.offsetX, presentationViewport.offsetY,
 	           presentationViewport.width, presentationViewport.height);
 

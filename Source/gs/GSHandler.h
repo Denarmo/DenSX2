@@ -181,6 +181,8 @@ public:
 
 		uint32 width = 0;
 		uint32 height = 0;
+		//Interlaced frame mode: the odd field sits half a buffer line lower on the screen.
+		bool oddField = false;
 	};
 
 	enum FLIP_FLAGS

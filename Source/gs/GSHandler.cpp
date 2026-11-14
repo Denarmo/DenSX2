@@ -565,8 +565,10 @@ void CGSHandler::Flip(uint32 flags)
 {
 	bool waitForCompletion = (flags & FLIP_FLAG_WAIT) != 0;
 	bool force = (flags & FLIP_FLAG_FORCE) != 0;
+	auto displayInfo = GetCurrentDisplayInfo();
+	displayInfo.oddField = GetCrtIsInterlaced() && GetCrtIsFrameMode() && ((m_nCSR & CSR_FIELD) != 0);
 	SendGSCall(
-	    [this, displayInfo = GetCurrentDisplayInfo(), force]() {
+	    [this, displayInfo, force]() {
 		    if(force || m_regsDirty)
 		    {
 			    FlipImpl(displayInfo);
