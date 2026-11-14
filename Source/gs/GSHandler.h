@@ -901,6 +901,8 @@ public:
 	void SendGSCall(const CMailBox::FunctionType&, bool = false, bool = false);
 
 	void ProcessSingleFrame();
+	//Runs one queued call, if any, on a GS that is not threaded.
+	bool ProcessPendingCall();
 
 	FlipCompleteEvent OnFlipComplete;
 	NewFrameEvent OnNewFrame;

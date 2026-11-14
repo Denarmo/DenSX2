@@ -2213,6 +2213,14 @@ void CGSHandler::ProcessSingleFrame()
 	m_flipped = false;
 }
 
+bool CGSHandler::ProcessPendingCall()
+{
+	assert(!m_gsThreaded);
+	if(!m_mailBox.IsPending()) return false;
+	m_mailBox.ReceiveCall();
+	return true;
+}
+
 Framework::CBitmap CGSHandler::GetScreenshot()
 {
 	throw std::runtime_error("Screenshot feature is not implemented in current backend.");

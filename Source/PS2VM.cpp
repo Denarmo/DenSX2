@@ -370,6 +370,30 @@ std::future<bool> CPS2VM::LoadState(const fs::path& statePath)
 	return future;
 }
 
+std::future<bool> CPS2VM::SaveState(Framework::CStream& stateStream)
+{
+	auto promise = std::make_shared<std::promise<bool>>();
+	auto future = promise->get_future();
+	m_mailBox.SendCall(
+	    [this, promise, &stateStream]() {
+		    auto result = SaveVMState(stateStream);
+		    promise->set_value(result);
+	    });
+	return future;
+}
+
+std::future<bool> CPS2VM::LoadState(Framework::CStream& stateStream)
+{
+	auto promise = std::make_shared<std::promise<bool>>();
+	auto future = promise->get_future();
+	m_mailBox.SendCall(
+	    [this, promise, &stateStream]() {
+		    auto result = LoadVMState(stateStream);
+		    promise->set_value(result);
+	    });
+	return future;
+}
+
 CPS2VM::CPU_UTILISATION_INFO CPS2VM::GetCpuUtilisationInfo() const
 {
 	return m_cpuUtilisation;
@@ -544,6 +568,19 @@ void CPS2VM::DestroyVM()
 
 bool CPS2VM::SaveVMState(const fs::path& statePath)
 {
+	try
+	{
+		auto stateStream = Framework::CreateOutputStdStream(statePath.native());
+		return SaveVMState(stateStream);
+	}
+	catch(...)
+	{
+		return false;
+	}
+}
+
+bool CPS2VM::SaveVMState(Framework::CStream& stateStream)
+{
 	if(m_ee->m_gs == NULL)
 	{
 		printf("PS2VM: GS Handler was not instancied. Cannot save state.\r\n");
@@ -552,7 +589,6 @@ bool CPS2VM::SaveVMState(const fs::path& statePath)
 
 	try
 	{
-		auto stateStream = Framework::CreateOutputStdStream(statePath.native());
 		Framework::CZipArchiveWriter archive;
 
 		m_ee->SaveState(archive);
@@ -572,6 +608,19 @@ bool CPS2VM::SaveVMState(const fs::path& statePath)
 
 bool CPS2VM::LoadVMState(const fs::path& statePath)
 {
+	try
+	{
+		auto stateStream = Framework::CreateInputStdStream(statePath.native());
+		return LoadVMState(stateStream);
+	}
+	catch(...)
+	{
+		return false;
+	}
+}
+
+bool CPS2VM::LoadVMState(Framework::CStream& stateStream)
+{
 	if(m_ee->m_gs == NULL)
 	{
 		printf("PS2VM: GS Handler was not instancied. Cannot load state.\r\n");
@@ -580,7 +629,6 @@ bool CPS2VM::LoadVMState(const fs::path& statePath)
 
 	try
 	{
-		auto stateStream = Framework::CreateInputStdStream(statePath.native());
 		Framework::CZipArchiveReader archive(stateStream);
 
 		try

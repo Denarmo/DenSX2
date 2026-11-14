@@ -1,6 +1,7 @@
 #include "GSH_OpenGL_Libretro.h"
 #include "ext/libretro.h"
 #include "Log.h"
+#include <thread>
 
 #define LOG_NAME "LIBRETRO"
 
@@ -107,10 +108,44 @@ void CGSH_OpenGL_Libretro::FlipImpl(const DISPLAY_INFO& dispInfo)
 	CGSH_OpenGL::FlipImpl(dispInfo);
 }
 
+void CGSH_OpenGL_Libretro::ProcessCallsUntil(const std::function<bool()>& done)
+{
+	m_holdPresent = true;
+	while(!done())
+	{
+		if(!ProcessPendingCall())
+		{
+			std::this_thread::yield();
+		}
+	}
+	m_holdPresent = false;
+}
+
+bool CGSH_OpenGL_Libretro::PresentHeldFrame()
+{
+	if(!m_flipped) return false;
+	m_flipped = false;
+	if(m_presentHeld)
+	{
+		m_presentHeld = false;
+		PresentBackbuffer();
+	}
+	else if(g_video_cb)
+	{
+		g_video_cb(nullptr, GetCrtWidth() * g_res_factor, GetCrtHeight() * g_res_factor, 0);
+	}
+	return true;
+}
+
 void CGSH_OpenGL_Libretro::PresentBackbuffer()
 {
 	CLog::GetInstance().Print(LOG_NAME, "%s\n", __FUNCTION__);
 
+	if(m_holdPresent)
+	{
+		m_presentHeld = true;
+		return;
+	}
 	if(g_video_cb)
 		g_video_cb(RETRO_HW_FRAME_BUFFER_VALID, GetCrtWidth() * g_res_factor, GetCrtHeight() * g_res_factor, 0);
 }

@@ -4,6 +4,7 @@
 #include <future>
 #include "filesystem_def.h"
 #include "Types.h"
+#include "Stream.h"
 #include "MIPS.h"
 #include "MailBox.h"
 #include "PadHandler.h"
@@ -76,6 +77,9 @@ public:
 
 	std::future<bool> SaveState(const fs::path&);
 	std::future<bool> LoadState(const fs::path&);
+	//The stream must live until the future is ready.
+	std::future<bool> SaveState(Framework::CStream&);
+	std::future<bool> LoadState(Framework::CStream&);
 
 	CPU_UTILISATION_INFO GetCpuUtilisationInfo() const;
 
@@ -118,6 +122,8 @@ private:
 	void DestroyVM();
 	bool SaveVMState(const fs::path&);
 	bool LoadVMState(const fs::path&);
+	bool SaveVMState(Framework::CStream&);
+	bool LoadVMState(Framework::CStream&);
 
 	void SaveVmTimingState(Framework::CZipArchiveWriter&);
 	void LoadVmTimingState(Framework::CZipArchiveReader&);

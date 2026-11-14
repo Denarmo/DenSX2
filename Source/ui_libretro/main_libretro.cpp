@@ -19,6 +19,8 @@
 
 #include <vector>
 #include <cstdlib>
+#include <cstring>
+#include <chrono>
 
 #define LOG_NAME "LIBRETRO"
 
@@ -179,18 +181,30 @@ void retro_get_system_info(struct retro_system_info* info)
 	info->valid_extensions = "elf|iso|cso|isz|cue|chd";
 }
 
+// The refresh rate the frontend paces retro_run at: PAL games switch the GS to 50 Hz after boot.
+static unsigned g_frame_rate = 60;
+
 void retro_get_system_av_info(struct retro_system_av_info* info)
 {
 	CLog::GetInstance().Print(LOG_NAME, "%s\n", __FUNCTION__);
 
 	*info = {};
-	info->timing.fps = 60.0;
+	info->timing.fps = g_frame_rate;
 	info->timing.sample_rate = 44100;
 	info->geometry.base_width = 640;
 	info->geometry.base_height = 448;
 	info->geometry.max_width = 640 * 8;
 	info->geometry.max_height = 448 * 8;
 	info->geometry.aspect_ratio = 4.0 / 3.0;
+}
+
+static void UpdateFrameRate(unsigned frameRate)
+{
+	if(frameRate == 0 || frameRate == g_frame_rate) return;
+	g_frame_rate = frameRate;
+	retro_system_av_info info;
+	retro_get_system_av_info(&info);
+	g_environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info);
 }
 
 void retro_set_video_refresh(retro_video_refresh_t cb)
@@ -246,22 +260,32 @@ size_t retro_serialize_size(void)
 	return 40 * 1024 * 1024;
 }
 
+// The emulation thread saves and loads at the top of its loop. Meanwhile this thread runs the
+// GS calls it may be waiting for, as it does in retro_run.
+static bool WaitForVmCall(std::future<bool>& result)
+{
+	auto gsHandler = static_cast<CGSH_OpenGL_Libretro*>(m_virtualMachine->GetGSHandler());
+	if(gsHandler)
+	{
+		gsHandler->ProcessCallsUntil([&result]() { return result.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
+	}
+	return result.get();
+}
+
 bool retro_serialize(void* data, size_t size)
 {
 	CLog::GetInstance().Print(LOG_NAME, "%s\n", __FUNCTION__);
 
+	if(!m_virtualMachine || !first_run) return false;
+
 	try
 	{
 		Framework::CMemStream stateStream;
-		Framework::CZipArchiveWriter archive;
-
-		m_virtualMachine->m_ee->SaveState(archive);
-		m_virtualMachine->m_iop->SaveState(archive);
-		m_virtualMachine->m_ee->m_gs->SaveState(archive);
-
-		archive.Write(stateStream);
-		stateStream.Seek(0, Framework::STREAM_SEEK_DIRECTION::STREAM_SEEK_SET);
-		stateStream.Read(data, size);
+		auto result = m_virtualMachine->SaveState(stateStream);
+		if(!WaitForVmCall(result)) return false;
+		if(stateStream.GetSize() > size) return false;
+		memcpy(data, stateStream.GetBuffer(), stateStream.GetSize());
+		memset(reinterpret_cast<uint8*>(data) + stateStream.GetSize(), 0, size - stateStream.GetSize());
 	}
 	catch(...)
 	{
@@ -275,30 +299,18 @@ bool retro_unserialize(const void* data, size_t size)
 {
 	CLog::GetInstance().Print(LOG_NAME, "%s\n", __FUNCTION__);
 
+	if(!m_virtualMachine || !first_run) return false;
+
 	try
 	{
 		Framework::CPtrStream stateStream(data, size);
-		Framework::CZipArchiveReader archive(stateStream);
-
-		try
-		{
-			m_virtualMachine->m_ee->LoadState(archive);
-			m_virtualMachine->m_iop->LoadState(archive);
-			m_virtualMachine->m_ee->m_gs->LoadState(archive);
-		}
-		catch(...)
-		{
-			//Any error that occurs in the previous block is critical
-			throw;
-		}
+		auto result = m_virtualMachine->LoadState(stateStream);
+		return WaitForVmCall(result);
 	}
 	catch(...)
 	{
 		return false;
 	}
-
-	m_virtualMachine->OnMachineStateChange();
-	return true;
 }
 
 void* retro_get_memory_data(unsigned id)
@@ -453,8 +465,14 @@ void retro_run()
 		if(m_virtualMachine->GetSoundHandler())
 			static_cast<CSH_LibreAudio*>(m_virtualMachine->GetSoundHandler())->ProcessBuffer();
 
-		if(m_virtualMachine->GetGSHandler())
-			m_virtualMachine->GetGSHandler()->ProcessSingleFrame();
+		if(auto gsHandler = static_cast<CGSH_OpenGL_Libretro*>(m_virtualMachine->GetGSHandler()))
+		{
+			if(!gsHandler->PresentHeldFrame())
+			{
+				gsHandler->ProcessSingleFrame();
+			}
+			UpdateFrameRate(gsHandler->GetCrtFrameRate());
+		}
 	}
 }
 
@@ -504,6 +522,7 @@ bool retro_load_game(const retro_game_info* info)
 		CAppConfig::GetInstance().Save();
 	}
 	first_run = false;
+	g_frame_rate = 60;
 
 	auto rgb = RETRO_PIXEL_FORMAT_XRGB8888;
 	g_environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &rgb);
