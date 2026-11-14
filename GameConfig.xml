@@ -160,4 +160,7 @@
 		<!-- SLUS-21240 Version 2.01 -->
 		<IdleLoopBlock Address="0x00427F40" CheckBlockKey="6D8515A293E38030EE880D6C915CEAA2;12"/>
 	</GameConfig>
+	<GameConfig Executable="SLES_511.17;1" Title="Colin McRae Rally 3">
+		<IdleLoopBlock Address="0x00247E40" Description="Return site of a call polled until Timer 1 reaches a value." />
+	</GameConfig>
 </GameConfigs>

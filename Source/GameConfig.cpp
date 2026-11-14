@@ -4,7 +4,10 @@
 #include "xml/FilteringNodeIterator.h"
 #include "PathUtils.h"
 #include "StdStreamUtils.h"
-#ifdef __ANDROID__
+#if defined(PLAY_LIBRETRO_CORE)
+#include "PtrStream.h"
+#include "GameConfigData.h"
+#elif defined(__ANDROID__)
 #include "android/AssetStream.h"
 #endif
 #include "Log.h"
@@ -39,7 +42,10 @@ void CGameConfig::ApplyGameConfig(CPS2VM& virtualMachine)
 	std::unique_ptr<Framework::Xml::CNode> document;
 	try
 	{
-#ifdef __ANDROID__
+#if defined(PLAY_LIBRETRO_CORE)
+		//A libretro core has no resources of its own to read it from, so it carries a copy.
+		Framework::CPtrStream inputStream(g_gameConfigData, sizeof(g_gameConfigData));
+#elif defined(__ANDROID__)
 		Framework::Android::CAssetStream inputStream(GAMECONFIG_FILENAME);
 #else
 		auto gameConfigPath = Framework::PathUtils::GetAppResourcesPath() / GAMECONFIG_FILENAME;

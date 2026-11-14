@@ -1556,32 +1556,44 @@ bool CGSHandler::ReadCLUT4_16(const TEX0& tex0)
 	return changed;
 }
 
+//Where each entry of a 256-color CSM1 CLUT is in GS memory, relative to the CLUT pointer, in CLUT order.
+//The swizzled layout does not depend on the pointer, so it is worked out once per format.
+template <typename Indexor>
+static const std::array<uint32, 256>& GetClut8Offsets()
+{
+	static const std::array<uint32, 256> offsets = []() {
+		std::array<uint32, 256> result = {};
+		static uint8 base[1];
+		Indexor indexor(base, 0, 1);
+		for(unsigned int j = 0; j < 16; j++)
+		{
+			for(unsigned int i = 0; i < 16; i++)
+			{
+				uint8 index = i + (j * 16);
+				index = (index & ~0x18) | ((index & 0x08) << 1) | ((index & 0x10) >> 1);
+				result[index] = static_cast<uint32>(reinterpret_cast<uint8*>(indexor.GetPixelAddress(i, j)) - base);
+			}
+		}
+		return result;
+	}();
+	return offsets;
+}
+
 template <typename Indexor>
 bool CGSHandler::ReadCLUT8_16(const TEX0& tex0)
 {
-	bool changed = false;
+	const auto& offsets = GetClut8Offsets<Indexor>();
+	uint32 clutPtr = tex0.GetCLUTPtr();
 
-	Indexor indexor(m_pRAM, tex0.GetCLUTPtr(), 1);
-
-	for(unsigned int j = 0; j < 16; j++)
+	uint16 colors[256];
+	for(unsigned int i = 0; i < 256; i++)
 	{
-		for(unsigned int i = 0; i < 16; i++)
-		{
-			uint16 color = indexor.GetPixel(i, j);
-
-			uint8 index = i + (j * 16);
-			index = (index & ~0x18) | ((index & 0x08) << 1) | ((index & 0x10) >> 1);
-
-			if(m_pCLUT[index] != color)
-			{
-				changed = true;
-			}
-
-			m_pCLUT[index] = color;
-		}
+		colors[i] = *reinterpret_cast<const uint16*>(m_pRAM + ((clutPtr + offsets[i]) & (RAMSIZE - 1)));
 	}
 
-	return changed;
+	if(memcmp(m_pCLUT, colors, sizeof(colors)) == 0) return false;
+	memcpy(m_pCLUT, colors, sizeof(colors));
+	return true;
 }
 
 void CGSHandler::ReadCLUT4(const TEX0& tex0)
@@ -1675,29 +1687,21 @@ void CGSHandler::ReadCLUT8(const TEX0& tex0)
 	{
 		if(tex0.nCPSM == PSMCT32 || tex0.nCPSM == PSMCT24)
 		{
-			CGsPixelFormats::CPixelIndexorPSMCT32 Indexor(m_pRAM, tex0.GetCLUTPtr(), 1);
+			const auto& offsets = GetClut8Offsets<CGsPixelFormats::CPixelIndexorPSMCT32>();
+			uint32 clutPtr = tex0.GetCLUTPtr();
 
-			for(unsigned int j = 0; j < 16; j++)
+			uint16 colors[0x200];
+			for(unsigned int i = 0; i < 256; i++)
 			{
-				for(unsigned int i = 0; i < 16; i++)
-				{
-					uint32 color = Indexor.GetPixel(i, j);
-					uint16 colorLo = static_cast<uint16>(color & 0xFFFF);
-					uint16 colorHi = static_cast<uint16>(color >> 16);
+				uint32 color = *reinterpret_cast<const uint32*>(m_pRAM + ((clutPtr + offsets[i]) & (RAMSIZE - 1)));
+				colors[i + 0x000] = static_cast<uint16>(color & 0xFFFF);
+				colors[i + 0x100] = static_cast<uint16>(color >> 16);
+			}
 
-					uint8 index = i + (j * 16);
-					index = (index & ~0x18) | ((index & 0x08) << 1) | ((index & 0x10) >> 1);
-
-					if(
-					    (m_pCLUT[index + 0x000] != colorLo) ||
-					    (m_pCLUT[index + 0x100] != colorHi))
-					{
-						changed = true;
-					}
-
-					m_pCLUT[index + 0x000] = colorLo;
-					m_pCLUT[index + 0x100] = colorHi;
-				}
+			changed = (memcmp(m_pCLUT, colors, sizeof(colors)) != 0);
+			if(changed)
+			{
+				memcpy(m_pCLUT, colors, sizeof(colors));
 			}
 		}
 		else if(tex0.nCPSM == PSMCT16)

@@ -575,6 +575,17 @@ target_include_directories(PlayCore
 )
 target_compile_definitions(PlayCore PUBLIC ${DEFINITIONS_LIST})
 
+if(BUILD_LIBRETRO_CORE AND NOT BUILD_PLAY)
+	# The libretro core carries GameConfig.xml, since it has no resources folder to read it from.
+	set(GAMECONFIG_XML ${CMAKE_CURRENT_SOURCE_DIR}/../GameConfig.xml)
+	set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${GAMECONFIG_XML})
+	file(READ ${GAMECONFIG_XML} GAMECONFIG_HEX HEX)
+	string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," GAMECONFIG_HEX "${GAMECONFIG_HEX}")
+	file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/GameConfigData.h.tmp "static const unsigned char g_gameConfigData[] = {${GAMECONFIG_HEX}};\n")
+	configure_file(${CMAKE_CURRENT_BINARY_DIR}/GameConfigData.h.tmp ${CMAKE_CURRENT_BINARY_DIR}/GameConfigData.h COPYONLY)
+	target_include_directories(PlayCore PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+endif()
+
 if(TARGET_PLATFORM_WIN32)
 	add_precompiled_header(PlayCore Pch.h FORCEINCLUDE SOURCE_CXX Pch.cpp)
 endif()

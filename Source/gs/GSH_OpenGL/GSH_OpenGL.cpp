@@ -347,6 +347,14 @@ void CGSH_OpenGL::CheckExtensions()
 			m_hasBufferStorageExtension = true;
 		}
 	}
+
+	//Blending in the shader through framebuffer fetch makes every draw much more expensive in Adreno's
+	//driver (a Colin McRae Rally 3 stage ran 13% faster without it), so blend with the fixed function there.
+	auto renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+	if(renderer && strstr(renderer, "Adreno"))
+	{
+		m_hasFramebufferFetchExtension = false;
+	}
 }
 
 Framework::OpenGl::CBuffer CGSH_OpenGL::GeneratePresentVertexBuffer()
@@ -1822,10 +1830,6 @@ void CGSH_OpenGL::DoRenderPass()
 
 		glActiveTexture(GL_TEXTURE1);
 		glBindTexture(GL_TEXTURE_2D, m_renderState.texture1Handle);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
 		m_validGlState |= GLSTATE_TEXTURE;
 	}
