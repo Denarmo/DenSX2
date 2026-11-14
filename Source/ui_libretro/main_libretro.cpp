@@ -85,6 +85,9 @@ void SetupVideoHandler()
 	if(!gsHandler)
 	{
 		m_virtualMachine->CreateGSHandler(CGSH_OpenGL_Libretro::GetFactoryFunction());
+		auto retro_gs = static_cast<CGSH_OpenGL_Libretro*>(m_virtualMachine->GetGSHandler());
+		bool threaded = retro_gs->StartWorker();
+		CLog::GetInstance().Print(LOG_NAME, "GS calls run on %s\n", threaded ? "a thread of their own" : "the frontend thread");
 	}
 	else
 	{
@@ -468,7 +471,11 @@ void retro_run()
 
 		if(auto gsHandler = static_cast<CGSH_OpenGL_Libretro*>(m_virtualMachine->GetGSHandler()))
 		{
-			if(!gsHandler->PresentHeldFrame())
+			if(gsHandler->HasWorker())
+			{
+				gsHandler->PresentWorkerFrame();
+			}
+			else if(!gsHandler->PresentHeldFrame())
 			{
 				gsHandler->ProcessSingleFrame();
 			}
@@ -605,7 +612,16 @@ void retro_deinit()
 	{
 		m_virtualMachine->PauseAsync();
 		auto gsHandler = static_cast<CGSH_OpenGL_Libretro*>(m_virtualMachine->GetGSHandler());
-		if(gsHandler)
+		if(gsHandler && gsHandler->HasWorker())
+		{
+			gsHandler->SetFreeRun(true);
+			while(m_virtualMachine->GetStatus() != CVirtualMachine::PAUSED)
+			{
+				std::this_thread::yield();
+			}
+			gsHandler->Release();
+		}
+		else if(gsHandler)
 		{
 			// Note: since we've forced GS into running on this/main/libretro thread
 			// we need to clear its queue, to prevent it from locking up VM
