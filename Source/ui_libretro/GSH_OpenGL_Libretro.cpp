@@ -152,7 +152,7 @@ void CGSH_OpenGL_Libretro::FlipImpl(const DISPLAY_INFO& dispInfo)
 		{
 			std::unique_lock<std::mutex> lock(m_presentMutex);
 			m_presentCondition.wait(lock, [this]() { return m_freeRun || (m_readyBuffer < 0); });
-			m_targetBuffer = 1 - ((m_readyBuffer >= 0) ? m_readyBuffer : std::max(m_takenBuffer, 0));
+			m_targetBuffer = 1 - ((m_readyBuffer >= 0) ? m_readyBuffer : (std::max)(m_takenBuffer, 0));
 			m_presentCondition.wait(lock, [this]() { return m_readingBuffer != m_targetBuffer; });
 			std::swap(readFence, m_presentBuffers[m_targetBuffer].readFence);
 		}
