@@ -56,6 +56,10 @@ if(BUILD_LIBRETRO_CORE)
 	if(NOT MSVC)
 		add_compile_options($<$<NOT:$<COMPILE_LANGUAGE:Swift>>:-fPIC>)
 	endif()
+	if(NOT BUILD_PLAY)
+		# The core shares PlayCore only with itself, so it can drop the app's JNI glue.
+		add_definitions(-DPLAY_LIBRETRO_CORE)
+	endif()
 	add_subdirectory(Source/ui_libretro)
 endif()
 

@@ -900,7 +900,7 @@ void CPS2VM::EmuThread()
 	fesetround(FE_TOWARDZERO);
 	FpUtils::SetDenormalHandlingMode();
 	CProfiler::GetInstance().SetWorkThread();
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(PLAY_LIBRETRO_CORE)
 	JNIEnv* env = nullptr;
 	Framework::CJavaVM::AttachCurrentThread(&env, THREAD_NAME);
 #endif
@@ -1009,7 +1009,7 @@ void CPS2VM::EmuThread()
 		}
 	}
 	static_cast<CEeExecutor*>(m_ee->m_EE.m_executor.get())->RemoveExceptionHandler();
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(PLAY_LIBRETRO_CORE)
 	Framework::CJavaVM::DetachCurrentThread();
 #endif
 }

@@ -547,7 +547,16 @@ bool retro_load_game_special(unsigned game_type, const struct retro_game_info* i
 void retro_init()
 {
 #ifdef __ANDROID__
-	Framework::PathUtils::SetFilesDirPath(getenv("EXTERNAL_STORAGE"));
+	{
+		// Keep Play!'s data in the frontend's save directory: EXTERNAL_STORAGE is often not writable.
+		const char* saveDir = nullptr;
+		if(!g_environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &saveDir) || !saveDir || !*saveDir)
+		{
+			saveDir = getenv("EXTERNAL_STORAGE");
+		}
+		Framework::PathUtils::SetFilesDirPath(saveDir);
+		Framework::PathUtils::SetCacheDirPath(saveDir);
+	}
 #endif
 	CLog::GetInstance().Print(LOG_NAME, "%s\n", __FUNCTION__);
 

@@ -1,0 +1,44 @@
+name: Build libretro cores (EmuDEN)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [emuden]
+jobs:
+  linux:
+    # The oldest maintained runner, so the core loads on older glibc versions too.
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y build-essential ninja-build libcurl4-openssl-dev libgl1-mesa-dev libglu1-mesa-dev libevdev-dev
+    - uses: actions/checkout@v7
+      with:
+        submodules: recursive
+        fetch-depth: 0
+    - name: Build
+      run: |
+        cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=Release -DBUILD_LIBRETRO_CORE=yes -DBUILD_PLAY=off -DBUILD_TESTS=off
+        cmake --build build --target play_libretro
+        strip --strip-unneeded -o play_libretro.so build/Source/ui_libretro/play_libretro.so
+    - uses: actions/upload-artifact@v7
+      with:
+        name: play_libretro_linux_x86_64
+        path: play_libretro.so
+  windows:
+    runs-on: windows-2022
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: recursive
+        fetch-depth: 0
+    - name: Build
+      run: |
+        cmake -S . -B build -G"Visual Studio 17 2022" -A x64 -DBUILD_LIBRETRO_CORE=yes -DBUILD_PLAY=off -DBUILD_TESTS=off
+        cmake --build build --config Release --target play_libretro
+        copy build\Source\ui_libretro\Release\play_libretro.dll play_libretro.dll
+    - uses: actions/upload-artifact@v7
+      with:
+        name: play_libretro_windows_x86_64
+        path: play_libretro.dll
