@@ -19,7 +19,7 @@ jobs:
         fetch-depth: 0
     - name: Build
       run: |
-        cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=Release -DBUILD_LIBRETRO_CORE=yes -DBUILD_PLAY=off -DBUILD_TESTS=off
+        cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=Release -DBUILD_LIBRETRO_CORE=yes -DBUILD_PLAY=off -DBUILD_TESTS=off -DENABLE_AMAZON_S3=off -DOpenGL_GL_PREFERENCE=LEGACY
         cmake --build build --target play_libretro
         strip --strip-unneeded -o play_libretro.so build/Source/ui_libretro/play_libretro.so
     - uses: actions/upload-artifact@v7
@@ -35,7 +35,7 @@ jobs:
         fetch-depth: 0
     - name: Build
       run: |
-        cmake -S . -B build -G"Visual Studio 17 2022" -A x64 -DBUILD_LIBRETRO_CORE=yes -DBUILD_PLAY=off -DBUILD_TESTS=off
+        cmake -S . -B build -G"Visual Studio 17 2022" -A x64 -DBUILD_LIBRETRO_CORE=yes -DBUILD_PLAY=off -DBUILD_TESTS=off -DENABLE_AMAZON_S3=off -DOpenGL_GL_PREFERENCE=LEGACY
         cmake --build build --config Release --target play_libretro
         copy build\Source\ui_libretro\Release\play_libretro.dll play_libretro.dll
     - uses: actions/upload-artifact@v7
