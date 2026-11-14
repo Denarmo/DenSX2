@@ -506,7 +506,6 @@ private:
 	GLintptr m_fragmentParamsOffset = 0;
 	GLint m_uniformBufferAlignment = 256;
 
-
 	//If GPU has framebuffer fetch extension, some things will be done
 	//within the shader, such alpha blending
 	bool m_hasFramebufferFetchExtension = false;
