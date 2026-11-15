@@ -120,7 +120,6 @@ void CDrawMobile::FlushVertices()
 	if(vertexCount == 0) return;
 
 	auto& frame = m_frames[m_frameCommandBuffer->GetCurrentFrame()];
-	auto commandBuffer = m_frameCommandBuffer->GetCommandBuffer();
 
 	for(auto vertex = frame.vertexBufferPtr + m_passVertexStart; vertex != frame.vertexBufferPtr + m_passVertexEnd; vertex++)
 	{
@@ -132,78 +131,20 @@ void CDrawMobile::FlushVertices()
 
 	if(m_pipelineCaps.textureUseMemoryCopy)
 	{
-		assert(!m_renderPassBegun);
+		assert(m_pendingDraws.empty());
 		m_memoryCopyRegion.Reset();
 	}
 
+	if(m_pendingDraws.empty())
 	{
-		VkViewport viewport = {};
-		viewport.width = DRAW_AREA_SIZE;
-		viewport.height = DRAW_AREA_SIZE;
-		viewport.maxDepth = 1.0f;
-		m_context->device.vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
-
-		VkRect2D scissor = {};
-		scissor.offset.x = m_scissorX;
-		scissor.offset.y = m_scissorY;
-		scissor.extent.width = m_scissorWidth;
-		scissor.extent.height = m_scissorHeight;
-		m_context->device.vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+		m_passLoadPushConstants = m_pushConstants;
 	}
 
-	if(!m_renderPassBegun)
-	{
-		m_context->annotations.PushCommandLabel(commandBuffer, string_format("Draw (FBP: 0x%06X, ZBP: 0x%06X)", m_pushConstants.fbBufAddr, m_pushConstants.depthBufAddr).c_str());
-
-		auto renderPassBeginInfo = Framework::Vulkan::RenderPassBeginInfo();
-		renderPassBeginInfo.renderPass = m_renderPass;
-		renderPassBeginInfo.renderArea.extent.width = DRAW_AREA_SIZE;
-		renderPassBeginInfo.renderArea.extent.height = DRAW_AREA_SIZE;
-		renderPassBeginInfo.framebuffer = m_framebuffer;
-		m_context->device.vkCmdBeginRenderPass(commandBuffer, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
-
-		//Load from memory
-
-		//Find pipeline and create it if we've never encountered it before
-		auto strippedCaps = MakeLoadStorePipelineCaps(m_pipelineCaps);
-		auto loadPipeline = m_loadPipelineCache.TryGetPipeline(strippedCaps);
-		if(!loadPipeline)
-		{
-			loadPipeline = m_loadPipelineCache.RegisterPipeline(strippedCaps, CreateLoadPipeline(strippedCaps));
-		}
-
-		auto descriptorSetCaps = make_convertible<DESCRIPTORSET_CAPS>(0);
-		descriptorSetCaps.framebufferFormat = m_pipelineCaps.framebufferFormat;
-		descriptorSetCaps.depthbufferFormat = m_pipelineCaps.depthbufferFormat;
-
-		auto descriptorSet = PrepareDescriptorSet(loadPipeline->descriptorSetLayout, descriptorSetCaps);
-
-		m_context->device.vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, loadPipeline->pipelineLayout,
-		                                          0, 1, &descriptorSet, 0, nullptr);
-		m_context->device.vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, loadPipeline->pipeline);
-		m_context->device.vkCmdPushConstants(commandBuffer, loadPipeline->pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
-		                                     0, sizeof(DRAW_PIPELINE_PUSHCONSTANTS), &m_pushConstants);
-		m_context->device.vkCmdDraw(commandBuffer, 3, 1, 0, 0);
-
-		m_context->device.vkCmdNextSubpass(commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
-
-		m_renderPassBegun = true;
-	}
-
-	//Find pipeline and create it if we've never encountered it before
+	//Find pipeline and create it if we have never encountered it before
 	auto drawPipeline = m_pipelineCache.TryGetPipeline(m_pipelineCaps);
 	if(!drawPipeline)
 	{
 		drawPipeline = m_pipelineCache.RegisterPipeline(m_pipelineCaps, CreateDrawPipeline(m_pipelineCaps));
-	}
-
-	{
-		auto memoryBarrier = Framework::Vulkan::MemoryBarrier();
-		memoryBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-		memoryBarrier.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
-
-		m_context->device.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-		                                       VK_DEPENDENCY_BY_REGION_BIT, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
 	}
 
 	auto descriptorSetCaps = make_convertible<DESCRIPTORSET_CAPS>(0);
@@ -212,28 +153,15 @@ void CDrawMobile::FlushVertices()
 	descriptorSetCaps.depthbufferFormat = m_pipelineCaps.depthbufferFormat;
 	descriptorSetCaps.textureFormat = m_pipelineCaps.textureFormat;
 
-	auto descriptorSet = PrepareDescriptorSet(drawPipeline->descriptorSetLayout, descriptorSetCaps);
-
-	std::vector<uint32> descriptorDynamicOffsets;
-
-	if(m_pipelineCaps.hasTexture && CGsPixelFormats::IsPsmIDTEX(m_pipelineCaps.textureFormat))
-	{
-		descriptorDynamicOffsets.push_back(m_clutBufferOffset);
-	}
-
-	m_context->device.vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, drawPipeline->pipelineLayout,
-	                                          0, 1, &descriptorSet, static_cast<uint32_t>(descriptorDynamicOffsets.size()), descriptorDynamicOffsets.data());
-
-	m_context->device.vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, drawPipeline->pipeline);
-
-	VkDeviceSize vertexBufferOffset = (m_passVertexStart * sizeof(PRIM_VERTEX));
-	VkBuffer vertexBuffer = frame.vertexBuffer;
-	m_context->device.vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &vertexBufferOffset);
-
-	m_context->device.vkCmdPushConstants(commandBuffer, drawPipeline->pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
-	                                     0, sizeof(DRAW_PIPELINE_PUSHCONSTANTS), &m_pushConstants);
-
-	m_context->device.vkCmdDraw(commandBuffer, vertexCount, 1, 0, 0);
+	PENDING_DRAW draw;
+	draw.pipeline = drawPipeline;
+	draw.descriptorSet = PrepareDescriptorSet(drawPipeline->descriptorSetLayout, descriptorSetCaps);
+	draw.hasClutOffset = m_pipelineCaps.hasTexture && CGsPixelFormats::IsPsmIDTEX(m_pipelineCaps.textureFormat);
+	draw.clutOffset = m_clutBufferOffset;
+	draw.vertexStart = m_passVertexStart;
+	draw.vertexCount = vertexCount;
+	draw.pushConstants = m_pushConstants;
+	m_pendingDraws.push_back(draw);
 
 	m_passVertexStart = m_passVertexEnd;
 }
@@ -241,38 +169,119 @@ void CDrawMobile::FlushVertices()
 void CDrawMobile::FlushRenderPass()
 {
 	FlushVertices();
-	if(m_renderPassBegun)
+	if(!m_pendingDraws.empty())
 	{
-		auto commandBuffer = m_frameCommandBuffer->GetCommandBuffer();
-		m_context->device.vkCmdNextSubpass(commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
-
-		//Store to memory
-
+		//Only the area touched by the draws is loaded, rendered and stored: pixels outside of it
+		//keep what memory holds.
 		int32 clippedX0 = std::clamp<int32>(m_renderPassMinX, m_scissorX, m_scissorX + m_scissorWidth);
 		int32 clippedX1 = std::clamp<int32>(m_renderPassMaxX, m_scissorX, m_scissorX + m_scissorWidth);
 		int32 clippedY0 = std::clamp<int32>(m_renderPassMinY, m_scissorY, m_scissorY + m_scissorHeight);
 		int32 clippedY1 = std::clamp<int32>(m_renderPassMaxY, m_scissorY, m_scissorY + m_scissorHeight);
+		clippedX0 = std::min<int32>(clippedX0, DRAW_AREA_SIZE);
+		clippedY0 = std::min<int32>(clippedY0, DRAW_AREA_SIZE);
+		clippedX1 = std::min<int32>(clippedX1, DRAW_AREA_SIZE);
+		clippedY1 = std::min<int32>(clippedY1, DRAW_AREA_SIZE);
 
-		VkRect2D scissor = {};
-		scissor.offset.x = clippedX0;
-		scissor.offset.y = clippedY0;
-		scissor.extent.width = clippedX1 - clippedX0;
-		scissor.extent.height = clippedY1 - clippedY0;
-		m_context->device.vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+		if((clippedX1 > clippedX0) && (clippedY1 > clippedY0))
+		{
+			RecordRenderPass(clippedX0, clippedY0, clippedX1 - clippedX0, clippedY1 - clippedY0);
+		}
+		m_pendingDraws.clear();
+	}
+	m_renderPassMinX = FLT_MAX;
+	m_renderPassMinY = FLT_MAX;
+	m_renderPassMaxX = -FLT_MAX;
+	m_renderPassMaxY = -FLT_MAX;
+}
 
-		//Find pipeline and create it if we've never encountered it before
-		auto strippedCaps = MakeLoadStorePipelineCaps(m_pipelineCaps);
+void CDrawMobile::RecordRenderPass(int32 x, int32 y, int32 width, int32 height)
+{
+	auto& frame = m_frames[m_frameCommandBuffer->GetCurrentFrame()];
+	auto commandBuffer = m_frameCommandBuffer->GetCommandBuffer();
+
+	VkRect2D area = {};
+	area.offset.x = x;
+	area.offset.y = y;
+	area.extent.width = width;
+	area.extent.height = height;
+
+	m_context->annotations.PushCommandLabel(commandBuffer, string_format("Draw (FBP: 0x%06X, ZBP: 0x%06X)", m_passLoadPushConstants.fbBufAddr, m_passLoadPushConstants.depthBufAddr).c_str());
+
+	{
+		VkViewport viewport = {};
+		viewport.width = DRAW_AREA_SIZE;
+		viewport.height = DRAW_AREA_SIZE;
+		viewport.maxDepth = 1.0f;
+		m_context->device.vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+		m_context->device.vkCmdSetScissor(commandBuffer, 0, 1, &area);
+	}
+
+	auto renderPassBeginInfo = Framework::Vulkan::RenderPassBeginInfo();
+	renderPassBeginInfo.renderPass = m_renderPass;
+	renderPassBeginInfo.renderArea = area;
+	renderPassBeginInfo.framebuffer = m_framebuffer;
+	m_context->device.vkCmdBeginRenderPass(commandBuffer, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+	auto strippedCaps = MakeLoadStorePipelineCaps(m_pipelineCaps);
+	auto loadStoreDescriptorSetCaps = make_convertible<DESCRIPTORSET_CAPS>(0);
+	loadStoreDescriptorSetCaps.framebufferFormat = m_pipelineCaps.framebufferFormat;
+	loadStoreDescriptorSetCaps.depthbufferFormat = m_pipelineCaps.depthbufferFormat;
+
+	//Load from memory
+	{
+		auto loadPipeline = m_loadPipelineCache.TryGetPipeline(strippedCaps);
+		if(!loadPipeline)
+		{
+			loadPipeline = m_loadPipelineCache.RegisterPipeline(strippedCaps, CreateLoadPipeline(strippedCaps));
+		}
+
+		auto descriptorSet = PrepareDescriptorSet(loadPipeline->descriptorSetLayout, loadStoreDescriptorSetCaps);
+
+		m_context->device.vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, loadPipeline->pipelineLayout,
+		                                          0, 1, &descriptorSet, 0, nullptr);
+		m_context->device.vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, loadPipeline->pipeline);
+		m_context->device.vkCmdPushConstants(commandBuffer, loadPipeline->pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
+		                                     0, sizeof(DRAW_PIPELINE_PUSHCONSTANTS), &m_passLoadPushConstants);
+		m_context->device.vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+	}
+
+	m_context->device.vkCmdNextSubpass(commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
+
+	VkBuffer vertexBuffer = frame.vertexBuffer;
+	for(const auto& draw : m_pendingDraws)
+	{
+		auto memoryBarrier = Framework::Vulkan::MemoryBarrier();
+		memoryBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		memoryBarrier.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+
+		m_context->device.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		                                       VK_DEPENDENCY_BY_REGION_BIT, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
+
+		m_context->device.vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, draw.pipeline->pipelineLayout,
+		                                          0, 1, &draw.descriptorSet, draw.hasClutOffset ? 1 : 0, draw.hasClutOffset ? &draw.clutOffset : nullptr);
+
+		m_context->device.vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, draw.pipeline->pipeline);
+
+		VkDeviceSize vertexBufferOffset = (draw.vertexStart * sizeof(PRIM_VERTEX));
+		m_context->device.vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &vertexBufferOffset);
+
+		m_context->device.vkCmdPushConstants(commandBuffer, draw.pipeline->pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
+		                                     0, sizeof(DRAW_PIPELINE_PUSHCONSTANTS), &draw.pushConstants);
+
+		m_context->device.vkCmdDraw(commandBuffer, draw.vertexCount, 1, 0, 0);
+	}
+
+	m_context->device.vkCmdNextSubpass(commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
+
+	//Store to memory
+	{
 		auto storePipeline = m_storePipelineCache.TryGetPipeline(strippedCaps);
 		if(!storePipeline)
 		{
 			storePipeline = m_storePipelineCache.RegisterPipeline(strippedCaps, CreateStorePipeline(strippedCaps));
 		}
 
-		auto descriptorSetCaps = make_convertible<DESCRIPTORSET_CAPS>(0);
-		descriptorSetCaps.framebufferFormat = m_pipelineCaps.framebufferFormat;
-		descriptorSetCaps.depthbufferFormat = m_pipelineCaps.depthbufferFormat;
-
-		auto descriptorSet = PrepareDescriptorSet(storePipeline->descriptorSetLayout, descriptorSetCaps);
+		auto descriptorSet = PrepareDescriptorSet(storePipeline->descriptorSetLayout, loadStoreDescriptorSetCaps);
 
 		m_context->device.vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, storePipeline->pipelineLayout,
 		                                          0, 1, &descriptorSet, 0, nullptr);
@@ -280,15 +289,10 @@ void CDrawMobile::FlushRenderPass()
 		m_context->device.vkCmdPushConstants(commandBuffer, storePipeline->pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
 		                                     0, sizeof(DRAW_PIPELINE_PUSHCONSTANTS), &m_pushConstants);
 		m_context->device.vkCmdDraw(commandBuffer, 3, 1, 0, 0);
-
-		m_context->device.vkCmdEndRenderPass(commandBuffer);
-		m_context->annotations.PopCommandLabel(commandBuffer);
-		m_renderPassBegun = false;
 	}
-	m_renderPassMinX = FLT_MAX;
-	m_renderPassMinY = FLT_MAX;
-	m_renderPassMaxX = -FLT_MAX;
-	m_renderPassMaxY = -FLT_MAX;
+
+	m_context->device.vkCmdEndRenderPass(commandBuffer);
+	m_context->annotations.PopCommandLabel(commandBuffer);
 }
 
 VkDescriptorSet CDrawMobile::PrepareDescriptorSet(VkDescriptorSetLayout descriptorSetLayout, const DESCRIPTORSET_CAPS& caps)

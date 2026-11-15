@@ -20,6 +20,7 @@ namespace GSH_Vulkan
 		void FlushRenderPass() override;
 
 	private:
+		void RecordRenderPass(int32, int32, int32, int32);
 		VkDescriptorSet PrepareDescriptorSet(VkDescriptorSetLayout, const DESCRIPTORSET_CAPS&);
 
 		void CreateFramebuffer();
@@ -48,6 +49,22 @@ namespace GSH_Vulkan
 
 		Framework::Vulkan::CImage m_drawDepthImage;
 		VkImageView m_drawDepthImageView = VK_NULL_HANDLE;
+
+		//Draws are recorded when the render pass ends, once the area they touch is known: the pass
+		//then loads, renders and stores only that area instead of the whole scissor.
+		struct PENDING_DRAW
+		{
+			const PIPELINE* pipeline = nullptr;
+			VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+			bool hasClutOffset = false;
+			uint32 clutOffset = 0;
+			uint32 vertexStart = 0;
+			uint32 vertexCount = 0;
+			DRAW_PIPELINE_PUSHCONSTANTS pushConstants;
+		};
+
+		std::vector<PENDING_DRAW> m_pendingDraws;
+		DRAW_PIPELINE_PUSHCONSTANTS m_passLoadPushConstants;
 
 		float m_renderPassMinX = FLT_MAX;
 		float m_renderPassMinY = FLT_MAX;
