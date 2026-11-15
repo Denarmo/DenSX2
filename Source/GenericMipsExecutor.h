@@ -1,6 +1,5 @@
 #pragma once
 
-#include <algorithm>
 #include <unordered_set>
 #include "MIPS.h"
 #include "BasicBlock.h"
@@ -31,11 +30,6 @@ public:
 	enum
 	{
 		RECYCLE_NOLINK_THRESHOLD = 16,
-	};
-
-	enum
-	{
-		INDIRECT_BRANCH_RELINK_MISSES = 32,
 	};
 
 	CGenericMipsExecutor(CMIPS& context, uint32 maxAddress, BLOCK_CATEGORY blockCategory)
@@ -74,10 +68,6 @@ public:
 			uint32 address = m_context.m_State.nPC & m_addressMask;
 			auto block = m_blockLookup.FindBlockAt(address);
 			block->GetCode()(&m_context);
-			if(m_context.m_indirectBranchMissSrc != MIPS_INVALID_PC)
-			{
-				LinkIndirectBranch();
-			}
 		}
 		m_context.m_State.nHasException &= ~MIPS_EXCEPTION_STATUS_QUOTADONE;
 #ifdef DEBUGGER_INCLUDED
@@ -101,9 +91,6 @@ public:
 		m_blockLookup.Clear();
 		m_blocks.clear();
 		m_blockOutLinks.clear();
-		std::fill(std::begin(m_indirectBranchHolders), std::end(m_indirectBranchHolders), nullptr);
-		std::fill(std::begin(m_context.m_indirectBranchCache), std::end(m_context.m_indirectBranchCache), MIPS_INVALID_PC);
-		m_context.m_indirectBranchMissSrc = MIPS_INVALID_PC;
 #ifdef DEBUGGER_INCLUDED
 		m_mustBreak = false;
 #endif
@@ -207,17 +194,6 @@ protected:
 			block->SetOutLink(LINK_SLOT_BRANCH, std::end(m_blockOutLinks));
 		}
 
-		if(uint32 slot = block->GetIndirectBranchSlot(); slot != CBasicBlock::INDIRECT_BRANCH_SLOT_NONE)
-		{
-			auto holder = m_indirectBranchHolders[slot];
-			if(holder && (holder != block))
-			{
-				ReleaseOutLink(holder, LINK_SLOT_BRANCH);
-			}
-			m_indirectBranchHolders[slot] = block;
-			m_context.m_indirectBranchCache[slot] = MIPS_INVALID_PC;
-		}
-
 		//Resolve any block links that could be valid now that block has been created
 		{
 			auto lowerBound = m_blockOutLinks.lower_bound(startAddress);
@@ -275,58 +251,24 @@ protected:
 		}
 	}
 
-	void ReleaseOutLink(CBasicBlock* block, LINK_SLOT linkSlot)
-	{
-		auto link = block->GetOutLink(linkSlot);
-		if(link != std::end(m_blockOutLinks))
-		{
-			if(link->second.live)
-			{
-				block->UnlinkBlock(linkSlot);
-			}
-			block->SetOutLink(linkSlot, std::end(m_blockOutLinks));
-			m_blockOutLinks.erase(link);
-		}
-	}
-
-	//Links the jr/jalr exit of the block that just missed its cached target to the block at the new target
-	void LinkIndirectBranch()
-	{
-		uint32 srcAddress = m_context.m_indirectBranchMissSrc;
-		m_context.m_indirectBranchMissSrc = MIPS_INVALID_PC;
-		auto block = m_blockLookup.FindBlockAt(srcAddress & m_addressMask);
-		if(block->IsEmpty() || (block->GetBeginAddress() != srcAddress)) return;
-		uint32 slot = block->GetIndirectBranchSlot();
-		if((slot == CBasicBlock::INDIRECT_BRANCH_SLOT_NONE) || (m_indirectBranchHolders[slot] != block)) return;
-		//Exits that jump to several targets (returns from shared functions) are relinked only after
-		//repeated misses: each relink patches code and flushes the instruction cache.
-		if(m_context.m_indirectBranchCache[slot] != MIPS_INVALID_PC)
-		{
-			if(++m_indirectBranchMisses[slot] < INDIRECT_BRANCH_RELINK_MISSES) return;
-		}
-		m_indirectBranchMisses[slot] = 0;
-		uint32 target = m_context.m_State.nPC;
-		uint32 targetAddress = target & m_addressMask;
-		auto targetBlock = m_blockLookup.FindBlockAt(targetAddress);
-		if(targetBlock->IsEmpty()) return;
-		ReleaseOutLink(block, LINK_SLOT_BRANCH);
-		auto link = m_blockOutLinks.insert(std::make_pair(targetAddress, BLOCK_OUT_LINK{LINK_SLOT_BRANCH, srcAddress, true}));
-		block->SetOutLink(LINK_SLOT_BRANCH, link);
-		block->LinkBlock(LINK_SLOT_BRANCH, targetBlock);
-		m_context.m_indirectBranchCache[slot] = target;
-	}
-
 	//Unlink and removes block from all of our bookkeeping structures
 	void OrphanBlock(CBasicBlock* block)
 	{
-		ReleaseOutLink(block, LINK_SLOT_NEXT);
-		ReleaseOutLink(block, LINK_SLOT_BRANCH);
-		if(uint32 slot = block->GetIndirectBranchSlot();
-		   (slot != CBasicBlock::INDIRECT_BRANCH_SLOT_NONE) && (m_indirectBranchHolders[slot] == block))
-		{
-			m_indirectBranchHolders[slot] = nullptr;
-			m_context.m_indirectBranchCache[slot] = MIPS_INVALID_PC;
-		}
+		auto orphanBlockLinkSlot =
+		    [&](LINK_SLOT linkSlot) {
+			    auto link = block->GetOutLink(linkSlot);
+			    if(link != std::end(m_blockOutLinks))
+			    {
+				    if(link->second.live)
+				    {
+					    block->UnlinkBlock(linkSlot);
+				    }
+				    block->SetOutLink(linkSlot, std::end(m_blockOutLinks));
+				    m_blockOutLinks.erase(link);
+			    }
+		    };
+		orphanBlockLinkSlot(LINK_SLOT_NEXT);
+		orphanBlockLinkSlot(LINK_SLOT_BRANCH);
 	}
 
 	void ClearActiveBlocksInRangeInternal(uint32 start, uint32 end, CBasicBlock* protectedBlock)
@@ -366,12 +308,6 @@ protected:
 				if(referringBlock->IsEmpty()) continue;
 				referringBlock->UnlinkBlock(blockLink.slot);
 				blockLink.live = false;
-				if(uint32 slot = referringBlock->GetIndirectBranchSlot();
-				   (blockLink.slot == LINK_SLOT_BRANCH) && (slot != CBasicBlock::INDIRECT_BRANCH_SLOT_NONE) && (m_indirectBranchHolders[slot] == referringBlock))
-				{
-					//Miss next time so the exit gets linked again once its target exists
-					m_context.m_indirectBranchCache[slot] = MIPS_INVALID_PC;
-				}
 			}
 		}
 
@@ -390,8 +326,6 @@ protected:
 	BLOCK_CATEGORY m_blockCategory = BLOCK_CATEGORY_UNKNOWN;
 
 	BlockLookupType m_blockLookup;
-	CBasicBlock* m_indirectBranchHolders[CMIPS::INDIRECT_BRANCH_CACHE_SIZE] = {};
-	uint8 m_indirectBranchMisses[CMIPS::INDIRECT_BRANCH_CACHE_SIZE] = {};
 
 #ifdef DEBUGGER_INCLUDED
 	bool m_mustBreak = false;

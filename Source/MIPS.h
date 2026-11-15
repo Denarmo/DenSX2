@@ -187,14 +187,6 @@ public:
 	AddressTranslator m_pAddrTranslator = nullptr;
 	TLBExceptionChecker m_TLBExceptionChecker = nullptr;
 
-	//Targets EE blocks ending with jr/jalr were last linked to, and the block that last missed its target.
-	enum
-	{
-		INDIRECT_BRANCH_CACHE_SIZE = 2048,
-	};
-	uint32 m_indirectBranchMissSrc = MIPS_INVALID_PC;
-	uint32 m_indirectBranchCache[INDIRECT_BRANCH_CACHE_SIZE];
-
 	enum REGISTER
 	{
 		R0 = 0,
