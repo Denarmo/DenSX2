@@ -216,6 +216,7 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::PrepareTexture(const TEX0& tex0)
 		return texInfo;
 	}
 
+	SyncTextureArea(tex0);
 	auto texture = m_textureCache.Search(tex0);
 	if(!texture)
 	{
@@ -279,6 +280,11 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::PrepareTexture(const TEX0& tex0)
 
 GLuint CGSH_OpenGL::PreparePalette(const TEX0& tex0)
 {
+	if(m_gpuClutActive)
+	{
+		if(CGsPixelFormats::IsPsmIDTEX8(tex0.nPsm)) return m_gpuClutTexture;
+		ReadGpuClut();
+	}
 	GLuint textureHandle = PalCache_Search(tex0);
 	if(textureHandle != 0)
 	{

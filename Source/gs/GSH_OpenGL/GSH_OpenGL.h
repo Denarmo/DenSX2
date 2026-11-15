@@ -324,6 +324,21 @@ private:
 	void VertexKick(uint8, uint64);
 
 	Framework::OpenGl::ProgramPtr GetShaderFromCaps(const SHADERCAPS&);
+	void SyncMemoryForRead(uint32, uint32) override;
+	void WriteBackMemoryCache() override;
+	void BeginTransferWrite() override;
+	void SyncCLUT(const TEX0&) override;
+	bool SyncClutOnGpu(const TEX0&);
+	void ReadGpuClut();
+	Framework::OpenGl::ProgramPtr GenerateGpuClutProgram();
+	void MarkGpuPages();
+	void SyncTextureArea(const TEX0&);
+	void SyncFramebufferToRam(CFramebuffer*, uint32 = 0, uint32 = ~0U);
+	void ClearGpuPages(uint32, uint32);
+	void ClearAllGpuPages();
+	void UploadFramebufferPages(const FramebufferPtr&, const std::vector<uint32>&);
+	bool MoveGpuPage(CFramebuffer*, CFramebuffer*, uint32);
+
 	Framework::OpenGl::ProgramPtr GenerateShader(const SHADERCAPS&);
 	void LoadProgramCache();
 	Framework::OpenGl::ProgramPtr LoadCachedProgram(ShaderCapsInt);
@@ -353,7 +368,7 @@ private:
 	void FlushVertexBuffer();
 	void DoRenderPass();
 
-	void CopyToFb(int32, int32, int32, int32, int32, int32, int32, int32, int32, int32);
+	void CopyToFb(int32, int32, int32, int32, int32, int32, int32, int32, int32, int32, bool = true);
 	void DrawToDepth(unsigned int, uint64);
 
 	void SetRenderingContext(uint64);
@@ -456,6 +471,35 @@ private:
 	};
 	TEXTURE_FRAMEBUFFER_LOOKUP m_textureFramebufferLookups[TEXTURE_FRAMEBUFFER_LOOKUPS];
 	DepthbufferList m_depthbuffers;
+
+	//GS memory pages drawn on the GPU that RAM doesn't have yet, with the framebuffer holding them. A texture or
+	//CLUT read from RAM over such a page copies the framebuffer back first (Gran Turismo 4 reads its frame as
+	//PSMT8 through CLUTs it renders).
+	enum
+	{
+		GPU_PAGE_COUNT = RAMSIZE / 0x2000, //CGsPixelFormats::PAGESIZE
+	};
+	struct GPU_PAGE
+	{
+		CFramebuffer* owner = nullptr;      //The framebuffer that drew in it
+		CFramebuffer* syncedFrom = nullptr; //RAM has the page as this framebuffer has it
+		uint32 drawnBlocks = 0;
+		uint32 channels = 0;                //The bits of each pixel the draws wrote
+	};
+	GPU_PAGE m_gpuPages[GPU_PAGE_COUNT];
+	uint32 m_gpuPageCount = 0;
+	std::vector<std::pair<uint32, uint32>> m_blockList;
+	std::vector<std::pair<uint32, uint32>> m_wholeBlockList;
+	std::vector<std::pair<uint32, uint32>> m_drawBlockList;
+	std::vector<uint32> m_readbackBuffer;
+	CFramebuffer* m_drawFramebuffer = nullptr;
+	FramebufferPtr m_drawFramebufferPtr;
+	uint32 m_drawMask = 0;
+	Framework::OpenGl::ProgramPtr m_gpuClutProgram;
+	GLint m_gpuClutPositionUniform = -1;
+	Framework::OpenGl::CTexture m_gpuClutTexture;
+	Framework::OpenGl::CFramebuffer m_gpuClutFramebuffer;
+	bool m_gpuClutActive = false;
 
 	Framework::OpenGl::CBuffer m_primBuffer;
 	Framework::OpenGl::CVertexArray m_primVertexArray;

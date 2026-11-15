@@ -1079,6 +1079,10 @@ protected:
 	void TransferReadHandlerPSMT8H(void*, uint32);
 
 	virtual void SyncCLUT(const TEX0&);
+	//Called before GS memory is read for a CLUT: a renderer that draws on the GPU brings RAM up to date.
+	virtual void SyncMemoryForRead(uint32 address, uint32 size)
+	{
+	}
 	bool ProcessCLD(const TEX0&);
 	template <typename Indexor>
 	bool ReadCLUT4_16(const TEX0&);

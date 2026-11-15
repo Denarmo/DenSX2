@@ -1482,6 +1482,8 @@ void CGSHandler::SyncCLUT(const TEX0& tex0)
 {
 	if(!ProcessCLD(tex0)) return;
 
+	SyncMemoryForRead(tex0.GetCLUTPtr(), (tex0.nCSM == 0) ? 0x400 : CGsPixelFormats::PAGESIZE);
+
 	//assert(IsPsmIDTEX(tex0.nPsm));
 	switch(tex0.nPsm)
 	{

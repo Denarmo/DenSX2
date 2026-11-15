@@ -912,3 +912,62 @@ Framework::OpenGl::ProgramPtr CGSH_OpenGL::GenerateCopyToFbProgram()
 
 	return program;
 }
+
+Framework::OpenGl::ProgramPtr CGSH_OpenGL::GenerateGpuClutProgram()
+{
+	Framework::OpenGl::CShader vertexShader(GL_VERTEX_SHADER);
+	Framework::OpenGl::CShader pixelShader(GL_FRAGMENT_SHADER);
+
+	{
+		std::stringstream shaderBuilder;
+		shaderBuilder << GLSL_VERSION << std::endl;
+		shaderBuilder << "void main()" << std::endl;
+		shaderBuilder << "{" << std::endl;
+		shaderBuilder << "	vec2 position = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));" << std::endl;
+		shaderBuilder << "	gl_Position = vec4((position * 2.0) - 1.0, 0, 1);" << std::endl;
+		shaderBuilder << "}" << std::endl;
+
+		vertexShader.SetSource(shaderBuilder.str().c_str());
+		FRAMEWORK_MAYBE_UNUSED bool result = vertexShader.Compile();
+		assert(result);
+	}
+
+	{
+		//Entry i of a CSM1 CLUT is pixel (p % 16, p / 16) of a 64 pixel wide buffer at the CLUT pointer, p being i with
+		//bits 3 and 4 swapped: in block (p % 16) / 8 + 2 * ((p / 16) / 8) after the pointer's, placed by the PSMCT32
+		//block layout of the framebuffer's pages.
+		std::stringstream shaderBuilder;
+		shaderBuilder << GLSL_VERSION << std::endl;
+		shaderBuilder << "precision mediump float;" << std::endl;
+		shaderBuilder << "precision highp int;" << std::endl;
+		shaderBuilder << "out vec4 fragColor;" << std::endl;
+		shaderBuilder << "uniform sampler2D g_framebuffer;" << std::endl;
+		shaderBuilder << "uniform ivec4 g_position;" << std::endl; //page, block, pages per row, scale
+		shaderBuilder << "void main()" << std::endl;
+		shaderBuilder << "{" << std::endl;
+		shaderBuilder << "	int i = int(gl_FragCoord.x);" << std::endl;
+		shaderBuilder << "	int p = (i & ~0x18) | ((i & 0x08) << 1) | ((i & 0x10) >> 1);" << std::endl;
+		shaderBuilder << "	int x = p & 15;" << std::endl;
+		shaderBuilder << "	int y = p >> 4;" << std::endl;
+		shaderBuilder << "	int block = g_position.y + ((x >> 3) | ((y >> 3) << 1));" << std::endl;
+		shaderBuilder << "	int page = g_position.x + (block >> 5);" << std::endl;
+		shaderBuilder << "	block &= 31;" << std::endl;
+		shaderBuilder << "	int blockX = (block & 1) | ((block >> 1) & 2) | ((block >> 2) & 4);" << std::endl;
+		shaderBuilder << "	int blockY = ((block >> 1) & 1) | ((block >> 2) & 2);" << std::endl;
+		shaderBuilder << "	ivec2 position = ivec2(((page % g_position.z) * 64) + (blockX * 8) + (x & 7), ((page / g_position.z) * 32) + (blockY * 8) + (y & 7));" << std::endl;
+		shaderBuilder << "	position *= g_position.w;" << std::endl;
+		shaderBuilder << "	fragColor = texelFetch(g_framebuffer, position, 0);" << std::endl;
+		shaderBuilder << "}" << std::endl;
+
+		pixelShader.SetSource(shaderBuilder.str().c_str());
+		FRAMEWORK_MAYBE_UNUSED bool result = pixelShader.Compile();
+		assert(result);
+	}
+
+	auto program = std::make_shared<Framework::OpenGl::CProgram>();
+	program->AttachShader(vertexShader);
+	program->AttachShader(pixelShader);
+	FRAMEWORK_MAYBE_UNUSED bool result = program->Link();
+	assert(result);
+	return program;
+}
