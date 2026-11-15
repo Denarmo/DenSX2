@@ -74,6 +74,13 @@ public:
 	virtual ~CBasicBlock() = default;
 	void Execute();
 	void Compile();
+
+	//Entry point of the compiled code, called directly by the executor's dispatch loop
+	typedef void (*CodeFunction)(void*);
+	CodeFunction GetCode() const
+	{
+		return m_code;
+	}
 	virtual void CompileRange(CMipsJitter*);
 
 	void AddBlockCompileHints(uint32);
@@ -136,6 +143,7 @@ private:
 #else
 	void (*m_function)(void*);
 #endif
+	CodeFunction m_code = nullptr;
 	uint32 m_recycleCount = 0;
 	uint32 m_indirectBranchSlot = INDIRECT_BRANCH_SLOT_NONE;
 	BlockOutLinkPointer m_outLinks[LINK_SLOT_MAX];

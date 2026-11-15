@@ -99,6 +99,7 @@ void CBasicBlock::Compile()
 	}
 
 	m_function = CMemoryFunction(stream.GetBuffer(), stream.GetSize());
+	m_code = reinterpret_cast<CodeFunction>(m_function.GetCode());
 
 	//Blocks that always leave with an exception (idle loops) have no branch link to patch
 	if(!HasLinkSlot(LINK_SLOT_BRANCH))
@@ -176,6 +177,7 @@ void CBasicBlock::Compile()
 	assert(blockIterator->key.size == blockSizeByte);
 
 	m_function = reinterpret_cast<void (*)(void*)>(blockIterator->fct);
+	m_code = m_function;
 
 #endif
 
@@ -501,6 +503,7 @@ void CBasicBlock::CopyFunctionFrom(const std::shared_ptr<CBasicBlock>& other)
 {
 #ifndef AOT_USE_CACHE
 	m_function = other->m_function.CreateInstance();
+	m_code = reinterpret_cast<CodeFunction>(m_function.GetCode());
 	std::copy(std::begin(other->m_linkBlockTrampolineOffset), std::end(other->m_linkBlockTrampolineOffset), m_linkBlockTrampolineOffset);
 #ifdef _DEBUG
 	std::copy(std::begin(other->m_linkBlock), std::end(other->m_linkBlock), m_linkBlock);

@@ -73,7 +73,7 @@ public:
 		{
 			uint32 address = m_context.m_State.nPC & m_addressMask;
 			auto block = m_blockLookup.FindBlockAt(address);
-			block->Execute();
+			block->GetCode()(&m_context);
 			if(m_context.m_indirectBranchMissSrc != MIPS_INVALID_PC)
 			{
 				LinkIndirectBranch();
