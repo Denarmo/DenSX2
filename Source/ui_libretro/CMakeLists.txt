@@ -74,6 +74,8 @@ elseif(TARGET_PLATFORM_IOS)
 elseif(TARGET_PLATFORM_UNIX)
 	list(APPEND UI_LIBRETRO_PROJECT_LIBS "-static-libgcc")
 	list(APPEND UI_LIBRETRO_PROJECT_LIBS "-static-libstdc++")
+	#Keep the static runtime's symbols private: the frontend's own libstdc++ must not bind to them.
+	list(APPEND UI_LIBRETRO_PROJECT_LIBS "-Wl,--exclude-libs,ALL")
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 8 AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
