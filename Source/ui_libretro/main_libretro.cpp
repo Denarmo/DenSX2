@@ -18,6 +18,8 @@
 #include "DefaultAppConfig.h"
 
 #include <vector>
+#include <map>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
@@ -49,8 +51,136 @@ static std::vector<struct retro_variable> m_vars =
         {"play_res_multi", "Resolution Multiplier; 1x|2x|4x|8x"},
         {"play_presentation_mode", "Presentation Mode; Fill Screen|Fit Screen|Original Size"},
         {"play_bilinear_filtering", "Force Bilinear Filtering; false|true"},
+        {"play_widescreen", "Widescreen (games with a patch); disabled|enabled"},
         {NULL, NULL},
 };
+
+//Widescreen: the frontend shows 16:9, with the patches the game needs for it. Patches are written at every vblank on the emulation thread, so they come back
+//after the game reloads its code or settings.
+struct WIDESCREEN_PATCH
+{
+	uint32 address;
+	uint32 value;
+	uint8 size;
+};
+
+struct WIDESCREEN_GAME
+{
+	const char* executable;
+	std::vector<WIDESCREEN_PATCH> patches;
+};
+
+static const std::vector<WIDESCREEN_GAME> g_widescreenGames =
+    {
+        //Colin McRae Rally 3 (PAL): the game's 16:9 setting.
+        {"SLES_511.17;1", {{0x002D108C, 1, 1}}},
+        //Gran Turismo 4 (PAL): with the game's own 16:9 option on, text drawn 3/4 as wide (from PCSX2's
+        //patch by Aero_). The game sets up a race's layout when it loads, so its option is not forced.
+        //The code it jumps to comes first.
+        {"SCES_517.19;1",
+         {
+             {0x00495998, 0x3C090061, 4},
+             {0x0049599C, 0x352984F0, 4},
+             {0x004959A0, 0x812A0000, 4},
+             {0x004959A4, 0xC65A0024, 4},
+             {0x004959A8, 0x11400004, 4},
+             {0x004959AC, 0x3C013F40, 4},
+             {0x004959B0, 0x34210000, 4},
+             {0x004959B4, 0x4481A000, 4},
+             {0x004959B8, 0x4614D682, 4},
+             {0x004959BC, 0x08124B83, 4},
+             {0x00492E08, 0x08125666, 4},
+             {0x0044DF60, 0x00000000, 4},
+         }},
+};
+
+static std::atomic<bool> g_widescreen = false;
+static std::atomic<const WIDESCREEN_GAME*> g_widescreenGame = nullptr;
+static CPS2VM::NewFrameEvent::Connection g_widescreenConnection;
+static std::string g_widescreenExecutable;
+//What each patched address held before its first patch, to put back when widescreen is turned off.
+static std::map<uint32, uint32> g_widescreenOriginals;
+
+static uint32 ReadEeRam(const uint8* ram, uint32 address, uint8 size)
+{
+	switch(size)
+	{
+	case 1:
+		return ram[address];
+	case 2:
+		return *reinterpret_cast<const uint16*>(ram + address);
+	default:
+		return *reinterpret_cast<const uint32*>(ram + address);
+	}
+}
+
+static void WriteEeRam(uint8* ram, uint32 address, uint32 value, uint8 size)
+{
+	switch(size)
+	{
+	case 1:
+		ram[address] = static_cast<uint8>(value);
+		break;
+	case 2:
+		*reinterpret_cast<uint16*>(ram + address) = static_cast<uint16>(value);
+		break;
+	default:
+		*reinterpret_cast<uint32*>(ram + address) = value;
+		break;
+	}
+}
+
+//Runs on the emulation thread. Only differing values are written: a write to compiled code makes the
+//executor drop the blocks it touches.
+static void ApplyWidescreenPatches()
+{
+	if(!m_virtualMachine) return;
+	const char* executable = m_virtualMachine->m_ee->m_os->GetExecutableName();
+	if(!executable) executable = "";
+	if(g_widescreenExecutable != executable)
+	{
+		g_widescreenExecutable = executable;
+		g_widescreenOriginals.clear();
+		const WIDESCREEN_GAME* found = nullptr;
+		for(const auto& game : g_widescreenGames)
+		{
+			if(g_widescreenExecutable == game.executable) found = &game;
+		}
+		g_widescreenGame = found;
+	}
+	const WIDESCREEN_GAME* game = g_widescreenGame;
+	if(!game) return;
+	auto ram = m_virtualMachine->m_ee->m_ram;
+	const auto& patches = game->patches;
+	if(g_widescreen)
+	{
+		for(const auto& patch : patches)
+		{
+			uint32 current = ReadEeRam(ram, patch.address, patch.size);
+			if(current == patch.value) continue;
+			g_widescreenOriginals.emplace(patch.address, current);
+			WriteEeRam(ram, patch.address, patch.value, patch.size);
+		}
+	}
+	else if(!g_widescreenOriginals.empty())
+	{
+		//In reverse, so a jump goes before the code it jumps to.
+		for(auto patch = patches.rbegin(); patch != patches.rend(); patch++)
+		{
+			auto original = g_widescreenOriginals.find(patch->address);
+			if(original == g_widescreenOriginals.end()) continue;
+			if(ReadEeRam(ram, patch->address, patch->size) != patch->value) continue;
+			WriteEeRam(ram, patch->address, original->second, patch->size);
+		}
+		g_widescreenOriginals.clear();
+	}
+}
+
+//Whether the picture is 16:9: widescreen is on and the running game has a patch.
+static bool IsWidescreenActive()
+{
+	return g_widescreen && g_widescreenGame;
+}
 
 enum class BootType
 {
@@ -199,7 +329,19 @@ void retro_get_system_av_info(struct retro_system_av_info* info)
 	info->geometry.base_height = 448;
 	info->geometry.max_width = 640 * 8;
 	info->geometry.max_height = 448 * 8;
-	info->geometry.aspect_ratio = 4.0 / 3.0;
+	info->geometry.aspect_ratio = IsWidescreenActive() ? (16.0 / 9.0) : (4.0 / 3.0);
+}
+
+static bool g_geometryWide = false;
+
+static void UpdateGeometry()
+{
+	bool wide = IsWidescreenActive();
+	if(wide == g_geometryWide) return;
+	g_geometryWide = wide;
+	retro_system_av_info info;
+	retro_get_system_av_info(&info);
+	g_environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &info.geometry);
 }
 
 static void UpdateFrameRate(unsigned frameRate)
@@ -409,6 +551,9 @@ void updateVars()
 				}
 			}
 			break;
+			case 3:
+				g_widescreen = (std::string(var.value) == "enabled");
+				break;
 			}
 
 			if(videoUpdate)
@@ -480,6 +625,7 @@ void retro_run()
 				gsHandler->ProcessSingleFrame();
 			}
 			UpdateFrameRate(gsHandler->GetCrtFrameRate());
+			UpdateGeometry();
 		}
 	}
 }
@@ -531,6 +677,7 @@ bool retro_load_game(const retro_game_info* info)
 	}
 	first_run = false;
 	g_frame_rate = 60;
+	g_geometryWide = false;
 
 	auto rgb = RETRO_PIXEL_FORMAT_XRGB8888;
 	g_environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &rgb);
@@ -594,6 +741,7 @@ void retro_init()
 
 	m_virtualMachine = new CPS2VM();
 	m_virtualMachine->Initialize();
+	g_widescreenConnection = m_virtualMachine->OnNewFrame.Connect(&ApplyWidescreenPatches);
 
 	//Disable frame limiter, RetroArch handles this on its own
 	CAppConfig::GetInstance().SetPreferenceBoolean(PREF_PS2_LIMIT_FRAMERATE, false);
@@ -635,6 +783,7 @@ void retro_deinit()
 		m_virtualMachine->DestroyGSHandler();
 		m_virtualMachine->DestroySoundHandler();
 		m_virtualMachine->Destroy();
+		g_widescreenConnection.reset();
 		delete m_virtualMachine;
 		m_virtualMachine = nullptr;
 	}
