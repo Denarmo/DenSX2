@@ -1,6 +1,8 @@
 #pragma once
 
 #include <list>
+#include <bitset>
+#include <map>
 #include <unordered_map>
 #include "../GSHandler.h"
 #include "../GsDebuggerInterface.h"
@@ -339,6 +341,10 @@ private:
 	void MaterializeGpuClut();
 	void ReleaseGpuClutSource(const CFramebuffer*);
 	Framework::OpenGl::ProgramPtr GenerateGpuClutProgram();
+	Framework::OpenGl::ProgramPtr GenerateByteViewProgram();
+	bool PrepareFramebufferByteTexture(const TEX0&, TEXTURE_INFO&);
+	CFramebuffer* GetByteViewSource(const TEX0&);
+	void BuildByteView(const FramebufferPtr&);
 	void MarkGpuPages();
 	void SyncTextureArea(const TEX0&);
 	void SyncFramebufferToRam(CFramebuffer*, uint32 = 0, uint32 = ~0U);
@@ -511,6 +517,17 @@ private:
 	//While set, the palette is the CLUT at m_gpuClutPosition in this framebuffer, not yet copied.
 	FramebufferPtr m_gpuClutSource;
 	int32 m_gpuClutPosition[4] = {};
+	//PSMT8 reads of a framebuffer the GPU drew: its bytes laid out as PSMT8 pages, a 128x64 tile for each of its
+	//64x32 pages, valid for the pages no draw changed since.
+	FramebufferPtr m_byteViewSource;
+	Framework::OpenGl::CTexture m_byteViewTexture;
+	Framework::OpenGl::CFramebuffer m_byteViewFramebuffer;
+	uint32 m_byteViewWidth = 0;
+	uint32 m_byteViewHeight = 0;
+	std::bitset<GPU_PAGE_COUNT> m_byteViewValid;
+	Framework::OpenGl::ProgramPtr m_byteViewProgram;
+	Framework::OpenGl::CTexture m_byteViewLayout;
+	std::map<uint32, std::pair<std::vector<Framework::OpenGl::CTexture>, uint32>> m_byteViewTextures;
 
 	Framework::OpenGl::CBuffer m_primBuffer;
 	Framework::OpenGl::CVertexArray m_primVertexArray;

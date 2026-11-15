@@ -216,6 +216,11 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::PrepareTexture(const TEX0& tex0)
 		return texInfo;
 	}
 
+	if(PrepareFramebufferByteTexture(tex0, texInfo))
+	{
+		return texInfo;
+	}
+
 	SyncTextureArea(tex0);
 	auto texture = m_textureCache.Search(tex0);
 	if(!texture)

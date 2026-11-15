@@ -949,6 +949,59 @@ Framework::OpenGl::ProgramPtr CGSH_OpenGL::GenerateCopyToFbProgram()
 	return program;
 }
 
+Framework::OpenGl::ProgramPtr CGSH_OpenGL::GenerateByteViewProgram()
+{
+	Framework::OpenGl::CShader vertexShader(GL_VERTEX_SHADER);
+	Framework::OpenGl::CShader pixelShader(GL_FRAGMENT_SHADER);
+
+	{
+		std::stringstream shaderBuilder;
+		shaderBuilder << GLSL_VERSION << std::endl;
+		shaderBuilder << "void main()" << std::endl;
+		shaderBuilder << "{" << std::endl;
+		shaderBuilder << "	vec2 position = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));" << std::endl;
+		shaderBuilder << "	gl_Position = vec4((position * 2.0) - 1.0, 0, 1);" << std::endl;
+		shaderBuilder << "}" << std::endl;
+
+		vertexShader.SetSource(shaderBuilder.str().c_str());
+		FRAMEWORK_MAYBE_UNUSED bool result = vertexShader.Compile();
+		assert(result);
+	}
+
+	{
+		//Texel (x, y) of a PSMT8 page is byte place.z of the PSMCT32 page's pixel place.xy.
+		std::stringstream shaderBuilder;
+		shaderBuilder << GLSL_VERSION << std::endl;
+		shaderBuilder << "precision mediump float;" << std::endl;
+		shaderBuilder << "precision highp int;" << std::endl;
+		shaderBuilder << "out vec4 fragColor;" << std::endl;
+		shaderBuilder << "uniform sampler2D g_framebuffer;" << std::endl;
+		shaderBuilder << "uniform highp usampler2D g_layout;" << std::endl;
+		shaderBuilder << "uniform int g_scale;" << std::endl;
+		shaderBuilder << "void main()" << std::endl;
+		shaderBuilder << "{" << std::endl;
+		shaderBuilder << "	ivec2 texel = ivec2(gl_FragCoord.xy);" << std::endl;
+		shaderBuilder << "	ivec2 page = texel / ivec2(128, 64);" << std::endl;
+		shaderBuilder << "	uvec4 place = texelFetch(g_layout, texel - (page * ivec2(128, 64)), 0);" << std::endl;
+		shaderBuilder << "	ivec2 position = ((page * ivec2(64, 32)) + ivec2(place.xy)) * g_scale;" << std::endl;
+		shaderBuilder << "	vec4 color = texelFetch(g_framebuffer, position, 0);" << std::endl;
+		shaderBuilder << "	float value = (place.z == 0u) ? color.r : ((place.z == 1u) ? color.g : ((place.z == 2u) ? color.b : color.a));" << std::endl;
+		shaderBuilder << "	fragColor = vec4(value, 0.0, 0.0, 0.0);" << std::endl;
+		shaderBuilder << "}" << std::endl;
+
+		pixelShader.SetSource(shaderBuilder.str().c_str());
+		FRAMEWORK_MAYBE_UNUSED bool result = pixelShader.Compile();
+		assert(result);
+	}
+
+	auto program = std::make_shared<Framework::OpenGl::CProgram>();
+	program->AttachShader(vertexShader);
+	program->AttachShader(pixelShader);
+	FRAMEWORK_MAYBE_UNUSED bool result = program->Link();
+	assert(result);
+	return program;
+}
+
 Framework::OpenGl::ProgramPtr CGSH_OpenGL::GenerateGpuClutProgram()
 {
 	Framework::OpenGl::CShader vertexShader(GL_VERTEX_SHADER);

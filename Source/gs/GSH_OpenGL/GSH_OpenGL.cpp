@@ -2937,7 +2937,7 @@ static bool GetPagePosition(uint32 basePtr, uint32 width, uint32 height, uint32 
 void CGSH_OpenGL::MarkGpuPages()
 {
 	auto framebuffer = m_drawFramebuffer;
-	ReleaseGpuClutSource(framebuffer);
+	if(m_gpuClutSource && (m_gpuClutSource.get() == framebuffer)) MaterializeGpuClut();
 	if(!framebuffer || !IsSyncedFramebufferPsm(framebuffer->m_psm)) return;
 
 	float minX = m_vertexBuffer[0].x, maxX = minX;
@@ -2964,6 +2964,7 @@ void CGSH_OpenGL::MarkGpuPages()
 	std::vector<uint32> uploads;
 	for(const auto& [page, blocks] : m_drawBlockList)
 	{
+		m_byteViewValid.reset(page);
 		auto& state = m_gpuPages[page];
 		if(state.owner != framebuffer)
 		{
@@ -2991,6 +2992,7 @@ void CGSH_OpenGL::MarkGpuPages()
 //Another framebuffer over the same memory takes a page over: a copy on the GPU.
 bool CGSH_OpenGL::MoveGpuPage(CFramebuffer* source, CFramebuffer* destination, uint32 page)
 {
+	m_byteViewValid.reset(page);
 	auto& state = m_gpuPages[page];
 	//Each framebuffer places the page by its own width: they need whole pages per row.
 	if(((source->m_width % 64) != 0) || ((destination->m_width % 64) != 0)) return false;
@@ -3034,7 +3036,8 @@ bool CGSH_OpenGL::MoveGpuPage(CFramebuffer* source, CFramebuffer* destination, u
 
 void CGSH_OpenGL::UploadFramebufferPages(const FramebufferPtr& framebuffer, const std::vector<uint32>& pages)
 {
-	ReleaseGpuClutSource(framebuffer.get());
+	if(m_gpuClutSource && (m_gpuClutSource.get() == framebuffer.get())) MaterializeGpuClut();
+	for(auto page : pages) m_byteViewValid.reset(page);
 	m_validGlState &= ~(GLSTATE_SCISSOR | GLSTATE_FRAMEBUFFER | GLSTATE_TEXTURE);
 	glDisable(GL_SCISSOR_TEST);
 	glActiveTexture(GL_TEXTURE0);
@@ -3308,6 +3311,8 @@ void CGSH_OpenGL::WriteBackMemoryCache()
 
 void CGSH_OpenGL::ClearAllGpuPages()
 {
+	m_byteViewValid.reset();
+	m_byteViewSource.reset();
 	m_gpuClutSource.reset();
 	m_gpuClutActive = false;
 	std::fill(std::begin(m_gpuPages), std::end(m_gpuPages), GPU_PAGE());
@@ -3437,6 +3442,181 @@ void CGSH_OpenGL::MaterializeGpuClut()
 void CGSH_OpenGL::ReleaseGpuClutSource(const CFramebuffer* framebuffer)
 {
 	if(m_gpuClutSource && (m_gpuClutSource.get() == framebuffer)) MaterializeGpuClut();
+	if(m_byteViewSource && (m_byteViewSource.get() == framebuffer)) m_byteViewValid.reset();
+}
+
+//The framebuffer that drew all the pages of a PSMT8 texture, if it is one the byte view can read.
+CGSH_OpenGL::CFramebuffer* CGSH_OpenGL::GetByteViewSource(const TEX0& tex0)
+{
+	uint32 bufWidth = tex0.GetBufWidth();
+	uint32 pagesPerRow = bufWidth / 128;
+	uint32 pagesX = (std::min<uint32>(tex0.GetWidth(), TEX0_MAX_TEXTURE_SIZE) + 127) / 128;
+	uint32 pagesY = (std::min<uint32>(tex0.GetHeight(), TEX0_MAX_TEXTURE_SIZE) + 63) / 64;
+	uint32 firstPage = tex0.GetBufPtr() / CGsPixelFormats::PAGESIZE;
+	CFramebuffer* source = nullptr;
+	for(uint32 y = 0; y < pagesY; y++)
+	{
+		for(uint32 x = 0; x < pagesX; x++)
+		{
+			auto owner = m_gpuPages[(firstPage + (y * pagesPerRow) + x) % GPU_PAGE_COUNT].owner;
+			if(!owner || (source && (owner != source))) return nullptr;
+			source = owner;
+		}
+	}
+	if((source->m_psm != PSMCT32) && (source->m_psm != PSMCT24)) return nullptr;
+	if(((source->m_width % 64) != 0) || ((source->m_basePtr % CGsPixelFormats::PAGESIZE) != 0)) return nullptr;
+	return source;
+}
+
+//A PSMT8 texture over pages a PSMCT32/PSMCT24 framebuffer drew (Gran Turismo 4 reads its frame so, a page at a
+//time): its bytes are taken from the framebuffer on the GPU instead of bringing the framebuffer back to RAM.
+bool CGSH_OpenGL::PrepareFramebufferByteTexture(const TEX0& tex0, TEXTURE_INFO& texInfo)
+{
+	if((tex0.nPsm != PSMT8) || (m_gpuPageCount == 0)) return false;
+	if(((tex0.GetBufPtr() % CGsPixelFormats::PAGESIZE) != 0) || (tex0.GetBufWidth() == 0) || ((tex0.GetBufWidth() % 128) != 0)) return false;
+	if(!GetByteViewSource(tex0)) return false;
+	if(!m_vertexBuffer.empty() && m_renderState.isValid) FlushVertexBuffer();
+	auto source = GetByteViewSource(tex0);
+	if(!source) return false;
+	auto sourceIterator = std::find_if(m_framebuffers.begin(), m_framebuffers.end(),
+	                                   [source](const FramebufferPtr& candidate) { return candidate.get() == source; });
+	if(sourceIterator == m_framebuffers.end()) return false;
+
+	uint32 width = std::min<uint32>(tex0.GetWidth(), TEX0_MAX_TEXTURE_SIZE);
+	uint32 height = std::min<uint32>(tex0.GetHeight(), TEX0_MAX_TEXTURE_SIZE);
+	uint32 pagesPerRow = tex0.GetBufWidth() / 128;
+	uint32 pagesX = (width + 127) / 128;
+	uint32 pagesY = (height + 63) / 64;
+	uint32 firstPage = tex0.GetBufPtr() / CGsPixelFormats::PAGESIZE;
+	bool valid = (m_byteViewSource.get() == source);
+	for(uint32 y = 0; valid && (y < pagesY); y++)
+	{
+		for(uint32 x = 0; x < pagesX; x++)
+		{
+			valid = valid && m_byteViewValid.test((firstPage + (y * pagesPerRow) + x) % GPU_PAGE_COUNT);
+		}
+	}
+	if(!valid) BuildByteView(*sourceIterator);
+
+	//A few textures of each size in turn, so that one isn't rewritten while a queued draw still reads it.
+	auto& [textures, next] = m_byteViewTextures[(width << 16) | height];
+	if(textures.size() < 32)
+	{
+		auto texture = Framework::OpenGl::CTexture::Create();
+		glBindTexture(GL_TEXTURE_2D, texture);
+		glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, width, height);
+		textures.push_back(std::move(texture));
+		next = static_cast<uint32>(textures.size() - 1);
+	}
+	else
+	{
+		next = (next + 1) % textures.size();
+	}
+	GLuint texture = textures[next];
+
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, m_byteViewFramebuffer);
+	glBindTexture(GL_TEXTURE_2D, texture);
+	for(uint32 y = 0; y < pagesY; y++)
+	{
+		for(uint32 x = 0; x < pagesX; x++)
+		{
+			uint32 page = (firstPage + (y * pagesPerRow) + x) % GPU_PAGE_COUNT;
+			uint32 pageX = 0, pageY = 0;
+			if(!GetPagePosition(source->m_basePtr, source->m_width, source->m_height, source->m_psm, page, pageX, pageY)) continue;
+			glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x * 128, y * 64, (pageX / 64) * 128, (pageY / 32) * 64,
+			                    std::min<uint32>(128, width - (x * 128)), std::min<uint32>(64, height - (y * 64)));
+		}
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, m_renderState.framebufferHandle);
+	CHECKGLERROR();
+
+	texInfo.textureHandle = texture;
+	return true;
+}
+
+//Lays out all of the framebuffer's bytes as PSMT8 pages.
+void CGSH_OpenGL::BuildByteView(const FramebufferPtr& source)
+{
+	if(m_multisampleEnabled) ResolveFramebufferMultisample(source, m_fbScale);
+	uint32 pagesPerRow = source->m_width / 64;
+	uint32 pageRows = (source->m_height + 31) / 32;
+	uint32 width = pagesPerRow * 128;
+	uint32 height = pageRows * 64;
+
+	if(!m_byteViewProgram)
+	{
+		m_byteViewProgram = GenerateByteViewProgram();
+		glUseProgram(*m_byteViewProgram);
+		glUniform1i(glGetUniformLocation(*m_byteViewProgram, "g_framebuffer"), 0);
+		glUniform1i(glGetUniformLocation(*m_byteViewProgram, "g_layout"), 1);
+
+		//Where each byte of a PSMT8 page is in a PSMCT32 page: pixel x, y and byte.
+		auto offsets8 = CGsPixelFormats::CPixelIndexorPSMT8::GetPageOffsets();
+		auto offsets32 = CGsPixelFormats::CPixelIndexorPSMCT32::GetPageOffsets();
+		std::vector<uint16> pixels(2048);
+		for(uint32 i = 0; i < 64 * 32; i++)
+		{
+			pixels[offsets32[i] / 4] = static_cast<uint16>(((i / 64) << 8) | (i % 64));
+		}
+		std::vector<uint8> layout(128 * 64 * 4);
+		for(uint32 i = 0; i < 128 * 64; i++)
+		{
+			uint16 pixel = pixels[offsets8[i] / 4];
+			layout[(i * 4) + 0] = static_cast<uint8>(pixel & 0xFF);
+			layout[(i * 4) + 1] = static_cast<uint8>(pixel >> 8);
+			layout[(i * 4) + 2] = static_cast<uint8>(offsets8[i] % 4);
+			layout[(i * 4) + 3] = 0;
+		}
+		m_byteViewLayout = Framework::OpenGl::CTexture::Create();
+		glBindTexture(GL_TEXTURE_2D, m_byteViewLayout);
+		glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8UI, 128, 64);
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 128, 64, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, layout.data());
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		CHECKGLERROR();
+	}
+
+	if((width != m_byteViewWidth) || (height != m_byteViewHeight))
+	{
+		m_byteViewTexture = Framework::OpenGl::CTexture::Create();
+		glBindTexture(GL_TEXTURE_2D, m_byteViewTexture);
+		glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, width, height);
+		m_byteViewFramebuffer = Framework::OpenGl::CFramebuffer::Create();
+		glBindFramebuffer(GL_FRAMEBUFFER, m_byteViewFramebuffer);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_byteViewTexture, 0);
+		CHECKGLERROR();
+		m_byteViewWidth = width;
+		m_byteViewHeight = height;
+	}
+
+	m_validGlState &= ~(GLSTATE_BLEND | GLSTATE_COLORMASK | GLSTATE_SCISSOR | GLSTATE_PROGRAM | GLSTATE_TEXTURE);
+	m_validGlState &= ~(GLSTATE_VIEWPORT | GLSTATE_DEPTHTEST | GLSTATE_DEPTHMASK | GLSTATE_FRAMEBUFFER);
+
+	glBindFramebuffer(GL_FRAMEBUFFER, m_byteViewFramebuffer);
+	glDisable(GL_BLEND);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_SCISSOR_TEST);
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	glDepthMask(GL_FALSE);
+	glViewport(0, 0, width, height);
+	glUseProgram(*m_byteViewProgram);
+	glUniform1i(glGetUniformLocation(*m_byteViewProgram, "g_scale"), m_fbScale);
+	glActiveTexture(GL_TEXTURE1);
+	glBindTexture(GL_TEXTURE_2D, m_byteViewLayout);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, source->m_texture);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED);
+	glBindVertexArray(m_copyToFbVertexArray);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	CHECKGLERROR();
+
+	m_byteViewSource = source;
+	m_byteViewValid.reset();
+	uint32 basePage = source->m_basePtr / CGsPixelFormats::PAGESIZE;
+	for(uint32 page = 0; page < (pagesPerRow * pageRows); page++)
+	{
+		m_byteViewValid.set((basePage + page) % GPU_PAGE_COUNT);
+	}
 }
 
 //A 16-color CLUT taken from a CLUT the GPU drew: its entries are read back (rare, it stalls).
