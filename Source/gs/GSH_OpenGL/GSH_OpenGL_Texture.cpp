@@ -282,7 +282,29 @@ GLuint CGSH_OpenGL::PreparePalette(const TEX0& tex0)
 {
 	if(m_gpuClutActive)
 	{
-		if(CGsPixelFormats::IsPsmIDTEX8(tex0.nPsm)) return m_gpuClutTexture;
+		if(CGsPixelFormats::IsPsmIDTEX8(tex0.nPsm))
+		{
+			//The texture is the palette's framebuffer read through its alpha: the palette needs its own copy.
+			if(m_gpuClutSource && m_renderState.texture0AlphaAsIndex && (m_renderState.texture0Handle == m_gpuClutSource->m_texture))
+			{
+				MaterializeGpuClut();
+			}
+			if(!m_gpuClutSource) return m_gpuClutTexture;
+			if(m_multisampleEnabled) ResolveFramebufferMultisample(m_gpuClutSource, m_fbScale);
+			for(int quarter = 0; quarter < 4; quarter++)
+			{
+				int block = m_gpuClutPosition[1] + quarter;
+				int page = m_gpuClutPosition[0] + (block >> 5);
+				block &= 31;
+				int blockX = (block & 1) | ((block >> 1) & 2) | ((block >> 2) & 4);
+				int blockY = ((block >> 1) & 1) | ((block >> 2) & 2);
+				m_fragmentParams.clutOrigins[(quarter * 2) + 0] = ((page % m_gpuClutPosition[2]) * 64) + (blockX * 8);
+				m_fragmentParams.clutOrigins[(quarter * 2) + 1] = ((page / m_gpuClutPosition[2]) * 32) + (blockY * 8);
+			}
+			m_fragmentParams.clutScale[0] = m_gpuClutPosition[3];
+			m_validGlState &= ~GLSTATE_FRAGMENT_PARAMS;
+			return m_gpuClutSource->m_texture;
+		}
 		ReadGpuClut();
 	}
 	GLuint textureHandle = PalCache_Search(tex0);

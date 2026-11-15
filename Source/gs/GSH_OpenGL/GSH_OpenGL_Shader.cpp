@@ -105,7 +105,7 @@ void CGSH_OpenGL::LoadProgramCache()
 
 	//Binaries are only good for the build and driver that made them.
 	std::string key = std::string(PLAY_VERSION) + "|" + GetGlString(GL_VENDOR) + "|" + GetGlString(GL_RENDERER) + "|" +
-	                  GetGlString(GL_VERSION) + "|" + std::to_string(m_hasFramebufferFetchExtension) +
+	                  GetGlString(GL_VERSION) + "|shaders 2|" + std::to_string(m_hasFramebufferFetchExtension) +
 	                  std::to_string(m_hasFramebufferFetchDepthExtension);
 
 	if(FILE* input = fopen(g_programCachePath.c_str(), "rb"))
@@ -338,7 +338,26 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
 	shaderBuilder << "	uint g_alphaRef;" << std::endl;
 	shaderBuilder << "	float g_alphaFix;" << std::endl;
 	shaderBuilder << "	vec3 g_fogColor;" << std::endl;
+	shaderBuilder << "	ivec4 g_clutOrigins01;" << std::endl;
+	shaderBuilder << "	ivec4 g_clutOrigins23;" << std::endl;
+	shaderBuilder << "	ivec4 g_clutScale;" << std::endl;
 	shaderBuilder << "};" << std::endl;
+
+	if(caps.texPaletteFromFramebuffer)
+	{
+		//Entry i of a CSM1 CLUT is pixel (p % 16, p / 16) of a 16x16 square, p being i with bits 3 and 4 swapped;
+		//each 8x8 quarter is a block whose place in the framebuffer comes with the draw.
+		shaderBuilder << "vec4 paletteColor(float colorIndex)" << std::endl;
+		shaderBuilder << "{" << std::endl;
+		shaderBuilder << "	int i = int(colorIndex + 0.5);" << std::endl;
+		shaderBuilder << "	int p = (i & 0xE7) | ((i & 0x08) << 1) | ((i & 0x10) >> 1);" << std::endl;
+		shaderBuilder << "	int x = p & 15;" << std::endl;
+		shaderBuilder << "	int y = p >> 4;" << std::endl;
+		shaderBuilder << "	int quarter = (x >> 3) + ((y >> 3) * 2);" << std::endl;
+		shaderBuilder << "	ivec2 origin = (quarter == 0) ? g_clutOrigins01.xy : ((quarter == 1) ? g_clutOrigins01.zw : ((quarter == 2) ? g_clutOrigins23.xy : g_clutOrigins23.zw));" << std::endl;
+		shaderBuilder << "	return texelFetch(g_palette, (origin + ivec2(x & 7, y & 7)) * g_clutScale.x, 0);" << std::endl;
+		shaderBuilder << "}" << std::endl;
+	}
 
 	if(caps.texClampS == TEXTURE_CLAMP_MODE_REGION_REPEAT || caps.texClampT == TEXTURE_CLAMP_MODE_REGION_REPEAT)
 	{
@@ -412,8 +431,15 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
 			}
 			else if(caps.texSourceMode == TEXTURE_SOURCE_MODE_IDX8)
 			{
-				shaderBuilder << "	float paletteTexelBias = 0.5 / 256.0;" << std::endl;
-				shaderBuilder << "	textureColor = expandAlpha(texture(g_palette, vec2(colorIndex / 256.0 + paletteTexelBias, 0)));" << std::endl;
+				if(caps.texPaletteFromFramebuffer)
+				{
+					shaderBuilder << "	textureColor = expandAlpha(paletteColor(colorIndex));" << std::endl;
+				}
+				else
+				{
+					shaderBuilder << "	float paletteTexelBias = 0.5 / 256.0;" << std::endl;
+					shaderBuilder << "	textureColor = expandAlpha(texture(g_palette, vec2(colorIndex / 256.0 + paletteTexelBias, 0)));" << std::endl;
+				}
 			}
 		}
 		else
@@ -433,11 +459,21 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
 			}
 			else if(caps.texSourceMode == TEXTURE_SOURCE_MODE_IDX8)
 			{
-				shaderBuilder << "	float paletteTexelBias = 0.5 / 256.0;" << std::endl;
-				shaderBuilder << "	vec4 tl = expandAlpha(texture(g_palette, vec2(tlIdx / 256.0 + paletteTexelBias, 0)));" << std::endl;
-				shaderBuilder << "	vec4 tr = expandAlpha(texture(g_palette, vec2(trIdx / 256.0 + paletteTexelBias, 0)));" << std::endl;
-				shaderBuilder << "	vec4 bl = expandAlpha(texture(g_palette, vec2(blIdx / 256.0 + paletteTexelBias, 0)));" << std::endl;
-				shaderBuilder << "	vec4 br = expandAlpha(texture(g_palette, vec2(brIdx / 256.0 + paletteTexelBias, 0)));" << std::endl;
+				if(caps.texPaletteFromFramebuffer)
+				{
+					shaderBuilder << "	vec4 tl = expandAlpha(paletteColor(tlIdx));" << std::endl;
+					shaderBuilder << "	vec4 tr = expandAlpha(paletteColor(trIdx));" << std::endl;
+					shaderBuilder << "	vec4 bl = expandAlpha(paletteColor(blIdx));" << std::endl;
+					shaderBuilder << "	vec4 br = expandAlpha(paletteColor(brIdx));" << std::endl;
+				}
+				else
+				{
+					shaderBuilder << "	float paletteTexelBias = 0.5 / 256.0;" << std::endl;
+					shaderBuilder << "	vec4 tl = expandAlpha(texture(g_palette, vec2(tlIdx / 256.0 + paletteTexelBias, 0)));" << std::endl;
+					shaderBuilder << "	vec4 tr = expandAlpha(texture(g_palette, vec2(trIdx / 256.0 + paletteTexelBias, 0)));" << std::endl;
+					shaderBuilder << "	vec4 bl = expandAlpha(texture(g_palette, vec2(blIdx / 256.0 + paletteTexelBias, 0)));" << std::endl;
+					shaderBuilder << "	vec4 br = expandAlpha(texture(g_palette, vec2(brIdx / 256.0 + paletteTexelBias, 0)));" << std::endl;
+				}
 			}
 
 			shaderBuilder << "	highp vec2 f = fract(texCoord.st * g_textureSize);" << std::endl;

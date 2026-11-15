@@ -101,6 +101,9 @@ private:
 		unsigned int alphaTestDepthTest_DepthFetch : 1;
 		unsigned int alphaTestDepthTestEqual_DepthFetch : 1;
 
+		//The 256-colour palette is a CLUT in a framebuffer, read by the shader where it is
+		unsigned int texPaletteFromFramebuffer : 1;
+
 		bool isIndexedTextureSource() const
 		{
 			return texSourceMode == TEXTURE_SOURCE_MODE_IDX4 || texSourceMode == TEXTURE_SOURCE_MODE_IDX8;
@@ -175,8 +178,11 @@ private:
 		float alphaFix;
 		float fogColor[3];
 		float padding2;
+		//Where the four blocks of a palette read from a framebuffer are (x, y pairs), and the framebuffer's scale
+		int32 clutOrigins[8];
+		int32 clutScale[4];
 	};
-	static_assert(sizeof(FRAGMENTPARAMS) == 0x40, "Size of FRAGMENTPARAMS must be 64 bytes.");
+	static_assert(sizeof(FRAGMENTPARAMS) == 0x70, "Size of FRAGMENTPARAMS must be 112 bytes.");
 
 	enum
 	{
@@ -330,6 +336,8 @@ private:
 	void SyncCLUT(const TEX0&) override;
 	bool SyncClutOnGpu(const TEX0&);
 	void ReadGpuClut();
+	void MaterializeGpuClut();
+	void ReleaseGpuClutSource(const CFramebuffer*);
 	Framework::OpenGl::ProgramPtr GenerateGpuClutProgram();
 	void MarkGpuPages();
 	void SyncTextureArea(const TEX0&);
@@ -500,6 +508,9 @@ private:
 	Framework::OpenGl::CTexture m_gpuClutTexture;
 	Framework::OpenGl::CFramebuffer m_gpuClutFramebuffer;
 	bool m_gpuClutActive = false;
+	//While set, the palette is the CLUT at m_gpuClutPosition in this framebuffer, not yet copied.
+	FramebufferPtr m_gpuClutSource;
+	int32 m_gpuClutPosition[4] = {};
 
 	Framework::OpenGl::CBuffer m_primBuffer;
 	Framework::OpenGl::CVertexArray m_primVertexArray;

@@ -622,6 +622,18 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
 	if(!prim.nTexture)
 	{
 		shaderCaps.texSourceMode = TEXTURE_SOURCE_MODE_NONE;
+		shaderCaps.texPaletteFromFramebuffer = 0;
+	}
+
+	if(shaderCaps.texPaletteFromFramebuffer)
+	{
+		//A draw into the palette's framebuffer would read its own target: it gets a copy.
+		auto frame = make_convertible<FRAME>(frameReg);
+		if((m_gpuClutSource->m_basePtr == frame.GetBasePtr()) && (m_gpuClutSource->m_width == frame.GetWidth()))
+		{
+			MaterializeGpuClut();
+			shaderCaps.texPaletteFromFramebuffer = 0;
+		}
 	}
 
 	//--------------------------------------------------------
@@ -630,7 +642,7 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
 	if(m_renderState.isValid)
 	{
 		if(m_renderState.isTextureStateValid && m_renderState.isFramebufferStateValid &&
-		   (static_cast<uint32>(m_renderState.shaderCaps) == static_cast<uint32>(shaderCaps)) &&
+		   (static_cast<ShaderCapsInt>(m_renderState.shaderCaps) == static_cast<ShaderCapsInt>(shaderCaps)) &&
 		   (m_renderState.primReg == primReg) &&
 		   (m_renderState.alphaReg == alphaReg) &&
 		   (m_renderState.testReg == testReg) &&
@@ -656,7 +668,7 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
 	//--------------------------------------------------------
 	uint64 prevPrimValue = m_renderState.isValid ? m_renderState.primReg : 0;
 	auto prevPrim = make_convertible<PRMODE>(prevPrimValue);
-	bool shaderChanged = !m_renderState.isValid || (static_cast<uint32>(m_renderState.shaderCaps) != static_cast<uint32>(shaderCaps));
+	bool shaderChanged = !m_renderState.isValid || (static_cast<ShaderCapsInt>(m_renderState.shaderCaps) != static_cast<ShaderCapsInt>(shaderCaps));
 	bool primChanged = !m_renderState.isValid || (m_renderState.primReg != primReg);
 	bool blendEnableChanged = primChanged && !m_hasFramebufferFetchExtension && ((!m_renderState.isValid) || (prevPrim.nAlpha != prim.nAlpha));
 	bool alphaChanged = !m_renderState.isValid || (m_renderState.alphaReg != alphaReg);
@@ -721,6 +733,14 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
 	{
 		SetupTexture(primReg, tex0Reg, tex1Reg, texAReg, clampReg);
 		CHECKGLERROR();
+	}
+
+	if(m_renderState.shaderCaps.texPaletteFromFramebuffer && !m_gpuClutSource)
+	{
+		//The palette was copied while the texture was set up: the copy is bound.
+		auto caps = m_renderState.shaderCaps;
+		caps.texPaletteFromFramebuffer = 0;
+		m_renderState.shaderCaps = caps;
 	}
 
 	if(fogColorChanged)
@@ -1223,6 +1243,7 @@ void CGSH_OpenGL::FillShaderCapsFromTexture(SHADERCAPS& shaderCaps, const uint64
 		}
 
 		shaderCaps.texSourceMode = CGsPixelFormats::IsPsmIDTEX4(tex0.nPsm) ? TEXTURE_SOURCE_MODE_IDX4 : TEXTURE_SOURCE_MODE_IDX8;
+		shaderCaps.texPaletteFromFramebuffer = (m_gpuClutSource && CGsPixelFormats::IsPsmIDTEX8(tex0.nPsm)) ? 1 : 0;
 	}
 
 	if(texA.nAEM)
@@ -1862,6 +1883,11 @@ void CGSH_OpenGL::DoRenderPass()
 
 		glActiveTexture(GL_TEXTURE1);
 		glBindTexture(GL_TEXTURE_2D, m_renderState.texture1Handle);
+		if(m_renderState.shaderCaps.texPaletteFromFramebuffer)
+		{
+			//A framebuffer's texture keeps the swizzle of its last use as an alpha-indexed texture.
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED);
+		}
 
 		m_validGlState |= GLSTATE_TEXTURE;
 	}
@@ -2329,6 +2355,7 @@ void CGSH_OpenGL::ProcessLocalToLocalTransfer()
 
 		const auto& srcFramebuffer = (*srcFramebufferIterator);
 		const auto& dstFramebuffer = (*dstFramebufferIterator);
+		ReleaseGpuClutSource(dstFramebuffer.get());
 
 		glBindFramebuffer(GL_FRAMEBUFFER, dstFramebuffer->m_framebuffer);
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, srcFramebuffer->m_framebuffer);
@@ -2678,6 +2705,7 @@ void CGSH_OpenGL::CommitFramebufferDirtyPages(const FramebufferPtr& framebuffer,
 	};
 
 	auto& cachedArea = framebuffer->m_cachedArea;
+	if(cachedArea.HasDirtyPages()) ReleaseGpuClutSource(framebuffer.get());
 
 	auto texturePageSize = CGsPixelFormats::GetPsmPageSize(framebuffer->m_psm);
 
@@ -2909,6 +2937,7 @@ static bool GetPagePosition(uint32 basePtr, uint32 width, uint32 height, uint32 
 void CGSH_OpenGL::MarkGpuPages()
 {
 	auto framebuffer = m_drawFramebuffer;
+	ReleaseGpuClutSource(framebuffer);
 	if(!framebuffer || !IsSyncedFramebufferPsm(framebuffer->m_psm)) return;
 
 	float minX = m_vertexBuffer[0].x, maxX = minX;
@@ -2977,6 +3006,7 @@ bool CGSH_OpenGL::MoveGpuPage(CFramebuffer* source, CFramebuffer* destination, u
 	auto destinationIterator = std::find_if(m_framebuffers.begin(), m_framebuffers.end(),
 	                                        [destination](const FramebufferPtr& candidate) { return candidate.get() == destination; });
 	if(destinationIterator == m_framebuffers.end()) return false;
+	ReleaseGpuClutSource(destination);
 	if(state.syncedFrom != destination)
 	{
 		//Its own copy of the page first: what the source didn't draw (and its alpha, from a PSMCT24 one).
@@ -3004,6 +3034,7 @@ bool CGSH_OpenGL::MoveGpuPage(CFramebuffer* source, CFramebuffer* destination, u
 
 void CGSH_OpenGL::UploadFramebufferPages(const FramebufferPtr& framebuffer, const std::vector<uint32>& pages)
 {
+	ReleaseGpuClutSource(framebuffer.get());
 	m_validGlState &= ~(GLSTATE_SCISSOR | GLSTATE_FRAMEBUFFER | GLSTATE_TEXTURE);
 	glDisable(GL_SCISSOR_TEST);
 	glActiveTexture(GL_TEXTURE0);
@@ -3277,6 +3308,8 @@ void CGSH_OpenGL::WriteBackMemoryCache()
 
 void CGSH_OpenGL::ClearAllGpuPages()
 {
+	m_gpuClutSource.reset();
+	m_gpuClutActive = false;
 	std::fill(std::begin(m_gpuPages), std::end(m_gpuPages), GPU_PAGE());
 	m_gpuPageCount = 0;
 	m_drawFramebuffer = nullptr;
@@ -3291,6 +3324,7 @@ void CGSH_OpenGL::SyncCLUT(const TEX0& tex0)
 	if(m_gpuClutActive)
 	{
 		m_gpuClutActive = false;
+		m_gpuClutSource.reset();
 		ProcessClutTransfer(tex0.nCSA, 0);
 	}
 	SyncMemoryForRead(tex0.GetCLUTPtr(), (tex0.nCSM == 0) ? 0x400 : CGsPixelFormats::PAGESIZE);
@@ -3336,16 +3370,28 @@ bool CGSH_OpenGL::SyncClutOnGpu(const TEX0& tex0)
 	uint32 pagesPerRow = std::max<uint32>(1, framebuffer->m_width / 64);
 	if((((page + 1) / pagesPerRow) * 32) >= framebuffer->m_height) return false;
 
-	GLuint sourceTexture = framebuffer->m_texture;
-	if(m_multisampleEnabled)
-	{
-		auto framebufferIterator = std::find_if(m_framebuffers.begin(), m_framebuffers.end(),
-		                                        [framebuffer](const FramebufferPtr& candidate) { return candidate.get() == framebuffer; });
-		if(framebufferIterator != m_framebuffers.end())
-		{
-			ResolveFramebufferMultisample(*framebufferIterator, m_fbScale);
-		}
-	}
+	auto framebufferIterator = std::find_if(m_framebuffers.begin(), m_framebuffers.end(),
+	                                        [framebuffer](const FramebufferPtr& candidate) { return candidate.get() == framebuffer; });
+	if(framebufferIterator == m_framebuffers.end()) return false;
+
+	//The draws read the palette from the framebuffer until something changes it (MaterializeGpuClut).
+	m_gpuClutSource = *framebufferIterator;
+	m_gpuClutPosition[0] = page;
+	m_gpuClutPosition[1] = block;
+	m_gpuClutPosition[2] = pagesPerRow;
+	m_gpuClutPosition[3] = m_fbScale;
+	m_gpuClutActive = true;
+	m_renderState.isTextureStateValid = false;
+	return true;
+}
+
+//Copies the palette the draws read from a framebuffer into the palette texture, before the framebuffer changes.
+void CGSH_OpenGL::MaterializeGpuClut()
+{
+	if(!m_gpuClutSource) return;
+	auto source = std::move(m_gpuClutSource);
+	m_gpuClutSource.reset();
+	if(m_multisampleEnabled) ResolveFramebufferMultisample(source, m_fbScale);
 
 	if(!m_gpuClutProgram)
 	{
@@ -3377,21 +3423,26 @@ bool CGSH_OpenGL::SyncClutOnGpu(const TEX0& tex0)
 	glDepthMask(GL_FALSE);
 	glViewport(0, 0, 256, 1);
 	glUseProgram(*m_gpuClutProgram);
-	glUniform4i(m_gpuClutPositionUniform, page, block, pagesPerRow, m_fbScale);
+	glUniform4i(m_gpuClutPositionUniform, m_gpuClutPosition[0], m_gpuClutPosition[1], m_gpuClutPosition[2], m_gpuClutPosition[3]);
 	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, sourceTexture);
+	glBindTexture(GL_TEXTURE_2D, source->m_texture);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED);
 	glBindVertexArray(m_copyToFbVertexArray);
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 	CHECKGLERROR();
 
-	m_gpuClutActive = true;
 	m_renderState.isTextureStateValid = false;
-	return true;
+}
+
+void CGSH_OpenGL::ReleaseGpuClutSource(const CFramebuffer* framebuffer)
+{
+	if(m_gpuClutSource && (m_gpuClutSource.get() == framebuffer)) MaterializeGpuClut();
 }
 
 //A 16-color CLUT taken from a CLUT the GPU drew: its entries are read back (rare, it stalls).
 void CGSH_OpenGL::ReadGpuClut()
 {
+	MaterializeGpuClut();
 	m_gpuClutActive = false;
 	uint32 colors[256];
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, m_gpuClutFramebuffer);
