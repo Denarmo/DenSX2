@@ -67,7 +67,14 @@ public:
 		{
 			uint32 address = m_context.m_State.nPC & m_addressMask;
 			auto block = m_blockLookup.FindBlockAt(address);
-			block->GetCode()(&m_context);
+			if(m_context.m_fixedFrameEntry)
+			{
+				m_context.m_fixedFrameEntry(&m_context, reinterpret_cast<void*>(block->GetCode()));
+			}
+			else
+			{
+				block->GetCode()(&m_context);
+			}
 		}
 		m_context.m_State.nHasException &= ~MIPS_EXCEPTION_STATUS_QUOTADONE;
 #ifdef DEBUGGER_INCLUDED

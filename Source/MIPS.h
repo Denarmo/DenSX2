@@ -170,6 +170,14 @@ public:
 
 	void* m_vuMem = nullptr;
 	void** m_pageLookup = nullptr;
+	//Block code by address ((address & m_blockCodeLookupMask) >> 16, then (address & 0xFFFF) / 4), set by
+	//executors that let blocks jump to dynamic targets directly.
+	void*** m_blockCodeLookup = nullptr;
+	uint32 m_blockCodeLookupMask = 0;
+	//Set by executors whose blocks run in a fixed frame (CCodeGen::SetFixedFrameExit): blocks are entered
+	//through m_fixedFrameEntry(context, code) and leave by branching to m_fixedFrameExit.
+	void (*m_fixedFrameEntry)(void*, void*) = nullptr;
+	void* m_fixedFrameExit = nullptr;
 
 	std::function<void(CMIPS*)> m_emptyBlockHandler;
 

@@ -579,6 +579,15 @@ void CCOP_FPU::LWC1()
 {
 	bool usePageLookup = (m_pCtx->m_pageLookup != nullptr);
 
+	if(usePageLookup && m_codeGen->SupportsPageAccess())
+	{
+		m_codeGen->PushRelRef(offsetof(CMIPS, m_pageLookup));
+		ComputeMemAccessAddrNoXlat();
+		m_codeGen->LoadFromPage(4, reinterpret_cast<void*>(&MemoryUtils_GetWordProxy));
+		m_codeGen->PullRel(offsetof(CMIPS, m_State.nCOP1[m_ft]));
+		return;
+	}
+
 	if(usePageLookup)
 	{
 		ComputeMemAccessPageRef();
@@ -617,6 +626,15 @@ void CCOP_FPU::LWC1()
 void CCOP_FPU::SWC1()
 {
 	bool usePageLookup = (m_pCtx->m_pageLookup != nullptr);
+
+	if(usePageLookup && m_codeGen->SupportsPageAccess())
+	{
+		m_codeGen->PushRelRef(offsetof(CMIPS, m_pageLookup));
+		ComputeMemAccessAddrNoXlat();
+		m_codeGen->PushRel(offsetof(CMIPS, m_State.nCOP1[m_ft]));
+		m_codeGen->StoreAtPage(4, reinterpret_cast<void*>(&MemoryUtils_SetWordProxy));
+		return;
+	}
 
 	if(usePageLookup)
 	{

@@ -38,11 +38,34 @@
 
 static CEeExecutor* g_eeExecutor = nullptr;
 
+//Where a block jumps when its target isn't compiled: back to the executor loop, which compiles it (jumping
+//to the empty block's code would compile and run it nested in this call, without bound)
+static void ReturnToExecutor(void*)
+{
+}
+
 CEeExecutor::CEeExecutor(CMIPS& context, uint8* ram)
     : CGenericMipsExecutor(context, 0x20000000, BLOCK_CATEGORY_PS2_EE)
     , m_ram(ram)
 {
+	void* returnToExecutor = reinterpret_cast<void*>(&ReturnToExecutor);
+	if(SetupBlockFixedFrame(context))
+	{
+		returnToExecutor = context.m_fixedFrameExit;
+		//Made by the base class before the frame existed
+		m_emptyBlock->Compile();
+	}
+	m_blockLookup.EnableCodeTable(returnToExecutor);
+	context.m_blockCodeLookup = m_blockLookup.GetCodeTable();
+	context.m_blockCodeLookupMask = m_addressMask;
 	m_pageSize = framework_getpagesize();
+}
+
+CEeExecutor::~CEeExecutor()
+{
+	m_context.m_blockCodeLookup = nullptr;
+	m_context.m_fixedFrameEntry = nullptr;
+	m_context.m_fixedFrameExit = nullptr;
 }
 
 void CEeExecutor::SetBlockFpRoundingModes(BlockFpRoundingModeMap blockFpRoundingModes)

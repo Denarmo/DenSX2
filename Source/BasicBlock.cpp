@@ -3,6 +3,9 @@
 #include "offsetof_def.h"
 #include "MipsJitter.h"
 #include "Jitter_CodeGenFactory.h"
+#if defined(__aarch64__) && !defined(__APPLE__) && !defined(AOT_ENABLED)
+#include "Jitter_CodeGen_AArch64.h"
+#endif
 
 #if defined(AOT_BUILD_CACHE) || defined(AOT_USE_CACHE)
 #define AOT_ENABLED
@@ -91,6 +94,7 @@ void CBasicBlock::Compile()
 			jitter = new CMipsJitter(codeGen);
 		}
 
+		jitter->GetCodeGen()->SetFixedFrameExit(m_context.m_fixedFrameExit);
 		jitter->GetCodeGen()->SetExternalSymbolReferencedHandler([&](auto symbol, auto offset, auto refType) { this->HandleExternalFunctionReference(symbol, offset, refType); });
 		jitter->SetStream(&stream);
 		jitter->Begin();
@@ -100,6 +104,17 @@ void CBasicBlock::Compile()
 
 	m_function = CMemoryFunction(stream.GetBuffer(), stream.GetSize());
 	m_code = reinterpret_cast<CodeFunction>(m_function.GetCode());
+	if(m_context.m_fixedFrameExit)
+	{
+		//Unlinked exits leave the frame instead of calling the trampolines
+		for(uint32 i = 0; i < LINK_SLOT_MAX; i++)
+		{
+			if(HasLinkSlot(static_cast<LINK_SLOT>(i)))
+			{
+				UnlinkBlock(static_cast<LINK_SLOT>(i));
+			}
+		}
+	}
 
 #ifdef VTUNE_ENABLED
 	if(iJIT_IsProfilingActive() == iJIT_SAMPLING_ON)
@@ -239,6 +254,18 @@ void CBasicBlock::CompileRange(CMipsJitter* jitter)
 	CompileEpilog(jitter, loopsOnItself);
 }
 
+bool CBasicBlock::EndsWithDynamicBranch() const
+{
+	if(m_begin == m_end) return false;
+	uint32 branchInstAddr = m_end - 4;
+	uint32 inst = m_context.m_pMemoryMap->GetInstruction(branchInstAddr);
+	if(m_context.m_pArch->IsInstructionBranch(&m_context, branchInstAddr, inst) != MIPS_BRANCH_NORMAL)
+	{
+		return false;
+	}
+	return m_context.m_pArch->GetInstructionEffectiveAddress(&m_context, branchInstAddr, inst) == MIPS_INVALID_PC;
+}
+
 void CBasicBlock::CompileProlog(CMipsJitter* jitter)
 {
 #ifdef DEBUGGER_INCLUDED
@@ -304,7 +331,26 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
 			jitter->PushCst(0);
 			jitter->BeginIf(Jitter::CONDITION_EQ);
 			{
-				jitter->JumpToDynamic(reinterpret_cast<void*>(&BranchBlockTrampoline));
+				if(EndsWithDynamicBranch() && m_context.m_blockCodeLookup && jitter->SupportsExternJmpRef())
+				{
+					//Find the target's code here: each such exit gets its own branch prediction
+					jitter->PushRelRef(offsetof(CMIPS, m_blockCodeLookup));
+					jitter->PushRel(offsetof(CMIPS, m_State.nPC));
+					jitter->PushCst(m_context.m_blockCodeLookupMask);
+					jitter->And();
+					jitter->Srl(16);
+					jitter->LoadRefFromRefIdx();
+					jitter->PushRel(offsetof(CMIPS, m_State.nPC));
+					jitter->PushCst(0xFFFC);
+					jitter->And();
+					jitter->Srl(2);
+					jitter->LoadRefFromRefIdx();
+					jitter->JumpToRef();
+				}
+				else
+				{
+					jitter->JumpToDynamic(reinterpret_cast<void*>(&BranchBlockTrampoline));
+				}
 			}
 			jitter->EndIf();
 #endif
@@ -332,7 +378,14 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
 
 void CBasicBlock::Execute()
 {
-	m_function(&m_context);
+	if(m_context.m_fixedFrameEntry)
+	{
+		m_context.m_fixedFrameEntry(&m_context, m_function.GetCode());
+	}
+	else
+	{
+		m_function(&m_context);
+	}
 
 	assert(m_context.m_State.nGPR[0].nV0 == 0);
 	assert(m_context.m_State.nGPR[0].nV1 == 0);
@@ -424,10 +477,13 @@ void CBasicBlock::UnlinkBlock(LINK_SLOT linkSlot)
 	assert(linkSlot < LINK_SLOT_MAX);
 	assert(m_linkBlockTrampolineOffset[linkSlot] != INVALID_LINK_SLOT);
 #ifdef _DEBUG
-	assert(m_linkBlock[linkSlot] != nullptr);
 	m_linkBlock[linkSlot] = nullptr;
 #endif
 	auto patchValue = (linkSlot == LINK_SLOT_NEXT) ? reinterpret_cast<uintptr_t>(&NextBlockTrampoline) : reinterpret_cast<uintptr_t>(&BranchBlockTrampoline);
+	if(m_context.m_fixedFrameExit)
+	{
+		patchValue = reinterpret_cast<uintptr_t>(m_context.m_fixedFrameExit);
+	}
 	auto code = reinterpret_cast<uint8*>(m_function.GetCode());
 	m_function.BeginModify();
 	*reinterpret_cast<uintptr_t*>(code + m_linkBlockTrampolineOffset[linkSlot]) = patchValue;
@@ -502,6 +558,25 @@ void CBasicBlock::BreakpointHandler(CMIPS* context)
 }
 
 #endif
+
+bool SetupBlockFixedFrame(CMIPS& context)
+{
+#if defined(__aarch64__) && !defined(__APPLE__) && !defined(AOT_ENABLED)
+	//One frame for all: blocks can outlive the executors that made them
+	static const auto frame = []() {
+		Framework::CMemStream stream;
+		uint32 exitOffset = 0;
+		Jitter::CCodeGen_AArch64::GenerateFixedFrame(stream, exitOffset);
+		auto function = new CMemoryFunction(stream.GetBuffer(), stream.GetSize());
+		return std::make_pair(function->GetCode(), reinterpret_cast<uint8*>(function->GetCode()) + exitOffset);
+	}();
+	context.m_fixedFrameEntry = reinterpret_cast<void (*)(void*, void*)>(frame.first);
+	context.m_fixedFrameExit = frame.second;
+	return true;
+#else
+	return false;
+#endif
+}
 
 void EmptyBlockHandler(CMIPS* context)
 {

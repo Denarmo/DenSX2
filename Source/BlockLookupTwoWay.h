@@ -20,6 +20,15 @@ public:
 
 	~BlockLookupTwoWay()
 	{
+		if(m_codeTable)
+		{
+			for(unsigned int i = 0; i < m_subTableCount; i++)
+			{
+				if(m_codeTable[i] != m_emptyCodeSubTable) delete[] m_codeTable[i];
+			}
+			delete[] m_codeTable;
+			delete[] m_emptyCodeSubTable;
+		}
 		for(unsigned int i = 0; i < m_subTableCount; i++)
 		{
 			auto subTable = m_blockTable[i];
@@ -41,7 +50,36 @@ public:
 				delete[] subTable;
 				m_blockTable[i] = nullptr;
 			}
+			if(m_codeTable && (m_codeTable[i] != m_emptyCodeSubTable))
+			{
+				delete[] m_codeTable[i];
+				m_codeTable[i] = m_emptyCodeSubTable;
+			}
 		}
+	}
+
+	//Keep a table of block code next to the block table, for generated code to look up. Empty entries hold
+	//the empty block's code (it compiles the block).
+	void EnableCodeTable(void* emptyCode)
+	{
+		assert(!m_codeTable);
+		m_emptyCode = emptyCode;
+		const uint32 subTableSize = SUBTABLE_SIZE / INSTRUCTION_SIZE;
+		m_emptyCodeSubTable = new void*[subTableSize];
+		for(uint32 i = 0; i < subTableSize; i++)
+		{
+			m_emptyCodeSubTable[i] = emptyCode;
+		}
+		m_codeTable = new void**[m_subTableCount];
+		for(uint32 i = 0; i < m_subTableCount; i++)
+		{
+			m_codeTable[i] = m_emptyCodeSubTable;
+		}
+	}
+
+	void*** GetCodeTable() const
+	{
+		return m_codeTable;
 	}
 
 	void AddBlock(BlockType block)
@@ -62,6 +100,20 @@ public:
 		}
 		assert(subTable[loAddress / INSTRUCTION_SIZE] == m_emptyBlock);
 		subTable[loAddress / INSTRUCTION_SIZE] = block;
+		if(m_codeTable)
+		{
+			auto& codeSubTable = m_codeTable[hiAddress];
+			if(codeSubTable == m_emptyCodeSubTable)
+			{
+				const uint32 subTableSize = SUBTABLE_SIZE / INSTRUCTION_SIZE;
+				codeSubTable = new void*[subTableSize];
+				for(uint32 i = 0; i < subTableSize; i++)
+				{
+					codeSubTable[i] = m_emptyCode;
+				}
+			}
+			codeSubTable[loAddress / INSTRUCTION_SIZE] = reinterpret_cast<void*>(block->GetCode());
+		}
 	}
 
 	void DeleteBlock(BlockType block)
@@ -74,6 +126,11 @@ public:
 		assert(subTable);
 		assert(subTable[loAddress / INSTRUCTION_SIZE] != m_emptyBlock);
 		subTable[loAddress / INSTRUCTION_SIZE] = m_emptyBlock;
+		if(m_codeTable)
+		{
+			assert(m_codeTable[hiAddress] != m_emptyCodeSubTable);
+			m_codeTable[hiAddress][loAddress / INSTRUCTION_SIZE] = m_emptyCode;
+		}
 	}
 
 	BlockType FindBlockAt(uint32 address) const
@@ -99,4 +156,7 @@ private:
 	BlockType m_emptyBlock = nullptr;
 	BlockType** m_blockTable = nullptr;
 	uint32 m_subTableCount = 0;
+	void*** m_codeTable = nullptr;
+	void** m_emptyCodeSubTable = nullptr;
+	void* m_emptyCode = nullptr;
 };

@@ -24,7 +24,7 @@ public:
 	using BlockFpRoundingModeMap = std::map<uint32, Jitter::CJitter::ROUNDINGMODE>;
 
 	CEeExecutor(CMIPS&, uint8*);
-	virtual ~CEeExecutor() = default;
+	virtual ~CEeExecutor();
 
 	void SetBlockFpRoundingModes(BlockFpRoundingModeMap);
 	void SetBlockFpUseAccurateAddSub(BlockFpUseAccurateAddSubSet);

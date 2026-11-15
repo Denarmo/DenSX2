@@ -45,6 +45,10 @@ extern "C"
 	void BranchBlockTrampoline(CMIPS*);
 }
 
+//Makes the context's blocks run in a fixed frame (see CMIPS::m_fixedFrameEntry) where the code generator
+//supports it. Returns whether it did; blocks compiled before must be compiled again.
+bool SetupBlockFixedFrame(CMIPS&);
+
 enum LINK_SLOT
 {
 	LINK_SLOT_NEXT,
@@ -82,6 +86,7 @@ public:
 		return m_code;
 	}
 	virtual void CompileRange(CMipsJitter*);
+	bool EndsWithDynamicBranch() const;
 
 	void AddBlockCompileHints(uint32);
 

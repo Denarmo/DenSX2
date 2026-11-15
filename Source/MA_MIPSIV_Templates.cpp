@@ -96,6 +96,16 @@ void CMA_MIPSIV::Template_Load32Idx(const MemoryAccessIdxTraits& traits)
 
 	bool usePageLookup = (m_pCtx->m_pageLookup != nullptr);
 
+	//One statement with the page lookup inline and the proxy out of line, so the block isn't split
+	if(usePageLookup && m_codeGen->SupportsPageAccess())
+	{
+		m_codeGen->PushRelRef(offsetof(CMIPS, m_pageLookup));
+		ComputeMemAccessAddrNoXlat();
+		m_codeGen->LoadFromPage(traits.elementSize, traits.getProxyFunction);
+		finishLoad();
+		return;
+	}
+
 	if(usePageLookup)
 	{
 		ComputeMemAccessPageRef();
@@ -134,6 +144,15 @@ void CMA_MIPSIV::Template_Store32Idx(const MemoryAccessIdxTraits& traits)
 	CheckTLBExceptions(true);
 
 	bool usePageLookup = (m_pCtx->m_pageLookup != nullptr);
+
+	if(usePageLookup && m_codeGen->SupportsPageAccess())
+	{
+		m_codeGen->PushRelRef(offsetof(CMIPS, m_pageLookup));
+		ComputeMemAccessAddrNoXlat();
+		m_codeGen->PushRel(offsetof(CMIPS, m_State.nGPR[m_nRT].nV[0]));
+		m_codeGen->StoreAtPage(traits.elementSize, traits.setProxyFunction);
+		return;
+	}
 
 	if(usePageLookup)
 	{

@@ -14,6 +14,11 @@ const CVuExecutor::BLOCK_COMPILE_HINTS CVuExecutor::g_blockCompileHints[] =
 CVuExecutor::CVuExecutor(CMIPS& context, uint32 maxAddress)
     : CGenericMipsExecutor(context, maxAddress, BLOCK_CATEGORY_PS2_VU)
 {
+	if(SetupBlockFixedFrame(context))
+	{
+		//Made by the base class before the frame existed
+		m_emptyBlock->Compile();
+	}
 }
 
 void CVuExecutor::SetBlockNoClamping(BlockNoClampingSet blockNoClamping)
