@@ -36,6 +36,11 @@ CMIPS::CMIPS(MEMORYMAP_ENDIANNESS endianness, bool usePageTable)
 		}
 	}
 
+	for(auto& target : m_indirectBranchCache)
+	{
+		target = MIPS_INVALID_PC;
+	}
+
 	m_pCOP[0] = nullptr;
 	m_pCOP[1] = nullptr;
 	m_pCOP[2] = nullptr;

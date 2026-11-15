@@ -93,6 +93,13 @@ public:
 	void LinkBlock(LINK_SLOT, CBasicBlock*);
 	void UnlinkBlock(LINK_SLOT);
 
+	enum : uint32
+	{
+		INDIRECT_BRANCH_SLOT_NONE = ~0U,
+	};
+	//Slot in CMIPS::m_indirectBranchCache this block's jr/jalr exit checks, if it has one
+	uint32 GetIndirectBranchSlot() const;
+
 #ifdef AOT_BUILD_CACHE
 	static void SetAotBlockOutputStream(Framework::CStdStream*);
 #endif
@@ -130,6 +137,7 @@ private:
 	void (*m_function)(void*);
 #endif
 	uint32 m_recycleCount = 0;
+	uint32 m_indirectBranchSlot = INDIRECT_BRANCH_SLOT_NONE;
 	BlockOutLinkPointer m_outLinks[LINK_SLOT_MAX];
 	uint32 m_linkBlockTrampolineOffset[LINK_SLOT_MAX];
 #ifdef _DEBUG

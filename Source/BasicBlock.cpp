@@ -100,6 +100,12 @@ void CBasicBlock::Compile()
 
 	m_function = CMemoryFunction(stream.GetBuffer(), stream.GetSize());
 
+	//Blocks that always leave with an exception (idle loops) have no branch link to patch
+	if(!HasLinkSlot(LINK_SLOT_BRANCH))
+	{
+		m_indirectBranchSlot = INDIRECT_BRANCH_SLOT_NONE;
+	}
+
 #ifdef VTUNE_ENABLED
 	if(iJIT_IsProfilingActive() == iJIT_SAMPLING_ON)
 	{
@@ -233,6 +239,25 @@ void CBasicBlock::CompileRange(CMipsJitter* jitter)
 		assert(jitter->IsStackEmpty());
 	}
 
+	m_indirectBranchSlot = [&]() -> uint32 {
+#if !defined(AOT_BUILD_CACHE) && !defined(__EMSCRIPTEN__)
+		if((m_category != BLOCK_CATEGORY_PS2_EE) || (m_begin == m_end))
+		{
+			return INDIRECT_BRANCH_SLOT_NONE;
+		}
+		//The cache must stay within the reach of the jitter's context-relative loads
+		if((offsetof(CMIPS, m_indirectBranchCache) + sizeof(CMIPS::m_indirectBranchCache)) > 0x3FFC)
+		{
+			return INDIRECT_BRANCH_SLOT_NONE;
+		}
+		uint32 inst = m_context.m_pMemoryMap->GetInstruction(m_end - 4);
+		bool isJumpRegister = ((inst >> 26) == 0) && (((inst & 0x3F) == 0x08) || ((inst & 0x3F) == 0x09));
+		return isJumpRegister ? ((m_begin / 4) % CMIPS::INDIRECT_BRANCH_CACHE_SIZE) : INDIRECT_BRANCH_SLOT_NONE;
+#else
+		return INDIRECT_BRANCH_SLOT_NONE;
+#endif
+	}();
+
 	jitter->MarkLastBlockLabel();
 	CompileEpilog(jitter, loopsOnItself);
 }
@@ -301,6 +326,24 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
 			jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
 			jitter->PushCst(0);
 			jitter->BeginIf(Jitter::CONDITION_EQ);
+			if(m_indirectBranchSlot != INDIRECT_BRANCH_SLOT_NONE)
+			{
+				//Jump straight to the block this exit was last linked to if the target is the same,
+				//otherwise tell the executor which block missed so it can link it to the new target.
+				jitter->PushRel(offsetof(CMIPS, m_indirectBranchCache) + (m_indirectBranchSlot * 4));
+				jitter->PushRel(offsetof(CMIPS, m_State.nPC));
+				jitter->BeginIf(Jitter::CONDITION_EQ);
+				{
+					jitter->JumpToDynamic(reinterpret_cast<void*>(&BranchBlockTrampoline));
+				}
+				jitter->Else();
+				{
+					jitter->PushCst(m_begin);
+					jitter->PullRel(offsetof(CMIPS, m_indirectBranchMissSrc));
+				}
+				jitter->EndIf();
+			}
+			else
 			{
 				jitter->JumpToDynamic(reinterpret_cast<void*>(&BranchBlockTrampoline));
 			}
@@ -367,6 +410,11 @@ bool CBasicBlock::IsEmpty() const
 {
 	return (m_begin == MIPS_INVALID_PC) &&
 	       (m_end == MIPS_INVALID_PC);
+}
+
+uint32 CBasicBlock::GetIndirectBranchSlot() const
+{
+	return m_indirectBranchSlot;
 }
 
 uint32 CBasicBlock::GetRecycleCount() const
@@ -505,10 +553,16 @@ void EmptyBlockHandler(CMIPS* context)
 	context->m_emptyBlockHandler(context);
 }
 
+//The trampolines are told apart by address when linking, so their bodies must differ:
+//identical code folding (MSVC /OPT:ICF) would otherwise merge them and branch links would never be made.
+static volatile uint32 g_lastUnlinkedExit = 0;
+
 void NextBlockTrampoline(CMIPS* context)
 {
+	g_lastUnlinkedExit = LINK_SLOT_NEXT;
 }
 
 void BranchBlockTrampoline(CMIPS* context)
 {
+	g_lastUnlinkedExit = LINK_SLOT_BRANCH;
 }
