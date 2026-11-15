@@ -221,7 +221,11 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::PrepareTexture(const TEX0& tex0)
 		return texInfo;
 	}
 
-	SyncTextureArea(tex0);
+	//Formats not read from RAM (depth formats) don't need what the GPU drew there in RAM.
+	if(m_textureUpdater[tex0.nPsm] != &CGSH_OpenGL::TexUpdater_Invalid)
+	{
+		SyncTextureArea(tex0);
+	}
 	auto texture = m_textureCache.Search(tex0);
 	if(!texture)
 	{
