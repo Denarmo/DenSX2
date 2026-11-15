@@ -107,58 +107,83 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::SearchTextureFramebuffer(const TEX0& tex0
 	TEXTURE_INFO texInfo;
 	FramebufferPtr framebuffer;
 
-	//First pass, look for an exact match
-	for(const auto& candidateFramebuffer : m_framebuffers)
+	//The scans below depend on the texture's address, width and format only: remember their result until
+	//the framebuffer list changes (Gran Turismo 4 keeps 30+ framebuffers and sets up thousands of textures).
+	uint64 lookupKey = static_cast<uint64>(tex0.GetBufPtr()) | (static_cast<uint64>(tex0.GetBufWidth()) << 32) | (static_cast<uint64>(tex0.nPsm) << 56);
+	auto& lookup = m_textureFramebufferLookups[(lookupKey ^ (lookupKey >> 13) ^ (lookupKey >> 32)) % TEXTURE_FRAMEBUFFER_LOOKUPS];
+	if((lookup.key == lookupKey) && (lookup.version == m_framebuffersVersion))
 	{
-		//Case: TEX0 points at the start of a frame buffer with the same width
-		if(candidateFramebuffer->m_basePtr == tex0.GetBufPtr() &&
-		   candidateFramebuffer->m_width == tex0.GetBufWidth() &&
-		   IsCompatibleFramebufferPSM(candidateFramebuffer->m_psm, tex0.nPsm))
-		{
-			framebuffer = candidateFramebuffer;
-			break;
-		}
-
-		//Case: TEX0 point at the start of a frame buffer with the same width
-		//but uses upper 8-bits (alpha) as an indexed texture (used in Yakuza)
-		else if(candidateFramebuffer->m_basePtr == tex0.GetBufPtr() &&
-		        candidateFramebuffer->m_width == tex0.GetBufWidth() &&
-		        candidateFramebuffer->m_psm == CGSHandler::PSMCT32 &&
-		        tex0.nPsm == CGSHandler::PSMT8H)
-		{
-			framebuffer = candidateFramebuffer;
-			texInfo.alphaAsIndex = true;
-			break;
-		}
+		if(lookup.framebufferIndex < 0) return TEXTURE_INFO();
+		framebuffer = m_framebuffers[lookup.framebufferIndex];
+		texInfo.offsetX = lookup.offsetX;
+		texInfo.alphaAsIndex = lookup.alphaAsIndex;
 	}
-
-	if(!framebuffer)
+	else
 	{
-		//Second pass, be a bit more flexible
+		lookup.key = lookupKey;
+		lookup.version = m_framebuffersVersion;
+
+		//First pass, look for an exact match
 		for(const auto& candidateFramebuffer : m_framebuffers)
 		{
-			//Another case: TEX0 is pointing to the start of a page within our framebuffer (BGDA does this)
-			if(candidateFramebuffer->m_basePtr <= tex0.GetBufPtr() &&
+			//Case: TEX0 points at the start of a frame buffer with the same width
+			if(candidateFramebuffer->m_basePtr == tex0.GetBufPtr() &&
 			   candidateFramebuffer->m_width == tex0.GetBufWidth() &&
-			   candidateFramebuffer->m_psm == tex0.nPsm)
+			   IsCompatibleFramebufferPSM(candidateFramebuffer->m_psm, tex0.nPsm))
 			{
-				uint32 framebufferOffset = tex0.GetBufPtr() - candidateFramebuffer->m_basePtr;
-
-				//Bail if offset is not aligned on a page boundary
-				if((framebufferOffset & (CGsPixelFormats::PAGESIZE - 1)) != 0) continue;
-
-				auto framebufferPageSize = CGsPixelFormats::GetPsmPageSize(candidateFramebuffer->m_psm);
-				uint32 framebufferPageCountX = candidateFramebuffer->m_width / framebufferPageSize.first;
-				uint32 framebufferPageIndex = framebufferOffset / CGsPixelFormats::PAGESIZE;
-
-				//Bail if pointed page isn't on the first line
-				if(framebufferPageIndex >= framebufferPageCountX) continue;
-
 				framebuffer = candidateFramebuffer;
-				texInfo.offsetX = static_cast<float>(framebufferPageIndex * framebufferPageSize.first) / static_cast<float>(candidateFramebuffer->m_width);
+				break;
+			}
+
+			//Case: TEX0 point at the start of a frame buffer with the same width
+			//but uses upper 8-bits (alpha) as an indexed texture (used in Yakuza)
+			else if(candidateFramebuffer->m_basePtr == tex0.GetBufPtr() &&
+			        candidateFramebuffer->m_width == tex0.GetBufWidth() &&
+			        candidateFramebuffer->m_psm == CGSHandler::PSMCT32 &&
+			        tex0.nPsm == CGSHandler::PSMT8H)
+			{
+				framebuffer = candidateFramebuffer;
+				texInfo.alphaAsIndex = true;
 				break;
 			}
 		}
+
+		if(!framebuffer)
+		{
+			//Second pass, be a bit more flexible
+			for(const auto& candidateFramebuffer : m_framebuffers)
+			{
+				//Another case: TEX0 is pointing to the start of a page within our framebuffer (BGDA does this)
+				if(candidateFramebuffer->m_basePtr <= tex0.GetBufPtr() &&
+				   candidateFramebuffer->m_width == tex0.GetBufWidth() &&
+				   candidateFramebuffer->m_psm == tex0.nPsm)
+				{
+					uint32 framebufferOffset = tex0.GetBufPtr() - candidateFramebuffer->m_basePtr;
+
+					//Bail if offset is not aligned on a page boundary
+					if((framebufferOffset & (CGsPixelFormats::PAGESIZE - 1)) != 0) continue;
+
+					auto framebufferPageSize = CGsPixelFormats::GetPsmPageSize(candidateFramebuffer->m_psm);
+					uint32 framebufferPageCountX = candidateFramebuffer->m_width / framebufferPageSize.first;
+					uint32 framebufferPageIndex = framebufferOffset / CGsPixelFormats::PAGESIZE;
+
+					//Bail if pointed page isn't on the first line
+					if(framebufferPageIndex >= framebufferPageCountX) continue;
+
+					framebuffer = candidateFramebuffer;
+					texInfo.offsetX = static_cast<float>(framebufferPageIndex * framebufferPageSize.first) / static_cast<float>(candidateFramebuffer->m_width);
+					break;
+				}
+			}
+		}
+
+		lookup.framebufferIndex = -1;
+		if(framebuffer)
+		{
+			lookup.framebufferIndex = static_cast<int32>(std::find(m_framebuffers.begin(), m_framebuffers.end(), framebuffer) - m_framebuffers.begin());
+		}
+		lookup.offsetX = texInfo.offsetX;
+		lookup.alphaAsIndex = texInfo.alphaAsIndex;
 	}
 
 	if(framebuffer)

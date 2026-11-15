@@ -433,6 +433,23 @@ private:
 	//A CLUT transfer makes every palette stale: they stay live only while their generation is current.
 	uint32 m_paletteGeneration = 0;
 	FramebufferList m_framebuffers;
+	//Bumped whenever m_framebuffers changes (framebuffers are only added or all cleared).
+	uint32 m_framebuffersVersion = 0;
+
+	//Which framebuffer a texture's address, width and format resolve to, for the current framebuffer list.
+	struct TEXTURE_FRAMEBUFFER_LOOKUP
+	{
+		uint64 key = ~0ULL;
+		uint32 version = ~0U;
+		int32 framebufferIndex = -1;
+		float offsetX = 0;
+		bool alphaAsIndex = false;
+	};
+	enum
+	{
+		TEXTURE_FRAMEBUFFER_LOOKUPS = 64,
+	};
+	TEXTURE_FRAMEBUFFER_LOOKUP m_textureFramebufferLookups[TEXTURE_FRAMEBUFFER_LOOKUPS];
 	DepthbufferList m_depthbuffers;
 
 	Framework::OpenGl::CBuffer m_primBuffer;

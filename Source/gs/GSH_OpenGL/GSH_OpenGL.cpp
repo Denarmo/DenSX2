@@ -122,6 +122,7 @@ void CGSH_OpenGL::ResetImpl()
 	m_textureCache.Flush();
 	PalCache_Flush();
 	m_framebuffers.clear();
+	m_framebuffersVersion++;
 	m_depthbuffers.clear();
 	m_vertexBuffer.clear();
 	m_renderState.isValid = false;
@@ -170,6 +171,7 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
 		{
 			framebuffer = FramebufferPtr(new CFramebuffer(dispLayer.bufPtr, dispLayer.bufWidth, FRAMEBUFFER_HEIGHT, dispLayer.psm, m_fbScale, m_multisampleEnabled));
 			m_framebuffers.push_back(framebuffer);
+			m_framebuffersVersion++;
 			PopulateFramebuffer(framebuffer);
 		}
 	}
@@ -279,6 +281,7 @@ void CGSH_OpenGL::NotifyPreferencesChangedImpl()
 	m_textureCache.Flush();
 	PalCache_Flush();
 	m_framebuffers.clear();
+	m_framebuffersVersion++;
 	m_depthbuffers.clear();
 	CGSHandler::NotifyPreferencesChangedImpl();
 }
@@ -1054,6 +1057,7 @@ void CGSH_OpenGL::SetupFramebuffer(uint64 frameReg, uint64 zbufReg, uint64 sciss
 	{
 		framebuffer = FramebufferPtr(new CFramebuffer(frame.GetBasePtr(), frame.GetWidth(), FRAMEBUFFER_HEIGHT, frame.nPsm, m_fbScale, m_multisampleEnabled));
 		m_framebuffers.push_back(framebuffer);
+		m_framebuffersVersion++;
 		PopulateFramebuffer(framebuffer);
 	}
 

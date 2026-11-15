@@ -203,6 +203,12 @@ protected:
 			}
 		}
 
+		//Whether the next bytes can be read in place with GetDirectPointer and Advance.
+		inline bool CanReadDirect() const
+		{
+			return !m_tagIncluded && ((m_bufferPosition == 0) || (m_bufferPosition == BUFFERSIZE));
+		}
+
 		void Flush();
 		inline void Align32();
 		void SetDmaParams(uint32, uint32, bool);
@@ -561,6 +567,23 @@ protected:
 
 		while(currentNum != 0)
 		{
+			if constexpr((dataType == 0x0C) && !useMask && (mode == 0) && clGreaterEqualWl)
+			{
+				//V4-32 written as read: copy the vectors straight from the stream.
+				if((cl == wl) && stream.CanReadDirect())
+				{
+					uint32 count = std::min<uint32>(currentNum, stream.GetAvailableReadBytes() / 0x10);
+					count = std::min<uint32>(count, (vuMemSize - nDstAddr) / 0x10);
+					if(count == 0) break;
+					memcpy(vuMem + nDstAddr, stream.GetDirectPointer(), count * 0x10);
+					stream.Advance(count * 0x10);
+					currentNum -= count;
+					m_writeTick = m_readTick = (m_writeTick + count) % cl;
+					nDstAddr = (nDstAddr + (count * 0x10)) & (vuMemSize - 1);
+					continue;
+				}
+			}
+
 			bool mustWrite = false;
 			uint128 writeValue;
 			memset(&writeValue, 0, sizeof(writeValue));
