@@ -3084,6 +3084,7 @@ void CGSH_OpenGL::SyncFramebufferToRam(CFramebuffer* framebuffer, uint32 firstPa
 	{
 		uint32 x, y, channels;
 		uint32 page;
+		uint32 drawnBlocks;
 	};
 	std::vector<DRAWN_PAGE> pages;
 	uint32 minX = ~0U, minY = ~0U, maxX = 0, maxY = 0;
@@ -3095,7 +3096,7 @@ void CGSH_OpenGL::SyncFramebufferToRam(CFramebuffer* framebuffer, uint32 firstPa
 			if((page < firstPage) || (page > lastPage)) continue;
 			auto& state = m_gpuPages[page];
 			if(state.owner != framebuffer) continue;
-			pages.push_back({pageX, pageY, state.channels, page});
+			pages.push_back({pageX, pageY, state.channels, page, state.drawnBlocks});
 			minX = (std::min)(minX, pageX);
 			maxX = (std::max)(maxX, pageX);
 			minY = (std::min)(minY, pageY);
@@ -3162,6 +3163,8 @@ void CGSH_OpenGL::SyncFramebufferToRam(CFramebuffer* framebuffer, uint32 firstPa
 					block = CGsPixelFormats::STORAGEPSMCT32::m_nBlockSwizzleTable[blockY][blockX];
 					break;
 				}
+				//RAM is newer in the blocks no draw wrote (a transfer may have replaced them).
+				if(!(page.drawnBlocks & (1U << block))) continue;
 				uint32 x0 = (page.x * pageSize.first) + (blockX * blockWidth);
 				uint32 y0 = (page.y * pageSize.second) + (blockY * blockHeight);
 				uint32 x1 = std::min<uint32>(x0 + blockWidth, framebuffer->m_width);
@@ -3232,6 +3235,12 @@ void CGSH_OpenGL::BeginTransferWrite()
 		if(state.drawnBlocks & ~overwritten)
 		{
 			SyncFramebufferToRam(state.owner, page, page);
+		}
+		else
+		{
+			//The transfer replaces all the GPU drew there: a later sync must not bring it back over the transfer.
+			state = GPU_PAGE();
+			m_gpuPageCount--;
 		}
 	}
 }
