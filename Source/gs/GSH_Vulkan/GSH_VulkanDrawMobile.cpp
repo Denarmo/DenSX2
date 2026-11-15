@@ -194,6 +194,36 @@ void CDrawMobile::FlushRenderPass()
 	m_renderPassMaxY = -FLT_MAX;
 }
 
+bool CDrawMobile::CanLoadClutDuringPass(uint32 clutBufferOffset, uint32 address, uint32 size)
+{
+	FlushVertices();
+	if(m_pendingDraws.empty()) return true;
+
+	for(const auto& draw : m_pendingDraws)
+	{
+		if(draw.hasClutOffset && (draw.clutOffset == clutBufferOffset)) return false;
+	}
+
+	//The CLUT must not come from memory the pass stores to: the load would read it before the store.
+	//Rows from the top of the buffer to the bottom of the pass, whole pages of 32 rows (16-bit
+	//formats have 64), cover everything the pass writes.
+	uint32 maxY = std::clamp<int32>(static_cast<int32>(m_renderPassMaxY) + 1, 0, static_cast<int32>(m_scissorY + m_scissorHeight));
+	uint32 pageRows = (maxY + 31) / 32;
+	auto overlaps = [&](uint32 bufAddress, uint32 bufWidth) {
+		uint32 pagesPerRow = std::max<uint32>((bufWidth + 63) / 64, 1);
+		uint64 bufStart = bufAddress;
+		uint64 bufEnd = bufStart + static_cast<uint64>(pageRows) * pagesPerRow * CGsPixelFormats::PAGESIZE;
+		if(bufEnd > CGSHandler::RAMSIZE) return true;
+		uint64 clutStart = address;
+		uint64 clutEnd = clutStart + size;
+		return (clutStart < bufEnd) && (bufStart < clutEnd);
+	};
+
+	if(overlaps(m_pushConstants.fbBufAddr, m_pushConstants.fbBufWidth)) return false;
+	if(m_pipelineCaps.writeDepth && overlaps(m_pushConstants.depthBufAddr, m_pushConstants.depthBufWidth)) return false;
+	return true;
+}
+
 void CDrawMobile::RecordRenderPass(int32 x, int32 y, int32 width, int32 height)
 {
 	auto& frame = m_frames[m_frameCommandBuffer->GetCurrentFrame()];
@@ -205,7 +235,9 @@ void CDrawMobile::RecordRenderPass(int32 x, int32 y, int32 width, int32 height)
 	area.extent.width = width;
 	area.extent.height = height;
 
+#if GSH_VULKAN_USE_ANNOTATIONS
 	m_context->annotations.PushCommandLabel(commandBuffer, string_format("Draw (FBP: 0x%06X, ZBP: 0x%06X)", m_passLoadPushConstants.fbBufAddr, m_passLoadPushConstants.depthBufAddr).c_str());
+#endif
 
 	{
 		VkViewport viewport = {};
@@ -247,28 +279,50 @@ void CDrawMobile::RecordRenderPass(int32 x, int32 y, int32 width, int32 height)
 
 	m_context->device.vkCmdNextSubpass(commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
 
-	VkBuffer vertexBuffer = frame.vertexBuffer;
+	{
+		VkBuffer vertexBuffer = frame.vertexBuffer;
+		VkDeviceSize vertexBufferOffset = 0;
+		m_context->device.vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &vertexBufferOffset);
+	}
+
+	//State that did not change since the previous draw is not recorded again: mobile drivers
+	//spend more CPU time per command than desktop ones.
+	const PENDING_DRAW* prevDraw = nullptr;
 	for(const auto& draw : m_pendingDraws)
 	{
-		auto memoryBarrier = Framework::Vulkan::MemoryBarrier();
-		memoryBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-		memoryBarrier.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+		//The load subpass is ordered before the first draw by the subpass dependency.
+		if(prevDraw)
+		{
+			auto memoryBarrier = Framework::Vulkan::MemoryBarrier();
+			memoryBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+			memoryBarrier.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
 
-		m_context->device.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-		                                       VK_DEPENDENCY_BY_REGION_BIT, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
+			m_context->device.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			                                       VK_DEPENDENCY_BY_REGION_BIT, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
+		}
 
-		m_context->device.vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, draw.pipeline->pipelineLayout,
-		                                          0, 1, &draw.descriptorSet, draw.hasClutOffset ? 1 : 0, draw.hasClutOffset ? &draw.clutOffset : nullptr);
+		bool layoutChanged = !prevDraw || (prevDraw->pipeline->pipelineLayout != draw.pipeline->pipelineLayout);
 
-		m_context->device.vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, draw.pipeline->pipeline);
+		if(layoutChanged || (prevDraw->descriptorSet != draw.descriptorSet) ||
+		   (prevDraw->hasClutOffset != draw.hasClutOffset) || (prevDraw->clutOffset != draw.clutOffset))
+		{
+			m_context->device.vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, draw.pipeline->pipelineLayout,
+			                                          0, 1, &draw.descriptorSet, draw.hasClutOffset ? 1 : 0, draw.hasClutOffset ? &draw.clutOffset : nullptr);
+		}
 
-		VkDeviceSize vertexBufferOffset = (draw.vertexStart * sizeof(PRIM_VERTEX));
-		m_context->device.vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &vertexBufferOffset);
+		if(!prevDraw || (prevDraw->pipeline->pipeline != draw.pipeline->pipeline))
+		{
+			m_context->device.vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, draw.pipeline->pipeline);
+		}
 
-		m_context->device.vkCmdPushConstants(commandBuffer, draw.pipeline->pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
-		                                     0, sizeof(DRAW_PIPELINE_PUSHCONSTANTS), &draw.pushConstants);
+		if(layoutChanged || memcmp(&prevDraw->pushConstants, &draw.pushConstants, sizeof(DRAW_PIPELINE_PUSHCONSTANTS)))
+		{
+			m_context->device.vkCmdPushConstants(commandBuffer, draw.pipeline->pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
+			                                     0, sizeof(DRAW_PIPELINE_PUSHCONSTANTS), &draw.pushConstants);
+		}
 
-		m_context->device.vkCmdDraw(commandBuffer, draw.vertexCount, 1, 0, 0);
+		m_context->device.vkCmdDraw(commandBuffer, draw.vertexCount, 1, draw.vertexStart, 0);
+		prevDraw = &draw;
 	}
 
 	m_context->device.vkCmdNextSubpass(commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
@@ -1777,10 +1831,32 @@ Framework::Vulkan::CShaderModule CDrawMobile::CreateStoreFragmentShader(const PI
 		fbAddress = fbAddress & NewInt(b, CGSHandler::RAMSIZE - 1);
 		depthAddress = depthAddress & NewInt(b, CGSHandler::RAMSIZE - 1);
 
-		CDrawUtils::WriteToFramebuffer(b, caps.framebufferFormat, memoryBuffer, fbAddress, dstPixel);
+		//Each pixel of a 24-bit buffer owns its word, so its top byte is kept with a plain read and
+		//write instead of the two atomics shared words need: atomics are slow on mobile GPUs.
+		auto write24 = [&](CIntValue address, CUintValue value) {
+			auto wordAddress = address / NewInt(b, 4);
+			auto word = Load(memoryBuffer, wordAddress) & NewUint(b, 0xFF000000);
+			Store(memoryBuffer, wordAddress, word | (value & NewUint(b, 0xFFFFFF)));
+		};
+
+		if((caps.framebufferFormat == CGSHandler::PSMCT24) || (caps.framebufferFormat == CGSHandler::PSMZ24))
+		{
+			write24(fbAddress, dstPixel);
+		}
+		else
+		{
+			CDrawUtils::WriteToFramebuffer(b, caps.framebufferFormat, memoryBuffer, fbAddress, dstPixel);
+		}
 		if(caps.writeDepth)
 		{
-			CDrawUtils::WriteToDepthbuffer(b, caps.depthbufferFormat, memoryBuffer, depthAddress, dstDepth);
+			if(caps.depthbufferFormat == CGSHandler::PSMZ24)
+			{
+				write24(depthAddress, dstDepth);
+			}
+			else
+			{
+				CDrawUtils::WriteToDepthbuffer(b, caps.depthbufferFormat, memoryBuffer, depthAddress, dstDepth);
+			}
 		}
 
 		outputColor = dstPixel->x();

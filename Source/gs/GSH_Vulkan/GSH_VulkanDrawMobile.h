@@ -18,6 +18,7 @@ namespace GSH_Vulkan
 
 		void FlushVertices() override;
 		void FlushRenderPass() override;
+		bool CanLoadClutDuringPass(uint32, uint32, uint32) override;
 
 	private:
 		void RecordRenderPass(int32, int32, int32, int32);

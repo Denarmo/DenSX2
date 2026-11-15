@@ -104,6 +104,10 @@ namespace GSH_Vulkan
 		virtual void FlushVertices() = 0;
 		virtual void FlushRenderPass() = 0;
 
+		//Whether a CLUT load into the given slot, reading the given GS memory range, can be recorded
+		//before the draws waiting for the current render pass, which is then not cut.
+		virtual bool CanLoadClutDuringPass(uint32 clutBufferOffset, uint32 address, uint32 size);
+
 		void PreFlushFrameCommandBuffer() override;
 		void PostFlushFrameCommandBuffer() override;
 

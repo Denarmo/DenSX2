@@ -129,6 +129,11 @@ void CDraw::SetMipParams(const MipBufs& mipBufs, uint32 maxMip, float lodK, uint
 	}
 }
 
+bool CDraw::CanLoadClutDuringPass(uint32, uint32, uint32)
+{
+	return false;
+}
+
 void CDraw::SetClutBufferOffset(uint32 clutBufferOffset)
 {
 	bool changed = m_clutBufferOffset != clutBufferOffset;

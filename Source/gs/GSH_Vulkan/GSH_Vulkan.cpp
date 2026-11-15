@@ -1663,8 +1663,14 @@ void CGSH_Vulkan::SyncCLUT(const TEX0& tex0)
 		m_nextClutCacheIndex %= CLUT_CACHE_SIZE;
 		m_clutStates[clutCacheIndex] = clutKey;
 
-		m_draw->FlushRenderPass();
 		uint32 clutBufferOffset = sizeof(uint32) * CLUTENTRYCOUNT * clutCacheIndex;
+		//A CSM1 CLUT lies within two pages from its pointer; a CSM2 one may be anywhere.
+		uint32 clutAddress = tex0.GetCLUTPtr() & ~(CGsPixelFormats::PAGESIZE - 1);
+		uint32 clutSize = (tex0.nCSM == 0) ? (CGsPixelFormats::PAGESIZE * 2) : RAMSIZE;
+		if(!m_draw->CanLoadClutDuringPass(clutBufferOffset, clutAddress, clutSize))
+		{
+			m_draw->FlushRenderPass();
+		}
 		m_clutLoad->DoClutLoad(clutBufferOffset, tex0, texClut);
 	}
 
