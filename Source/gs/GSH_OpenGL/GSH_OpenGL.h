@@ -343,8 +343,16 @@ private:
 	Framework::OpenGl::ProgramPtr GenerateGpuClutProgram();
 	Framework::OpenGl::ProgramPtr GenerateByteViewProgram();
 	bool PrepareFramebufferByteTexture(const TEX0&, TEXTURE_INFO&);
-	CFramebuffer* GetByteViewSource(const TEX0&);
-	void BuildByteView(const FramebufferPtr&);
+	CFramebuffer* GetByteViewSource(const TEX0&, uint32, uint32);
+	void BuildByteView(uint32, const FramebufferPtr&);
+	void InvalidateByteViews(uint32);
+	void InvalidateByteViews();
+	Framework::OpenGl::ProgramPtr GenerateMergeProgram();
+	bool CanMergeTransfer(CFramebuffer*, const BITBLTBUF&, uint32);
+	void MergeTransfer(const BITBLTBUF&, const TRXREG&, const TRXPOS&);
+	bool IsRamCurrent(uint32, uint32) const;
+	bool IsRamCurrentRange(uint32, uint32) const;
+	void ClearRamCurrent(uint32, uint32);
 	void MarkGpuPages();
 	void SyncTextureArea(const TEX0&);
 	void SyncFramebufferToRam(CFramebuffer*, uint32 = 0, uint32 = ~0U);
@@ -519,14 +527,27 @@ private:
 	int32 m_gpuClutPosition[4] = {};
 	//PSMT8 reads of a framebuffer the GPU drew: its bytes laid out as PSMT8 pages, a 128x64 tile for each of its
 	//64x32 pages, valid for the pages no draw changed since.
-	FramebufferPtr m_byteViewSource;
-	Framework::OpenGl::CTexture m_byteViewTexture;
-	Framework::OpenGl::CFramebuffer m_byteViewFramebuffer;
-	uint32 m_byteViewWidth = 0;
-	uint32 m_byteViewHeight = 0;
-	std::bitset<GPU_PAGE_COUNT> m_byteViewValid;
+	//One for PSMT8 (128x64 tiles), one for PSMT4 (128x128 tiles).
+	struct BYTE_VIEW
+	{
+		FramebufferPtr source;
+		Framework::OpenGl::CTexture texture;
+		Framework::OpenGl::CFramebuffer framebuffer;
+		uint32 width = 0;
+		uint32 height = 0;
+		std::bitset<GPU_PAGE_COUNT> valid;
+		Framework::OpenGl::CTexture layout;
+	};
+	BYTE_VIEW m_byteViews[2];
 	Framework::OpenGl::ProgramPtr m_byteViewProgram;
-	Framework::OpenGl::CTexture m_byteViewLayout;
+	//A transfer into pages a framebuffer drew is merged into the framebuffer, which keeps them (MergeTransfer).
+	std::vector<std::pair<uint32, CFramebuffer*>> m_mergePages;
+	Framework::OpenGl::ProgramPtr m_mergeProgram;
+	Framework::OpenGl::CTexture m_mergeData;
+	Framework::OpenGl::CTexture m_mergeCopy;
+	uint32 m_mergeCopyScale = 0;
+	//For each page, the nibbles RAM has as the GPU does: in a drawn block, those transfers wrote since the draw.
+	std::vector<uint64> m_ramCurrent = std::vector<uint64>(GPU_PAGE_COUNT * 256);
 	std::map<uint32, std::pair<std::vector<Framework::OpenGl::CTexture>, uint32>> m_byteViewTextures;
 
 	Framework::OpenGl::CBuffer m_primBuffer;

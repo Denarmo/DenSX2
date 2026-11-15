@@ -67,7 +67,7 @@ public:
 		{
 			uint32 address = m_context.m_State.nPC & m_addressMask;
 			auto block = m_blockLookup.FindBlockAt(address);
-			block->Execute();
+			block->GetCode()(&m_context);
 		}
 		m_context.m_State.nHasException &= ~MIPS_EXCEPTION_STATUS_QUOTADONE;
 #ifdef DEBUGGER_INCLUDED

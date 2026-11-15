@@ -99,6 +99,7 @@ void CBasicBlock::Compile()
 	}
 
 	m_function = CMemoryFunction(stream.GetBuffer(), stream.GetSize());
+	m_code = reinterpret_cast<CodeFunction>(m_function.GetCode());
 
 #ifdef VTUNE_ENABLED
 	if(iJIT_IsProfilingActive() == iJIT_SAMPLING_ON)
@@ -170,6 +171,7 @@ void CBasicBlock::Compile()
 	assert(blockIterator->key.size == blockSizeByte);
 
 	m_function = reinterpret_cast<void (*)(void*)>(blockIterator->fct);
+	m_code = m_function;
 
 #endif
 
@@ -453,6 +455,7 @@ void CBasicBlock::CopyFunctionFrom(const std::shared_ptr<CBasicBlock>& other)
 {
 #ifndef AOT_USE_CACHE
 	m_function = other->m_function.CreateInstance();
+	m_code = reinterpret_cast<CodeFunction>(m_function.GetCode());
 	std::copy(std::begin(other->m_linkBlockTrampolineOffset), std::end(other->m_linkBlockTrampolineOffset), m_linkBlockTrampolineOffset);
 #ifdef _DEBUG
 	std::copy(std::begin(other->m_linkBlock), std::end(other->m_linkBlock), m_linkBlock);
@@ -505,10 +508,16 @@ void EmptyBlockHandler(CMIPS* context)
 	context->m_emptyBlockHandler(context);
 }
 
+//The trampolines are told apart by address when linking, so their bodies must differ:
+//identical code folding (MSVC /OPT:ICF) would otherwise merge them and branch links would never be made.
+static volatile uint32 g_lastUnlinkedExit = 0;
+
 void NextBlockTrampoline(CMIPS* context)
 {
+	g_lastUnlinkedExit = LINK_SLOT_NEXT;
 }
 
 void BranchBlockTrampoline(CMIPS* context)
 {
+	g_lastUnlinkedExit = LINK_SLOT_BRANCH;
 }

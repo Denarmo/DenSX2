@@ -35,6 +35,7 @@ public:
 	void Invalidate(uint32, uint32);
 	bool IsPageDirty(uint32) const;
 	void SetPageDirty(uint32);
+	void ClearPageDirty(uint32);
 	bool HasDirtyPages() const;
 	void ClearDirtyPages();
 	void ClearDirtyPages(const PageRect&);
