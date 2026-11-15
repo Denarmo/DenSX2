@@ -926,8 +926,8 @@ void retro_deinit()
 				std::this_thread::yield();
 			}
 		}
-		else
 #endif
+		//With the Vulkan GS there is no OpenGL handler: gsHandler is null.
 		if(gsHandler && gsHandler->HasWorker())
 		{
 			gsHandler->SetFreeRun(true);
