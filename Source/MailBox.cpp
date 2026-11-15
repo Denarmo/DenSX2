@@ -10,7 +10,10 @@ void CMailBox::WaitForCall()
 	std::unique_lock callLock(m_callMutex);
 	while(!IsPending())
 	{
+		m_waiters++;
 		m_waitCondition.wait(callLock);
+		m_waiters--;
+		m_wakeSent = false;
 	}
 }
 
@@ -18,7 +21,10 @@ void CMailBox::WaitForCall(unsigned int timeOut)
 {
 	std::unique_lock callLock(m_callMutex);
 	if(IsPending()) return;
+	m_waiters++;
 	m_waitCondition.wait_for(callLock, std::chrono::milliseconds(timeOut));
+	m_waiters--;
+	m_wakeSent = false;
 }
 
 void CMailBox::FlushCalls()
@@ -29,6 +35,7 @@ void CMailBox::FlushCalls()
 void CMailBox::SendCall(const FunctionType& function, bool waitForCompletion)
 {
 	std::future<void> future;
+	bool wake = false;
 
 	{
 		MESSAGE message;
@@ -42,9 +49,14 @@ void CMailBox::SendCall(const FunctionType& function, bool waitForCompletion)
 
 		std::lock_guard callLock(m_callMutex);
 		m_calls.push_back(std::move(message));
+		wake = (m_waiters != 0) && !m_wakeSent;
+		m_wakeSent |= wake;
 	}
 
-	m_waitCondition.notify_all();
+	if(wake)
+	{
+		m_waitCondition.notify_all();
+	}
 
 	if(waitForCompletion)
 	{
@@ -54,15 +66,21 @@ void CMailBox::SendCall(const FunctionType& function, bool waitForCompletion)
 
 void CMailBox::SendCall(FunctionType&& function)
 {
+	bool wake = false;
 	{
 		MESSAGE message;
 		message.function = std::move(function);
 
 		std::lock_guard callLock(m_callMutex);
 		m_calls.push_back(std::move(message));
+		wake = (m_waiters != 0) && !m_wakeSent;
+		m_wakeSent |= wake;
 	}
 
-	m_waitCondition.notify_all();
+	if(wake)
+	{
+		m_waitCondition.notify_all();
+	}
 }
 
 void CMailBox::ReceiveCall()

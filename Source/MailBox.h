@@ -42,4 +42,8 @@ private:
 	FunctionCallQueue m_calls;
 	std::mutex m_callMutex;
 	std::condition_variable m_waitCondition;
+	//Receivers waiting on m_waitCondition (guarded by m_callMutex): senders only wake it when there are some
+	unsigned int m_waiters = 0;
+	//A wake was sent and no receiver has woken up since: more calls don't need another one
+	bool m_wakeSent = false;
 };
