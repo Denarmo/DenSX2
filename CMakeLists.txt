@@ -61,6 +61,7 @@ if(BUILD_LIBRETRO_CORE)
 		add_definitions(-DPLAY_LIBRETRO_CORE)
 	endif()
 	add_subdirectory(Source/ui_libretro)
+	add_subdirectory(tools/VmBench)
 endif()
 
 if(BUILD_PLAY)
