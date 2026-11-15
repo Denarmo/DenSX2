@@ -1094,7 +1094,10 @@ void CGSH_OpenGL::SetupFramebuffer(uint64 frameReg, uint64 zbufReg, uint64 sciss
 	float projWidth = static_cast<float>(framebuffer->m_width);
 	float projHeight = static_cast<float>(framebuffer->m_height);
 
-	MakeLinearZOrtho(m_vertexParams.projMatrix, 0, projWidth, 0, projHeight);
+	//The GS samples pixel n at n, OpenGL at its centre: move the picture half a (GS) pixel so both sample the
+	//same places. Otherwise 1:1 copies sample texel edges and leave lines of wrong texels (Colin McRae Rally 3).
+	const float pixelOffset = 0.5f;
+	MakeLinearZOrtho(m_vertexParams.projMatrix, -pixelOffset, projWidth - pixelOffset, -pixelOffset, projHeight - pixelOffset);
 	m_validGlState &= ~GLSTATE_VERTEX_PARAMS;
 
 	m_renderState.scissorX = scissor.scax0;
