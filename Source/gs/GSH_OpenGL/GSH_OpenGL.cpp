@@ -2259,7 +2259,8 @@ void CGSH_OpenGL::VertexKick(uint8 nRegister, uint64 nValue)
 
 void CGSH_OpenGL::ProcessHostToLocalTransfer()
 {
-	if(m_trxCtx.nDirty)
+	//Pages to merge need it even when the transfer changed nothing: their framebuffer doesn't have what RAM has.
+	if(m_trxCtx.nDirty || !m_mergePages.empty())
 	{
 		FlushVertexBuffer();
 		m_renderState.isTextureStateValid = false;
@@ -2272,15 +2273,37 @@ void CGSH_OpenGL::ProcessHostToLocalTransfer()
 		auto [transferAddress, transferSize] = GsTransfer::GetDstRange(bltBuf, trxReg, trxPos);
 
 		m_textureCache.InvalidateRange(transferAddress, transferSize);
+
+		//Pages merged on the GPU stay with their framebuffer, which doesn't reload them from RAM.
+		std::vector<std::pair<uint32, GPU_PAGE>> mergedPages;
+		if(!m_mergePages.empty())
+		{
+			MergeTransfer(bltBuf, trxReg, trxPos);
+			for(const auto& [page, owner] : m_mergePages)
+			{
+				if(m_gpuPages[page].owner == owner) mergedPages.emplace_back(page, m_gpuPages[page]);
+			}
+		}
 		ClearGpuPages(transferAddress, transferSize);
+		for(const auto& [page, state] : mergedPages)
+		{
+			if(!m_gpuPages[page].owner) m_gpuPageCount++;
+			m_gpuPages[page] = state;
+		}
 
 		bool isUpperByteTransfer = (bltBuf.nDstPsm == PSMT8H) || (bltBuf.nDstPsm == PSMT4HL) || (bltBuf.nDstPsm == PSMT4HH);
 		for(const auto& framebuffer : m_framebuffers)
 		{
 			if((framebuffer->m_psm == PSMCT24) && isUpperByteTransfer) continue;
 			framebuffer->m_cachedArea.Invalidate(transferAddress, transferSize);
+			for(const auto& [page, state] : mergedPages)
+			{
+				if(state.owner != framebuffer.get()) continue;
+				framebuffer->m_cachedArea.ClearPageDirty(page - (framebuffer->m_basePtr / CGsPixelFormats::PAGESIZE));
+			}
 		}
 	}
+	m_mergePages.clear();
 }
 
 void CGSH_OpenGL::ProcessLocalToHostTransfer()
@@ -2964,7 +2987,8 @@ void CGSH_OpenGL::MarkGpuPages()
 	std::vector<uint32> uploads;
 	for(const auto& [page, blocks] : m_drawBlockList)
 	{
-		m_byteViewValid.reset(page);
+		InvalidateByteViews(page);
+		ClearRamCurrent(page, blocks);
 		auto& state = m_gpuPages[page];
 		if(state.owner != framebuffer)
 		{
@@ -2992,7 +3016,7 @@ void CGSH_OpenGL::MarkGpuPages()
 //Another framebuffer over the same memory takes a page over: a copy on the GPU.
 bool CGSH_OpenGL::MoveGpuPage(CFramebuffer* source, CFramebuffer* destination, uint32 page)
 {
-	m_byteViewValid.reset(page);
+	InvalidateByteViews(page);
 	auto& state = m_gpuPages[page];
 	//Each framebuffer places the page by its own width: they need whole pages per row.
 	if(((source->m_width % 64) != 0) || ((destination->m_width % 64) != 0)) return false;
@@ -3037,7 +3061,7 @@ bool CGSH_OpenGL::MoveGpuPage(CFramebuffer* source, CFramebuffer* destination, u
 void CGSH_OpenGL::UploadFramebufferPages(const FramebufferPtr& framebuffer, const std::vector<uint32>& pages)
 {
 	if(m_gpuClutSource && (m_gpuClutSource.get() == framebuffer.get())) MaterializeGpuClut();
-	for(auto page : pages) m_byteViewValid.reset(page);
+	for(auto page : pages) InvalidateByteViews(page);
 	m_validGlState &= ~(GLSTATE_SCISSOR | GLSTATE_FRAMEBUFFER | GLSTATE_TEXTURE);
 	glDisable(GL_SCISSOR_TEST);
 	glActiveTexture(GL_TEXTURE0);
@@ -3082,7 +3106,8 @@ void CGSH_OpenGL::SyncMemoryForRead(uint32 address, uint32 size)
 		{
 			blocks |= 1U << (block % 32);
 		}
-		if(state.drawnBlocks & blocks)
+		if((state.drawnBlocks & blocks) && !IsRamCurrentRange(std::max<uint32>(address, page * CGsPixelFormats::PAGESIZE),
+		                                                       std::min<uint32>(address + std::max<uint32>(size, 1), (page + 1) * CGsPixelFormats::PAGESIZE)))
 		{
 			SyncFramebufferToRam(state.owner, page % GPU_PAGE_COUNT, page % GPU_PAGE_COUNT);
 		}
@@ -3096,7 +3121,7 @@ void CGSH_OpenGL::SyncTextureArea(const TEX0& tex0)
 	for(const auto& [page, blocks] : m_blockList)
 	{
 		auto& state = m_gpuPages[page];
-		if(state.owner && (state.drawnBlocks & blocks))
+		if(state.owner && (state.drawnBlocks & blocks) && !IsRamCurrent(page, state.drawnBlocks & blocks))
 		{
 			//All of the framebuffer: games read one page by page (Gran Turismo 4), one copy serves them all.
 			if(!m_vertexBuffer.empty() && m_renderState.isValid) FlushVertexBuffer();
@@ -3240,6 +3265,7 @@ void CGSH_OpenGL::SyncFramebufferToRam(CFramebuffer* framebuffer, uint32 firstPa
 void CGSH_OpenGL::BeginTransferWrite()
 {
 	CGSHandler::BeginTransferWrite();
+	m_mergePages.clear();
 	auto bltBuf = make_convertible<BITBLTBUF>(m_nReg[GS_REG_BITBLTBUF]);
 	auto trxReg = make_convertible<TRXREG>(m_nReg[GS_REG_TRXREG]);
 	auto trxPos = make_convertible<TRXPOS>(m_nReg[GS_REG_TRXPOS]);
@@ -3268,7 +3294,14 @@ void CGSH_OpenGL::BeginTransferWrite()
 		}
 		if(state.drawnBlocks & ~overwritten)
 		{
-			SyncFramebufferToRam(state.owner, page, page);
+			if(CanMergeTransfer(state.owner, bltBuf, page))
+			{
+				m_mergePages.emplace_back(page, state.owner);
+			}
+			else
+			{
+				SyncFramebufferToRam(state.owner, page, page);
+			}
 		}
 		else
 		{
@@ -3311,8 +3344,10 @@ void CGSH_OpenGL::WriteBackMemoryCache()
 
 void CGSH_OpenGL::ClearAllGpuPages()
 {
-	m_byteViewValid.reset();
-	m_byteViewSource.reset();
+	InvalidateByteViews();
+	for(auto& view : m_byteViews) view.source.reset();
+	std::fill(m_ramCurrent.begin(), m_ramCurrent.end(), 0);
+	m_mergePages.clear();
 	m_gpuClutSource.reset();
 	m_gpuClutActive = false;
 	std::fill(std::begin(m_gpuPages), std::end(m_gpuPages), GPU_PAGE());
@@ -3332,7 +3367,7 @@ void CGSH_OpenGL::SyncCLUT(const TEX0& tex0)
 		m_gpuClutSource.reset();
 		ProcessClutTransfer(tex0.nCSA, 0);
 	}
-	SyncMemoryForRead(tex0.GetCLUTPtr(), (tex0.nCSM == 0) ? 0x400 : CGsPixelFormats::PAGESIZE);
+	SyncMemoryForRead(tex0.GetCLUTPtr(), (tex0.nCSM != 0) ? CGsPixelFormats::PAGESIZE : (CGsPixelFormats::IsPsmIDTEX4(tex0.nPsm) ? 0x40 : 0x400));
 	switch(tex0.nPsm)
 	{
 	case PSMT8:
@@ -3442,16 +3477,275 @@ void CGSH_OpenGL::MaterializeGpuClut()
 void CGSH_OpenGL::ReleaseGpuClutSource(const CFramebuffer* framebuffer)
 {
 	if(m_gpuClutSource && (m_gpuClutSource.get() == framebuffer)) MaterializeGpuClut();
-	if(m_byteViewSource && (m_byteViewSource.get() == framebuffer)) m_byteViewValid.reset();
+	for(auto& view : m_byteViews)
+	{
+		if(view.source && (view.source.get() == framebuffer)) view.valid.reset();
+	}
 }
 
-//The framebuffer that drew all the pages of a PSMT8 texture, if it is one the byte view can read.
-CGSH_OpenGL::CFramebuffer* CGSH_OpenGL::GetByteViewSource(const TEX0& tex0)
+void CGSH_OpenGL::InvalidateByteViews(uint32 page)
 {
-	uint32 bufWidth = tex0.GetBufWidth();
-	uint32 pagesPerRow = bufWidth / 128;
-	uint32 pagesX = (std::min<uint32>(tex0.GetWidth(), TEX0_MAX_TEXTURE_SIZE) + 127) / 128;
-	uint32 pagesY = (std::min<uint32>(tex0.GetHeight(), TEX0_MAX_TEXTURE_SIZE) + 63) / 64;
+	for(auto& view : m_byteViews) view.valid.reset(page);
+}
+
+void CGSH_OpenGL::InvalidateByteViews()
+{
+	for(auto& view : m_byteViews) view.valid.reset();
+}
+
+void CGSH_OpenGL::ClearRamCurrent(uint32 page, uint32 blocks)
+{
+	uint64* words = m_ramCurrent.data() + (page * 256);
+	for(uint32 block = 0; block < 32; block++)
+	{
+		if(blocks & (1U << block)) std::fill(words + (block * 8), words + (block * 8) + 8, 0);
+	}
+}
+
+//Whether RAM has all of these drawn blocks as the GPU does.
+bool CGSH_OpenGL::IsRamCurrent(uint32 page, uint32 blocks) const
+{
+	const uint64* words = m_ramCurrent.data() + (page * 256);
+	for(uint32 block = 0; block < 32; block++)
+	{
+		if(!(blocks & (1U << block))) continue;
+		for(uint32 i = 0; i < 8; i++)
+		{
+			if(words[(block * 8) + i] != ~0ULL) return false;
+		}
+	}
+	return true;
+}
+
+//Whether RAM has the bytes [start, end) of one page as the GPU does.
+bool CGSH_OpenGL::IsRamCurrentRange(uint32 start, uint32 end) const
+{
+	if(start >= end) return true;
+	uint32 page = (start / CGsPixelFormats::PAGESIZE) % GPU_PAGE_COUNT;
+	const auto& state = m_gpuPages[page];
+	if(!state.owner) return true;
+	const uint64* words = m_ramCurrent.data() + (page * 256);
+	for(uint32 address = start; address < end; address++)
+	{
+		uint32 offset = address % CGsPixelFormats::PAGESIZE;
+		if(!(state.drawnBlocks & (1U << (offset / 0x100)))) continue;
+		uint32 nibble = offset * 2;
+		if(((words[nibble / 64] >> (nibble % 64)) & 3) != 3) return false;
+	}
+	return true;
+}
+
+//Nibble of a PSMT4 page (128x128) each texel is.
+static const uint16* GetPsmt4NibbleTable()
+{
+	static std::vector<uint16> table;
+	if(!table.empty()) return table.data();
+	table.assign(128 * 128, 0);
+	std::vector<uint8> memory(CGsPixelFormats::PAGESIZE);
+	CGsPixelFormats::CPixelIndexorPSMT4 indexor(memory.data(), 0, 2);
+	//Four passes, each nibble holding 4 bits of its own index.
+	for(uint32 pass = 0; pass < 4; pass++)
+	{
+		for(uint32 byte = 0; byte < CGsPixelFormats::PAGESIZE; byte++)
+		{
+			memory[byte] = static_cast<uint8>((((byte * 2) >> (pass * 4)) & 0x0F) | ((((byte * 2) + 1) >> (pass * 4)) & 0x0F) << 4);
+		}
+		for(uint32 y = 0; y < 128; y++)
+		{
+			for(uint32 x = 0; x < 128; x++)
+			{
+				table[(y * 128) + x] |= static_cast<uint16>(indexor.GetPixel(x, y) << (pass * 4));
+			}
+		}
+	}
+	return table.data();
+}
+
+namespace
+{
+	struct TRANSFER_LAYOUT
+	{
+		uint32 pageWidth = 0;
+		uint32 pageHeight = 0;
+		uint32 unitNibbles = 0;
+		const uint32* byteOffsets = nullptr;
+		const uint16* nibbleOffsets = nullptr;
+	};
+
+	bool GetTransferLayout(uint32 psm, TRANSFER_LAYOUT& layout)
+	{
+		switch(psm)
+		{
+		case CGSHandler::PSMCT32:
+			layout = {64, 32, 8, CGsPixelFormats::CPixelIndexorPSMCT32::GetPageOffsets(), nullptr};
+			return true;
+		case CGSHandler::PSMCT24:
+			layout = {64, 32, 6, CGsPixelFormats::CPixelIndexorPSMCT32::GetPageOffsets(), nullptr};
+			return true;
+		case CGSHandler::PSMCT16:
+			layout = {64, 64, 4, CGsPixelFormats::CPixelIndexorPSMCT16::GetPageOffsets(), nullptr};
+			return true;
+		case CGSHandler::PSMCT16S:
+			layout = {64, 64, 4, CGsPixelFormats::CPixelIndexorPSMCT16S::GetPageOffsets(), nullptr};
+			return true;
+		case CGSHandler::PSMT8:
+			layout = {128, 64, 2, CGsPixelFormats::CPixelIndexorPSMT8::GetPageOffsets(), nullptr};
+			return true;
+		case CGSHandler::PSMT4:
+			layout = {128, 128, 1, nullptr, GetPsmt4NibbleTable()};
+			return true;
+		default:
+			return false;
+		}
+	}
+}
+
+//A transfer into a page a PSMCT32/PSMCT24 framebuffer drew can be merged into the framebuffer instead of bringing
+//the page back to RAM (a GPU stall): Gran Turismo 4 uploads its HUD textures over memory it rendered to.
+bool CGSH_OpenGL::CanMergeTransfer(CFramebuffer* owner, const BITBLTBUF& bltBuf, uint32 page)
+{
+	if(m_multisampleEnabled) return false;
+	if((owner->m_psm != PSMCT32) && (owner->m_psm != PSMCT24)) return false;
+	if(((owner->m_width % 64) != 0) || ((owner->m_basePtr % CGsPixelFormats::PAGESIZE) != 0)) return false;
+	TRANSFER_LAYOUT layout;
+	if(!GetTransferLayout(bltBuf.nDstPsm, layout)) return false;
+	if(bltBuf.GetDstWidth() < layout.pageWidth) return false;
+	uint32 pageX = 0, pageY = 0;
+	if(!GetPagePosition(owner->m_basePtr, owner->m_width, owner->m_height, owner->m_psm, page, pageX, pageY)) return false;
+	return std::any_of(m_framebuffers.begin(), m_framebuffers.end(), [owner](const FramebufferPtr& candidate) { return candidate.get() == owner; });
+}
+
+//After the transfer wrote RAM: the nibbles it wrote in each page of m_mergePages go into the framebuffer that has
+//the page (a copy of the page, then a pass taking the written bits from RAM), and RAM is current for them.
+void CGSH_OpenGL::MergeTransfer(const BITBLTBUF& bltBuf, const TRXREG& trxReg, const TRXPOS& trxPos)
+{
+	TRANSFER_LAYOUT layout;
+	if(!GetTransferLayout(bltBuf.nDstPsm, layout)) return;
+	uint32 pagesPerRow = bltBuf.GetDstWidth() / layout.pageWidth;
+	uint32 baseNibble = bltBuf.GetDstPtr() * 2;
+
+	std::vector<int32> maskIndex(GPU_PAGE_COUNT, -1);
+	std::vector<uint64> masks(m_mergePages.size() * 256);
+	for(uint32 i = 0; i < m_mergePages.size(); i++)
+	{
+		maskIndex[m_mergePages[i].first] = i;
+	}
+	for(uint32 y = 0; y < trxReg.nRRH; y++)
+	{
+		uint32 pixelY = (trxPos.nDSAY + y) % 2048;
+		uint32 rowPage = (pixelY / layout.pageHeight) * pagesPerRow;
+		uint32 rowOffset = (pixelY % layout.pageHeight) * layout.pageWidth;
+		for(uint32 x = 0; x < trxReg.nRRW; x++)
+		{
+			uint32 pixelX = (trxPos.nDSAX + x) % 2048;
+			uint32 offset = rowOffset + (pixelX % layout.pageWidth);
+			uint32 inPage = layout.nibbleOffsets ? layout.nibbleOffsets[offset] : (layout.byteOffsets[offset] * 2);
+			uint32 nibble = (baseNibble + ((rowPage + (pixelX / layout.pageWidth)) * CGsPixelFormats::PAGESIZE * 2) + inPage) % (RAMSIZE * 2);
+			int32 index = maskIndex[nibble / (CGsPixelFormats::PAGESIZE * 2)];
+			if(index < 0) continue;
+			uint64* mask = masks.data() + (index * 256);
+			uint32 pageNibble = nibble % (CGsPixelFormats::PAGESIZE * 2);
+			for(uint32 i = 0; i < layout.unitNibbles; i++)
+			{
+				uint32 bit = pageNibble + i;
+				mask[bit / 64] |= 1ULL << (bit % 64);
+			}
+		}
+	}
+
+	if(!m_mergeProgram)
+	{
+		m_mergeProgram = GenerateMergeProgram();
+		glUseProgram(*m_mergeProgram);
+		glUniform1i(glGetUniformLocation(*m_mergeProgram, "g_copy"), 0);
+		glUniform1i(glGetUniformLocation(*m_mergeProgram, "g_data"), 1);
+		m_mergeData = Framework::OpenGl::CTexture::Create();
+		glBindTexture(GL_TEXTURE_2D, m_mergeData);
+		glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 128, 32);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		CHECKGLERROR();
+	}
+	uint32 scale = m_fbScale;
+	if(m_mergeCopyScale != scale)
+	{
+		m_mergeCopy = Framework::OpenGl::CTexture::Create();
+		glBindTexture(GL_TEXTURE_2D, m_mergeCopy);
+		glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 64 * scale, 32 * scale);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		m_mergeCopyScale = scale;
+		CHECKGLERROR();
+	}
+
+	auto offsets32 = CGsPixelFormats::CPixelIndexorPSMCT32::GetPageOffsets();
+	std::vector<uint32> data(128 * 32);
+	for(uint32 i = 0; i < m_mergePages.size(); i++)
+	{
+		auto [page, owner] = m_mergePages[i];
+		const uint64* mask = masks.data() + (i * 256);
+		uint64* ramCurrent = m_ramCurrent.data() + (page * 256);
+		bool written = false;
+		for(uint32 word = 0; word < 256; word++)
+		{
+			ramCurrent[word] |= mask[word];
+			written |= (mask[word] != 0);
+		}
+		if(!written) continue;
+
+		uint32 pageX = 0, pageY = 0;
+		GetPagePosition(owner->m_basePtr, owner->m_width, owner->m_height, owner->m_psm, page, pageX, pageY);
+		const uint8* pageMemory = m_pRAM + (page * CGsPixelFormats::PAGESIZE);
+		for(uint32 y = 0; y < 32; y++)
+		{
+			for(uint32 x = 0; x < 64; x++)
+			{
+				uint32 offset = offsets32[(y * 64) + x];
+				uint32 bits = static_cast<uint32>(mask[(offset * 2) / 64] >> ((offset * 2) % 64)) & 0xFF;
+				uint32 bitMask = 0;
+				for(uint32 nibble = 0; nibble < 8; nibble++)
+				{
+					if(bits & (1 << nibble)) bitMask |= 0xFU << (nibble * 4);
+				}
+				data[(y * 128) + x] = *reinterpret_cast<const uint32*>(pageMemory + offset);
+				data[(y * 128) + 64 + x] = bitMask;
+			}
+		}
+
+		m_validGlState &= ~(GLSTATE_BLEND | GLSTATE_COLORMASK | GLSTATE_SCISSOR | GLSTATE_PROGRAM | GLSTATE_TEXTURE);
+		m_validGlState &= ~(GLSTATE_VIEWPORT | GLSTATE_DEPTHTEST | GLSTATE_DEPTHMASK | GLSTATE_FRAMEBUFFER);
+
+		glActiveTexture(GL_TEXTURE1);
+		glBindTexture(GL_TEXTURE_2D, m_mergeData);
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 128, 32, GL_RGBA, GL_UNSIGNED_BYTE, data.data());
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, m_mergeCopy);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, owner->m_framebuffer);
+		glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, pageX * scale, pageY * scale, 64 * scale, 32 * scale);
+
+		glBindFramebuffer(GL_FRAMEBUFFER, owner->m_framebuffer);
+		glDisable(GL_BLEND);
+		glDisable(GL_DEPTH_TEST);
+		glDisable(GL_SCISSOR_TEST);
+		glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+		glDepthMask(GL_FALSE);
+		glViewport(pageX * scale, pageY * scale, 64 * scale, 32 * scale);
+		glUseProgram(*m_mergeProgram);
+		glUniform4i(glGetUniformLocation(*m_mergeProgram, "g_params"), pageX * scale, pageY * scale, scale, 0);
+		glBindVertexArray(m_copyToFbVertexArray);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		CHECKGLERROR();
+
+		InvalidateByteViews(page);
+	}
+}
+
+//The framebuffer that drew all the pages of a PSMT8/PSMT4 texture, if it is one the byte views can read.
+CGSH_OpenGL::CFramebuffer* CGSH_OpenGL::GetByteViewSource(const TEX0& tex0, uint32 pageWidth, uint32 pageHeight)
+{
+	uint32 pagesPerRow = tex0.GetBufWidth() / pageWidth;
+	uint32 pagesX = (std::min<uint32>(tex0.GetWidth(), TEX0_MAX_TEXTURE_SIZE) + pageWidth - 1) / pageWidth;
+	uint32 pagesY = (std::min<uint32>(tex0.GetHeight(), TEX0_MAX_TEXTURE_SIZE) + pageHeight - 1) / pageHeight;
 	uint32 firstPage = tex0.GetBufPtr() / CGsPixelFormats::PAGESIZE;
 	CFramebuffer* source = nullptr;
 	for(uint32 y = 0; y < pagesY; y++)
@@ -3468,35 +3762,53 @@ CGSH_OpenGL::CFramebuffer* CGSH_OpenGL::GetByteViewSource(const TEX0& tex0)
 	return source;
 }
 
-//A PSMT8 texture over pages a PSMCT32/PSMCT24 framebuffer drew (Gran Turismo 4 reads its frame so, a page at a
-//time): its bytes are taken from the framebuffer on the GPU instead of bringing the framebuffer back to RAM.
+//A PSMT8/PSMT4 texture over pages a PSMCT32/PSMCT24 framebuffer drew (Gran Turismo 4 reads its frame so, a page at a
+//time, and its HUD textures uploaded over its render targets): its texels are taken from the framebuffer on the GPU
+//instead of bringing the framebuffer back to RAM.
 bool CGSH_OpenGL::PrepareFramebufferByteTexture(const TEX0& tex0, TEXTURE_INFO& texInfo)
 {
-	if((tex0.nPsm != PSMT8) || (m_gpuPageCount == 0)) return false;
+	uint32 viewIndex = 0;
+	uint32 tileHeight = 0;
+	if(tex0.nPsm == PSMT8)
+	{
+		viewIndex = 0;
+		tileHeight = 64;
+	}
+	else if(tex0.nPsm == PSMT4)
+	{
+		viewIndex = 1;
+		tileHeight = 128;
+	}
+	else
+	{
+		return false;
+	}
+	if(m_gpuPageCount == 0) return false;
 	if(((tex0.GetBufPtr() % CGsPixelFormats::PAGESIZE) != 0) || (tex0.GetBufWidth() == 0) || ((tex0.GetBufWidth() % 128) != 0)) return false;
-	if(!GetByteViewSource(tex0)) return false;
+	if(!GetByteViewSource(tex0, 128, tileHeight)) return false;
 	if(!m_vertexBuffer.empty() && m_renderState.isValid) FlushVertexBuffer();
-	auto source = GetByteViewSource(tex0);
+	auto source = GetByteViewSource(tex0, 128, tileHeight);
 	if(!source) return false;
 	auto sourceIterator = std::find_if(m_framebuffers.begin(), m_framebuffers.end(),
 	                                   [source](const FramebufferPtr& candidate) { return candidate.get() == source; });
 	if(sourceIterator == m_framebuffers.end()) return false;
 
+	auto& view = m_byteViews[viewIndex];
 	uint32 width = std::min<uint32>(tex0.GetWidth(), TEX0_MAX_TEXTURE_SIZE);
 	uint32 height = std::min<uint32>(tex0.GetHeight(), TEX0_MAX_TEXTURE_SIZE);
 	uint32 pagesPerRow = tex0.GetBufWidth() / 128;
 	uint32 pagesX = (width + 127) / 128;
-	uint32 pagesY = (height + 63) / 64;
+	uint32 pagesY = (height + tileHeight - 1) / tileHeight;
 	uint32 firstPage = tex0.GetBufPtr() / CGsPixelFormats::PAGESIZE;
-	bool valid = (m_byteViewSource.get() == source);
+	bool valid = (view.source.get() == source);
 	for(uint32 y = 0; valid && (y < pagesY); y++)
 	{
 		for(uint32 x = 0; x < pagesX; x++)
 		{
-			valid = valid && m_byteViewValid.test((firstPage + (y * pagesPerRow) + x) % GPU_PAGE_COUNT);
+			valid = valid && view.valid.test((firstPage + (y * pagesPerRow) + x) % GPU_PAGE_COUNT);
 		}
 	}
-	if(!valid) BuildByteView(*sourceIterator);
+	if(!valid) BuildByteView(viewIndex, *sourceIterator);
 
 	//A few textures of each size in turn, so that one isn't rewritten while a queued draw still reads it.
 	auto& [textures, next] = m_byteViewTextures[(width << 16) | height];
@@ -3514,7 +3826,7 @@ bool CGSH_OpenGL::PrepareFramebufferByteTexture(const TEX0& tex0, TEXTURE_INFO& 
 	}
 	GLuint texture = textures[next];
 
-	glBindFramebuffer(GL_READ_FRAMEBUFFER, m_byteViewFramebuffer);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, view.framebuffer);
 	glBindTexture(GL_TEXTURE_2D, texture);
 	for(uint32 y = 0; y < pagesY; y++)
 	{
@@ -3523,8 +3835,8 @@ bool CGSH_OpenGL::PrepareFramebufferByteTexture(const TEX0& tex0, TEXTURE_INFO& 
 			uint32 page = (firstPage + (y * pagesPerRow) + x) % GPU_PAGE_COUNT;
 			uint32 pageX = 0, pageY = 0;
 			if(!GetPagePosition(source->m_basePtr, source->m_width, source->m_height, source->m_psm, page, pageX, pageY)) continue;
-			glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x * 128, y * 64, (pageX / 64) * 128, (pageY / 32) * 64,
-			                    std::min<uint32>(128, width - (x * 128)), std::min<uint32>(64, height - (y * 64)));
+			glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x * 128, y * tileHeight, (pageX / 64) * 128, (pageY / 32) * tileHeight,
+			                    std::min<uint32>(128, width - (x * 128)), std::min<uint32>(tileHeight, height - (y * tileHeight)));
 		}
 	}
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, m_renderState.framebufferHandle);
@@ -3534,14 +3846,16 @@ bool CGSH_OpenGL::PrepareFramebufferByteTexture(const TEX0& tex0, TEXTURE_INFO& 
 	return true;
 }
 
-//Lays out all of the framebuffer's bytes as PSMT8 pages.
-void CGSH_OpenGL::BuildByteView(const FramebufferPtr& source)
+//Lays out all of the framebuffer's bytes as PSMT8 pages (view 0) or its nibbles as PSMT4 pages (view 1).
+void CGSH_OpenGL::BuildByteView(uint32 viewIndex, const FramebufferPtr& source)
 {
+	auto& view = m_byteViews[viewIndex];
+	uint32 tileHeight = (viewIndex == 0) ? 64 : 128;
 	if(m_multisampleEnabled) ResolveFramebufferMultisample(source, m_fbScale);
 	uint32 pagesPerRow = source->m_width / 64;
 	uint32 pageRows = (source->m_height + 31) / 32;
 	uint32 width = pagesPerRow * 128;
-	uint32 height = pageRows * 64;
+	uint32 height = pageRows * tileHeight;
 
 	if(!m_byteViewProgram)
 	{
@@ -3549,50 +3863,56 @@ void CGSH_OpenGL::BuildByteView(const FramebufferPtr& source)
 		glUseProgram(*m_byteViewProgram);
 		glUniform1i(glGetUniformLocation(*m_byteViewProgram, "g_framebuffer"), 0);
 		glUniform1i(glGetUniformLocation(*m_byteViewProgram, "g_layout"), 1);
+	}
 
-		//Where each byte of a PSMT8 page is in a PSMCT32 page: pixel x, y and byte.
-		auto offsets8 = CGsPixelFormats::CPixelIndexorPSMT8::GetPageOffsets();
+	if(static_cast<GLuint>(view.layout) == 0)
+	{
+		//Where each texel of a PSMT8/PSMT4 page is in a PSMCT32 page: pixel x, y, byte (and nibble, bit 2).
 		auto offsets32 = CGsPixelFormats::CPixelIndexorPSMCT32::GetPageOffsets();
 		std::vector<uint16> pixels(2048);
 		for(uint32 i = 0; i < 64 * 32; i++)
 		{
 			pixels[offsets32[i] / 4] = static_cast<uint16>(((i / 64) << 8) | (i % 64));
 		}
-		std::vector<uint8> layout(128 * 64 * 4);
-		for(uint32 i = 0; i < 128 * 64; i++)
+		std::vector<uint8> layout(128 * tileHeight * 4);
+		auto offsets8 = CGsPixelFormats::CPixelIndexorPSMT8::GetPageOffsets();
+		auto nibbles4 = GetPsmt4NibbleTable();
+		for(uint32 i = 0; i < 128 * tileHeight; i++)
 		{
-			uint16 pixel = pixels[offsets8[i] / 4];
+			uint32 nibble = (viewIndex == 0) ? (offsets8[i] * 2) : nibbles4[i];
+			uint32 byte = nibble / 2;
+			uint16 pixel = pixels[byte / 4];
 			layout[(i * 4) + 0] = static_cast<uint8>(pixel & 0xFF);
 			layout[(i * 4) + 1] = static_cast<uint8>(pixel >> 8);
-			layout[(i * 4) + 2] = static_cast<uint8>(offsets8[i] % 4);
+			layout[(i * 4) + 2] = static_cast<uint8>((byte % 4) | ((nibble & 1) << 2));
 			layout[(i * 4) + 3] = 0;
 		}
-		m_byteViewLayout = Framework::OpenGl::CTexture::Create();
-		glBindTexture(GL_TEXTURE_2D, m_byteViewLayout);
-		glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8UI, 128, 64);
-		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 128, 64, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, layout.data());
+		view.layout = Framework::OpenGl::CTexture::Create();
+		glBindTexture(GL_TEXTURE_2D, view.layout);
+		glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8UI, 128, tileHeight);
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 128, tileHeight, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, layout.data());
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 		CHECKGLERROR();
 	}
 
-	if((width != m_byteViewWidth) || (height != m_byteViewHeight))
+	if((width != view.width) || (height != view.height))
 	{
-		m_byteViewTexture = Framework::OpenGl::CTexture::Create();
-		glBindTexture(GL_TEXTURE_2D, m_byteViewTexture);
+		view.texture = Framework::OpenGl::CTexture::Create();
+		glBindTexture(GL_TEXTURE_2D, view.texture);
 		glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, width, height);
-		m_byteViewFramebuffer = Framework::OpenGl::CFramebuffer::Create();
-		glBindFramebuffer(GL_FRAMEBUFFER, m_byteViewFramebuffer);
-		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_byteViewTexture, 0);
+		view.framebuffer = Framework::OpenGl::CFramebuffer::Create();
+		glBindFramebuffer(GL_FRAMEBUFFER, view.framebuffer);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, view.texture, 0);
 		CHECKGLERROR();
-		m_byteViewWidth = width;
-		m_byteViewHeight = height;
+		view.width = width;
+		view.height = height;
 	}
 
 	m_validGlState &= ~(GLSTATE_BLEND | GLSTATE_COLORMASK | GLSTATE_SCISSOR | GLSTATE_PROGRAM | GLSTATE_TEXTURE);
 	m_validGlState &= ~(GLSTATE_VIEWPORT | GLSTATE_DEPTHTEST | GLSTATE_DEPTHMASK | GLSTATE_FRAMEBUFFER);
 
-	glBindFramebuffer(GL_FRAMEBUFFER, m_byteViewFramebuffer);
+	glBindFramebuffer(GL_FRAMEBUFFER, view.framebuffer);
 	glDisable(GL_BLEND);
 	glDisable(GL_DEPTH_TEST);
 	glDisable(GL_SCISSOR_TEST);
@@ -3601,8 +3921,9 @@ void CGSH_OpenGL::BuildByteView(const FramebufferPtr& source)
 	glViewport(0, 0, width, height);
 	glUseProgram(*m_byteViewProgram);
 	glUniform1i(glGetUniformLocation(*m_byteViewProgram, "g_scale"), m_fbScale);
+	glUniform1i(glGetUniformLocation(*m_byteViewProgram, "g_nibbles"), viewIndex);
 	glActiveTexture(GL_TEXTURE1);
-	glBindTexture(GL_TEXTURE_2D, m_byteViewLayout);
+	glBindTexture(GL_TEXTURE_2D, view.layout);
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_2D, source->m_texture);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED);
@@ -3610,12 +3931,12 @@ void CGSH_OpenGL::BuildByteView(const FramebufferPtr& source)
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 	CHECKGLERROR();
 
-	m_byteViewSource = source;
-	m_byteViewValid.reset();
+	view.source = source;
+	view.valid.reset();
 	uint32 basePage = source->m_basePtr / CGsPixelFormats::PAGESIZE;
 	for(uint32 page = 0; page < (pagesPerRow * pageRows); page++)
 	{
-		m_byteViewValid.set((basePage + page) % GPU_PAGE_COUNT);
+		view.valid.set((basePage + page) % GPU_PAGE_COUNT);
 	}
 }
 

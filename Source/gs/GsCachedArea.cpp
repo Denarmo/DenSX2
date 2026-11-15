@@ -153,6 +153,14 @@ void CGsCachedArea::SetPageDirty(uint32 pageIndex)
 	m_dirtyPages[dirtyPageSection] |= (1ULL << dirtyPageIndex);
 }
 
+void CGsCachedArea::ClearPageDirty(uint32 pageIndex)
+{
+	if(pageIndex >= MAX_DIRTYPAGES) return;
+	unsigned int dirtyPageSection = pageIndex / (sizeof(m_dirtyPages[0]) * 8);
+	unsigned int dirtyPageIndex = pageIndex % (sizeof(m_dirtyPages[0]) * 8);
+	m_dirtyPages[dirtyPageSection] &= ~(1ULL << dirtyPageIndex);
+}
+
 bool CGsCachedArea::HasDirtyPages() const
 {
 	DirtyPageHolder dirtyStatus = 0;

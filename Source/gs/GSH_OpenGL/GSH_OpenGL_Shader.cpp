@@ -969,7 +969,7 @@ Framework::OpenGl::ProgramPtr CGSH_OpenGL::GenerateByteViewProgram()
 	}
 
 	{
-		//Texel (x, y) of a PSMT8 page is byte place.z of the PSMCT32 page's pixel place.xy.
+		//Texel (x, y) of a PSMT8/PSMT4 page is byte place.z & 3 (high nibble if place.z & 4) of the PSMCT32 page's pixel place.xy.
 		std::stringstream shaderBuilder;
 		shaderBuilder << GLSL_VERSION << std::endl;
 		shaderBuilder << "precision mediump float;" << std::endl;
@@ -978,15 +978,75 @@ Framework::OpenGl::ProgramPtr CGSH_OpenGL::GenerateByteViewProgram()
 		shaderBuilder << "uniform sampler2D g_framebuffer;" << std::endl;
 		shaderBuilder << "uniform highp usampler2D g_layout;" << std::endl;
 		shaderBuilder << "uniform int g_scale;" << std::endl;
+		shaderBuilder << "uniform int g_nibbles;" << std::endl;
 		shaderBuilder << "void main()" << std::endl;
 		shaderBuilder << "{" << std::endl;
+		shaderBuilder << "	ivec2 tile = (g_nibbles != 0) ? ivec2(128, 128) : ivec2(128, 64);" << std::endl;
 		shaderBuilder << "	ivec2 texel = ivec2(gl_FragCoord.xy);" << std::endl;
-		shaderBuilder << "	ivec2 page = texel / ivec2(128, 64);" << std::endl;
-		shaderBuilder << "	uvec4 place = texelFetch(g_layout, texel - (page * ivec2(128, 64)), 0);" << std::endl;
+		shaderBuilder << "	ivec2 page = texel / tile;" << std::endl;
+		shaderBuilder << "	uvec4 place = texelFetch(g_layout, texel - (page * tile), 0);" << std::endl;
 		shaderBuilder << "	ivec2 position = ((page * ivec2(64, 32)) + ivec2(place.xy)) * g_scale;" << std::endl;
-		shaderBuilder << "	vec4 color = texelFetch(g_framebuffer, position, 0);" << std::endl;
-		shaderBuilder << "	float value = (place.z == 0u) ? color.r : ((place.z == 1u) ? color.g : ((place.z == 2u) ? color.b : color.a));" << std::endl;
+		shaderBuilder << "	highp vec4 color = texelFetch(g_framebuffer, position, 0);" << std::endl;
+		shaderBuilder << "	uint byteIndex = place.z & 3u;" << std::endl;
+		shaderBuilder << "	highp float value = (byteIndex == 0u) ? color.r : ((byteIndex == 1u) ? color.g : ((byteIndex == 2u) ? color.b : color.a));" << std::endl;
+		shaderBuilder << "	if(g_nibbles != 0)" << std::endl;
+		shaderBuilder << "	{" << std::endl;
+		shaderBuilder << "		uint byteValue = uint(value * 255.0 + 0.5);" << std::endl;
+		shaderBuilder << "		value = float(((place.z & 4u) != 0u) ? (byteValue >> 4) : (byteValue & 15u)) / 255.0;" << std::endl;
+		shaderBuilder << "	}" << std::endl;
 		shaderBuilder << "	fragColor = vec4(value, 0.0, 0.0, 0.0);" << std::endl;
+		shaderBuilder << "}" << std::endl;
+
+		pixelShader.SetSource(shaderBuilder.str().c_str());
+		FRAMEWORK_MAYBE_UNUSED bool result = pixelShader.Compile();
+		assert(result);
+	}
+
+	auto program = std::make_shared<Framework::OpenGl::CProgram>();
+	program->AttachShader(vertexShader);
+	program->AttachShader(pixelShader);
+	FRAMEWORK_MAYBE_UNUSED bool result = program->Link();
+	assert(result);
+	return program;
+}
+
+Framework::OpenGl::ProgramPtr CGSH_OpenGL::GenerateMergeProgram()
+{
+	Framework::OpenGl::CShader vertexShader(GL_VERTEX_SHADER);
+	Framework::OpenGl::CShader pixelShader(GL_FRAGMENT_SHADER);
+
+	{
+		std::stringstream shaderBuilder;
+		shaderBuilder << GLSL_VERSION << std::endl;
+		shaderBuilder << "void main()" << std::endl;
+		shaderBuilder << "{" << std::endl;
+		shaderBuilder << "	vec2 position = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));" << std::endl;
+		shaderBuilder << "	gl_Position = vec4((position * 2.0) - 1.0, 0, 1);" << std::endl;
+		shaderBuilder << "}" << std::endl;
+
+		vertexShader.SetSource(shaderBuilder.str().c_str());
+		FRAMEWORK_MAYBE_UNUSED bool result = vertexShader.Compile();
+		assert(result);
+	}
+
+	{
+		//A page of a framebuffer with the bits of RAM a transfer wrote (g_data: RAM pixels, then the mask).
+		std::stringstream shaderBuilder;
+		shaderBuilder << GLSL_VERSION << std::endl;
+		shaderBuilder << "precision highp float;" << std::endl;
+		shaderBuilder << "precision highp int;" << std::endl;
+		shaderBuilder << "out vec4 fragColor;" << std::endl;
+		shaderBuilder << "uniform sampler2D g_copy;" << std::endl;
+		shaderBuilder << "uniform sampler2D g_data;" << std::endl;
+		shaderBuilder << "uniform ivec4 g_params;" << std::endl; //page position (scaled), scale
+		shaderBuilder << "void main()" << std::endl;
+		shaderBuilder << "{" << std::endl;
+		shaderBuilder << "	ivec2 local = ivec2(gl_FragCoord.xy) - g_params.xy;" << std::endl;
+		shaderBuilder << "	ivec2 pixel = local / g_params.z;" << std::endl;
+		shaderBuilder << "	uvec4 current = uvec4(texelFetch(g_copy, local, 0) * 255.0 + 0.5);" << std::endl;
+		shaderBuilder << "	uvec4 ram = uvec4(texelFetch(g_data, pixel, 0) * 255.0 + 0.5);" << std::endl;
+		shaderBuilder << "	uvec4 mask = uvec4(texelFetch(g_data, pixel + ivec2(64, 0), 0) * 255.0 + 0.5);" << std::endl;
+		shaderBuilder << "	fragColor = vec4((current & ~mask) | (ram & mask)) / 255.0;" << std::endl;
 		shaderBuilder << "}" << std::endl;
 
 		pixelShader.SetSource(shaderBuilder.str().c_str());
