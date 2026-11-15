@@ -30,12 +30,19 @@ CPresent::CPresent(const ContextPtr& context)
 	CreateRenderPass();
 	CreateVertexBuffer();
 
-	CreateSwapChain();
+	if(m_context->surface)
+	{
+		CreateSwapChain();
+	}
 }
 
 CPresent::~CPresent()
 {
 	DestroySwapChain();
+	for(auto& offscreenImage : m_offscreenImages)
+	{
+		DestroyOffscreenImage(offscreenImage);
+	}
 	for(const auto& presentCommandBuffer : m_presentCommandBuffers)
 	{
 		m_context->device.vkDestroyFence(m_context->device, presentCommandBuffer.execCompleteFence, nullptr);
@@ -87,7 +94,7 @@ void CPresent::DoPresent(const CGSHandler::DISPLAY_INFO& dispInfo)
 	}
 	if(result != VK_SUBOPTIMAL_KHR) CHECKVULKANERROR(result);
 
-	UpdateBackbuffer(imageIndex, swapChainSemaphores, dispInfo);
+	UpdateBackbuffer(m_swapChainImages[imageIndex], m_swapChainFramebuffers[imageIndex], m_surfaceExtents, &swapChainSemaphores, dispInfo);
 
 	//Queue present
 	{
@@ -108,12 +115,63 @@ void CPresent::DoPresent(const CGSHandler::DISPLAY_INFO& dispInfo)
 	}
 }
 
-void CPresent::UpdateBackbuffer(uint32 imageIndex, const SWAPCHAIN_SEMAPHORES& swapChainSemaphores, const CGSHandler::DISPLAY_INFO& dispInfo)
+void CPresent::DoPresentOffscreen(const CGSHandler::DISPLAY_INFO& dispInfo, uint32 index, uint32 width, uint32 height)
+{
+	if(m_offscreenImages.size() <= index)
+	{
+		m_offscreenImages.resize(index + 1);
+	}
+	auto& target = m_offscreenImages[index];
+	if((target.width != width) || (target.height != height))
+	{
+		if(!target.image.IsEmpty())
+		{
+			m_context->device.vkQueueWaitIdle(m_context->queue);
+			DestroyOffscreenImage(target);
+		}
+		target.image = Framework::Vulkan::CImage(m_context->device, m_context->physicalDeviceMemoryProperties,
+		                                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+		                                         m_context->surfaceFormat.format, width, height);
+		target.view = target.image.CreateImageView();
+		auto frameBufferCreateInfo = Framework::Vulkan::FramebufferCreateInfo();
+		frameBufferCreateInfo.renderPass = m_renderPass;
+		frameBufferCreateInfo.attachmentCount = 1;
+		frameBufferCreateInfo.pAttachments = &target.view;
+		frameBufferCreateInfo.width = width;
+		frameBufferCreateInfo.height = height;
+		frameBufferCreateInfo.layers = 1;
+		auto result = m_context->device.vkCreateFramebuffer(m_context->device, &frameBufferCreateInfo, nullptr, &target.framebuffer);
+		CHECKVULKANERROR(result);
+		target.width = width;
+		target.height = height;
+	}
+	UpdateBackbuffer(target.image, target.framebuffer, VkExtent2D{width, height}, nullptr, dispInfo);
+}
+
+VkImage CPresent::GetOffscreenImage(uint32 index) const
+{
+	return (index < m_offscreenImages.size()) ? static_cast<VkImage>(m_offscreenImages[index].image) : VK_NULL_HANDLE;
+}
+
+VkImageView CPresent::GetOffscreenImageView(uint32 index) const
+{
+	return (index < m_offscreenImages.size()) ? m_offscreenImages[index].view : VK_NULL_HANDLE;
+}
+
+void CPresent::DestroyOffscreenImage(OFFSCREEN_IMAGE& target)
+{
+	if(target.framebuffer) m_context->device.vkDestroyFramebuffer(m_context->device, target.framebuffer, nullptr);
+	if(target.view) m_context->device.vkDestroyImageView(m_context->device, target.view, nullptr);
+	target.image.Reset();
+	target.framebuffer = VK_NULL_HANDLE;
+	target.view = VK_NULL_HANDLE;
+	target.width = target.height = 0;
+}
+
+void CPresent::UpdateBackbuffer(VkImage swapChainImage, VkFramebuffer framebuffer, VkExtent2D extents,
+                                const SWAPCHAIN_SEMAPHORES* swapChainSemaphores, const CGSHandler::DISPLAY_INFO& dispInfo)
 {
 	auto result = VK_SUCCESS;
-
-	auto swapChainImage = m_swapChainImages[imageIndex];
-	auto framebuffer = m_swapChainFramebuffers[imageIndex];
 
 	auto frameCommandBuffer = PrepareCommandBuffer();
 	auto commandBuffer = frameCommandBuffer.commandBuffer;
@@ -137,7 +195,9 @@ void CPresent::UpdateBackbuffer(uint32 imageIndex, const SWAPCHAIN_SEMAPHORES& s
 		imageMemoryBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		imageMemoryBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
-		m_context->device.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		//Offscreen, the image was last read by whoever took it (a libretro frontend's copy).
+		auto srcStage = swapChainSemaphores ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+		m_context->device.vkCmdPipelineBarrier(commandBuffer, srcStage, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 		                                       0, 0, nullptr, 0, nullptr, 1, &imageMemoryBarrier);
 	}
 
@@ -147,7 +207,7 @@ void CPresent::UpdateBackbuffer(uint32 imageIndex, const SWAPCHAIN_SEMAPHORES& s
 	//Begin render pass
 	auto renderPassBeginInfo = Framework::Vulkan::RenderPassBeginInfo();
 	renderPassBeginInfo.renderPass = m_renderPass;
-	renderPassBeginInfo.renderArea.extent = m_surfaceExtents;
+	renderPassBeginInfo.renderArea.extent = extents;
 	renderPassBeginInfo.clearValueCount = 1;
 	renderPassBeginInfo.pClearValues = &clearValue;
 	renderPassBeginInfo.framebuffer = framebuffer;
@@ -164,7 +224,7 @@ void CPresent::UpdateBackbuffer(uint32 imageIndex, const SWAPCHAIN_SEMAPHORES& s
 		m_context->device.vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
 
 		VkRect2D scissor = {};
-		scissor.extent = m_surfaceExtents;
+		scissor.extent = extents;
 		m_context->device.vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 	}
 
@@ -230,13 +290,16 @@ void CPresent::UpdateBackbuffer(uint32 imageIndex, const SWAPCHAIN_SEMAPHORES& s
 	{
 		VkPipelineStageFlags pipelineStageFlags = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 		auto submitInfo = Framework::Vulkan::SubmitInfo();
-		submitInfo.waitSemaphoreCount = 1;
-		submitInfo.pWaitSemaphores = &swapChainSemaphores.imageAcquireSemaphore;
-		submitInfo.pWaitDstStageMask = &pipelineStageFlags;
 		submitInfo.commandBufferCount = 1;
 		submitInfo.pCommandBuffers = &commandBuffer;
-		submitInfo.signalSemaphoreCount = 1;
-		submitInfo.pSignalSemaphores = &swapChainSemaphores.renderCompleteSemaphore;
+		if(swapChainSemaphores)
+		{
+			submitInfo.waitSemaphoreCount = 1;
+			submitInfo.pWaitSemaphores = &swapChainSemaphores->imageAcquireSemaphore;
+			submitInfo.pWaitDstStageMask = &pipelineStageFlags;
+			submitInfo.signalSemaphoreCount = 1;
+			submitInfo.pSignalSemaphores = &swapChainSemaphores->renderCompleteSemaphore;
+		}
 		result = m_context->device.vkQueueSubmit(m_context->queue, 1, &submitInfo, frameCommandBuffer.execCompleteFence);
 		CHECKVULKANERROR(result);
 	}
@@ -472,7 +535,10 @@ void CPresent::DestroySwapChain()
 		m_context->device.vkDestroySemaphore(m_context->device, swapChainSemaphores.imageAcquireSemaphore, nullptr);
 		m_context->device.vkDestroySemaphore(m_context->device, swapChainSemaphores.renderCompleteSemaphore, nullptr);
 	}
-	m_context->device.vkDestroySwapchainKHR(m_context->device, m_swapChain, nullptr);
+	if(m_swapChain != VK_NULL_HANDLE)
+	{
+		m_context->device.vkDestroySwapchainKHR(m_context->device, m_swapChain, nullptr);
+	}
 
 	m_swapChainImages.clear();
 	m_swapChainImageViews.clear();
@@ -494,7 +560,7 @@ void CPresent::CreateRenderPass()
 	colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
 	colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 	colorAttachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-	colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+	colorAttachment.finalLayout = m_context->surface ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
 	VkAttachmentReference colorRef = {};
 	colorRef.attachment = 0;

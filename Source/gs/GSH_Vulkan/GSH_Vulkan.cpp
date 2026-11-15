@@ -124,10 +124,17 @@ void CGSH_Vulkan::InitializeImpl()
 	assert(!m_instance.IsEmpty());
 	m_context->instance = &m_instance;
 
-	auto physicalDevices = GetPhysicalDevices();
-	assert(!physicalDevices.empty());
-	auto physicalDeviceIndex = GetPhysicalDeviceIndex(physicalDevices);
-	m_context->physicalDevice = physicalDevices[physicalDeviceIndex];
+	if(m_physicalDeviceOverride != VK_NULL_HANDLE)
+	{
+		m_context->physicalDevice = m_physicalDeviceOverride;
+	}
+	else
+	{
+		auto physicalDevices = GetPhysicalDevices();
+		assert(!physicalDevices.empty());
+		auto physicalDeviceIndex = GetPhysicalDeviceIndex(physicalDevices);
+		m_context->physicalDevice = physicalDevices[physicalDeviceIndex];
+	}
 
 	auto renderQueueFamilies = GetRenderQueueFamilies(m_context->physicalDevice);
 	assert(!renderQueueFamilies.empty());
@@ -160,6 +167,7 @@ void CGSH_Vulkan::InitializeImpl()
 	}
 
 	CreateDevice(m_context->physicalDevice);
+	OnDeviceCreated();
 	m_context->device.vkGetDeviceQueue(m_context->device, renderQueueFamily, 0, &m_context->queue);
 	m_context->commandBufferPool = Framework::Vulkan::CCommandBufferPool(m_context->device, renderQueueFamily);
 
@@ -212,10 +220,7 @@ void CGSH_Vulkan::InitializeImpl()
 #else
 #error Unsupported Vulkan flavor
 #endif
-	if(m_context->surface)
-	{
-		m_present = std::make_shared<CPresent>(m_context);
-	}
+	m_present = std::make_shared<CPresent>(m_context);
 	m_transferHost = std::make_shared<CTransferHost>(m_context, m_frameCommandBuffer);
 	m_transferLocal = std::make_shared<CTransferLocal>(m_context, m_frameCommandBuffer);
 
@@ -297,7 +302,7 @@ void CGSH_Vulkan::MarkNewFrame()
 
 void CGSH_Vulkan::FlipImpl(const DISPLAY_INFO& dispInfo)
 {
-	if(m_present)
+	if(m_present && m_context->surface)
 	{
 		m_present->SetPresentationViewport(GetPresentationViewport());
 		m_present->DoPresent(dispInfo);
@@ -436,6 +441,20 @@ void CGSH_Vulkan::CreateDevice(VkPhysicalDevice physicalDevice)
 {
 	assert(m_context->device.IsEmpty());
 
+	m_context->device = CreateDeviceObject(m_instance, physicalDevice, m_context->surface != VK_NULL_HANDLE);
+
+	{
+		VkPhysicalDeviceProperties deviceProperties = {};
+		m_context->instance->vkGetPhysicalDeviceProperties(physicalDevice, &deviceProperties);
+		m_context->storageBufferAlignment = deviceProperties.limits.minStorageBufferOffsetAlignment;
+		m_context->computeWorkgroupInvocations = deviceProperties.limits.maxComputeWorkGroupInvocations;
+	}
+
+	m_context->annotations = decltype(m_context->annotations)(m_context->instance, &m_context->device);
+}
+
+Framework::Vulkan::CDevice CGSH_Vulkan::CreateDeviceObject(const Framework::Vulkan::CInstance& instance, VkPhysicalDevice physicalDevice, bool withSwapchain)
+{
 	float queuePriorities[] = {1.0f};
 
 	auto deviceQueueCreateInfo = Framework::Vulkan::DeviceQueueCreateInfo();
@@ -445,7 +464,10 @@ void CGSH_Vulkan::CreateDevice(VkPhysicalDevice physicalDevice)
 	deviceQueueCreateInfo.pQueuePriorities = queuePriorities;
 
 	std::vector<const char*> enabledExtensions;
-	enabledExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+	if(withSwapchain)
+	{
+		enabledExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+	}
 #if GSH_VULKAN_IS_DESKTOP
 	enabledExtensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
 #endif
@@ -501,16 +523,7 @@ void CGSH_Vulkan::CreateDevice(VkPhysicalDevice physicalDevice)
 	deviceCreateInfo.queueCreateInfoCount = 1;
 	deviceCreateInfo.pQueueCreateInfos = &deviceQueueCreateInfo;
 
-	m_context->device = Framework::Vulkan::CDevice(m_instance, physicalDevice, deviceCreateInfo);
-
-	{
-		VkPhysicalDeviceProperties deviceProperties = {};
-		m_context->instance->vkGetPhysicalDeviceProperties(physicalDevice, &deviceProperties);
-		m_context->storageBufferAlignment = deviceProperties.limits.minStorageBufferOffsetAlignment;
-		m_context->computeWorkgroupInvocations = deviceProperties.limits.maxComputeWorkGroupInvocations;
-	}
-
-	m_context->annotations = decltype(m_context->annotations)(m_context->instance, &m_context->device);
+	return Framework::Vulkan::CDevice(instance, physicalDevice, deviceCreateInfo);
 }
 
 void CGSH_Vulkan::CreateDescriptorPool()

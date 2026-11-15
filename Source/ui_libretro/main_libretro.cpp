@@ -7,6 +7,9 @@
 
 #include "PS2VM_Preferences.h"
 #include "GSH_OpenGL_Libretro.h"
+#ifdef PLAY_LIBRETRO_VULKAN
+#include "GSH_Vulkan_Libretro.h"
+#endif
 #include "SH_LibreAudio.h"
 #include "PH_Libretro_Input.h"
 
@@ -42,6 +45,22 @@ struct retro_hw_render_callback g_hw_render
 };
 
 int g_res_factor = 1;
+//The frontend prefers Vulkan and gave a Vulkan device: the Vulkan GS runs instead of OpenGL's.
+static bool g_useVulkan = false;
+
+static CGSH_OpenGL_Libretro* GetGlGs()
+{
+	if(!m_virtualMachine || g_useVulkan) return nullptr;
+	return static_cast<CGSH_OpenGL_Libretro*>(m_virtualMachine->GetGSHandler());
+}
+
+#ifdef PLAY_LIBRETRO_VULKAN
+static CGSH_Vulkan_Libretro* GetVulkanGs()
+{
+	if(!m_virtualMachine || !g_useVulkan) return nullptr;
+	return static_cast<CGSH_Vulkan_Libretro*>(m_virtualMachine->GetGSHandler());
+}
+#endif
 //The frontend applies the aspect ratio, so the core fills the frame it reports.
 CGSHandler::PRESENTATION_MODE g_presentation_mode = CGSHandler::PRESENTATION_MODE::PRESENTATION_MODE_FILL;
 bool g_forceBilinearTextures = false;
@@ -212,6 +231,24 @@ void SetupVideoHandler()
 	CLog::GetInstance().Print(LOG_NAME, "%s\n", __FUNCTION__);
 
 	auto gsHandler = m_virtualMachine->GetGSHandler();
+#ifdef PLAY_LIBRETRO_VULKAN
+	if(g_useVulkan)
+	{
+		if(!gsHandler)
+		{
+			m_virtualMachine->CreateGSHandler(CGSH_Vulkan_Libretro::GetFactoryFunction());
+			CLog::GetInstance().Print(LOG_NAME, "GS calls run on the Vulkan GS thread\n");
+		}
+		else
+		{
+			auto retro_gs = static_cast<CGSH_Vulkan_Libretro*>(gsHandler);
+			retro_gs->SetFreeRun(true);
+			retro_gs->Reset();
+			retro_gs->SetFreeRun(false);
+		}
+		return;
+	}
+#endif
 	if(!gsHandler)
 	{
 		m_virtualMachine->CreateGSHandler(CGSH_OpenGL_Libretro::GetFactoryFunction());
@@ -234,6 +271,21 @@ static void retro_context_destroy()
 static void retro_context_reset()
 {
 	CLog::GetInstance().Print(LOG_NAME, "%s\n", __FUNCTION__);
+
+#ifdef PLAY_LIBRETRO_VULKAN
+	if(g_useVulkan)
+	{
+		const retro_hw_render_interface* hwInterface = nullptr;
+		if(!g_environ_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE, &hwInterface) || !hwInterface ||
+		   (hwInterface->interface_type != RETRO_HW_RENDER_INTERFACE_VULKAN) ||
+		   (hwInterface->interface_version != RETRO_HW_RENDER_INTERFACE_VULKAN_VERSION))
+		{
+			CLog::GetInstance().Warn(LOG_NAME, "The frontend gave no Vulkan interface.\n");
+			return;
+		}
+		CGSH_Vulkan_Libretro::SetFrontendInterface(reinterpret_cast<const retro_hw_render_interface_vulkan*>(hwInterface));
+	}
+#endif
 
 	if(m_virtualMachine)
 	{
@@ -410,7 +462,16 @@ size_t retro_serialize_size(void)
 // GS calls it may be waiting for, as it does in retro_run.
 static bool WaitForVmCall(std::future<bool>& result)
 {
-	auto gsHandler = static_cast<CGSH_OpenGL_Libretro*>(m_virtualMachine->GetGSHandler());
+#ifdef PLAY_LIBRETRO_VULKAN
+	if(auto vulkanGs = GetVulkanGs())
+	{
+		vulkanGs->SetFreeRun(true);
+		result.wait();
+		vulkanGs->SetFreeRun(false);
+		return result.get();
+	}
+#endif
+	auto gsHandler = GetGlGs();
 	if(gsHandler)
 	{
 		gsHandler->ProcessCallsUntil([&result]() { return result.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
@@ -558,9 +619,8 @@ void updateVars()
 
 			if(videoUpdate)
 			{
-				if(m_virtualMachine)
-					if(m_virtualMachine->GetGSHandler())
-						static_cast<CGSH_OpenGL_Libretro*>(m_virtualMachine->GetGSHandler())->UpdatePresentation();
+				if(auto glGs = GetGlGs())
+					glGs->UpdatePresentation();
 			}
 		}
 	}
@@ -662,7 +722,15 @@ void retro_run()
 		if(m_virtualMachine->GetSoundHandler())
 			static_cast<CSH_LibreAudio*>(m_virtualMachine->GetSoundHandler())->ProcessBuffer();
 
-		if(auto gsHandler = static_cast<CGSH_OpenGL_Libretro*>(m_virtualMachine->GetGSHandler()))
+#ifdef PLAY_LIBRETRO_VULKAN
+		if(auto vulkanGs = GetVulkanGs())
+		{
+			vulkanGs->PresentFrame();
+			UpdateFrameRate(vulkanGs->GetCrtFrameRate());
+			UpdateGeometry();
+		}
+#endif
+		if(auto gsHandler = GetGlGs())
 		{
 			if(gsHandler->HasWorker())
 			{
@@ -734,6 +802,30 @@ bool retro_load_game(const retro_game_info* info)
 
 	auto rgb = RETRO_PIXEL_FORMAT_XRGB8888;
 	g_environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &rgb);
+
+	g_useVulkan = false;
+#ifdef PLAY_LIBRETRO_VULKAN
+	{
+		unsigned preferred = 0;
+		if(g_environ_cb(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER, &preferred) && (preferred == RETRO_HW_CONTEXT_VULKAN))
+		{
+			g_hw_render = {};
+			g_hw_render.context_type = RETRO_HW_CONTEXT_VULKAN;
+			g_hw_render.version_major = VK_API_VERSION_1_1;
+			g_hw_render.context_reset = retro_context_reset;
+			g_hw_render.context_destroy = retro_context_destroy;
+			if(g_environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &g_hw_render))
+			{
+				g_useVulkan = true;
+				g_environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE,
+				             const_cast<retro_hw_render_context_negotiation_interface_vulkan*>(CGSH_Vulkan_Libretro::GetNegotiationInterface()));
+				CLog::GetInstance().Print(LOG_NAME, "Using the Vulkan GS\n");
+				g_environ_cb(RETRO_ENVIRONMENT_SET_VARIABLES, (void*)m_vars.data());
+				return true;
+			}
+		}
+	}
+#endif
 
 #ifdef GLES_COMPATIBILITY
 	g_hw_render.context_type = RETRO_HW_CONTEXT_OPENGLES3;
@@ -824,7 +916,18 @@ void retro_deinit()
 	if(m_virtualMachine)
 	{
 		m_virtualMachine->PauseAsync();
-		auto gsHandler = static_cast<CGSH_OpenGL_Libretro*>(m_virtualMachine->GetGSHandler());
+		auto gsHandler = GetGlGs();
+#ifdef PLAY_LIBRETRO_VULKAN
+		if(auto vulkanGs = GetVulkanGs())
+		{
+			vulkanGs->SetFreeRun(true);
+			while(m_virtualMachine->GetStatus() != CVirtualMachine::PAUSED)
+			{
+				std::this_thread::yield();
+			}
+		}
+		else
+#endif
 		if(gsHandler && gsHandler->HasWorker())
 		{
 			gsHandler->SetFreeRun(true);

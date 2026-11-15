@@ -25,6 +25,9 @@ public:
 	virtual ~CGSH_Vulkan() = default;
 
 	static Framework::Vulkan::CInstance CreateInstance(bool);
+	//The device the GS needs on this physical device (queue family 0). Swapchain support is
+	//only asked for with a surface.
+	static Framework::Vulkan::CDevice CreateDeviceObject(const Framework::Vulkan::CInstance&, VkPhysicalDevice, bool withSwapchain);
 
 	void SetPresentationParams(const CGSHandler::PRESENTATION_PARAMS&) override;
 
@@ -67,8 +70,16 @@ protected:
 	void SyncMemoryCache() override;
 	void SyncCLUT(const TEX0&) override;
 
+	//Called once the device exists, before anything is submitted.
+	virtual void OnDeviceCreated()
+	{
+	}
+
 	Framework::Vulkan::CInstance m_instance;
 	GSH_Vulkan::ContextPtr m_context;
+	//When set, the physical device to use instead of the one chosen in the settings.
+	VkPhysicalDevice m_physicalDeviceOverride = VK_NULL_HANDLE;
+	GSH_Vulkan::PresentPtr m_present;
 
 private:
 	struct CLUTKEY : public convertible<uint64>
@@ -232,7 +243,6 @@ private:
 	GSH_Vulkan::FrameCommandBufferPtr m_frameCommandBuffer;
 	GSH_Vulkan::ClutLoadPtr m_clutLoad;
 	GSH_Vulkan::DrawPtr m_draw;
-	GSH_Vulkan::PresentPtr m_present;
 	GSH_Vulkan::TransferHostPtr m_transferHost;
 	GSH_Vulkan::TransferLocalPtr m_transferLocal;
 

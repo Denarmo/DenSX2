@@ -5,6 +5,7 @@
 #include "GSH_VulkanPipelineCache.h"
 #include "vulkan/ShaderModule.h"
 #include "vulkan/Buffer.h"
+#include "vulkan/Image.h"
 
 namespace GSH_Vulkan
 {
@@ -17,6 +18,12 @@ namespace GSH_Vulkan
 		void ValidateSwapChain(const CGSHandler::PRESENTATION_PARAMS&);
 		void SetPresentationViewport(const CGSHandler::PRESENTATION_VIEWPORT&);
 		void DoPresent(const CGSHandler::DISPLAY_INFO&);
+
+		//Without a surface (libretro): draws into image 'index' of its own, of this size, which then
+		//is in SHADER_READ_ONLY_OPTIMAL layout. The image is remade when the size changes.
+		void DoPresentOffscreen(const CGSHandler::DISPLAY_INFO&, uint32 index, uint32 width, uint32 height);
+		VkImage GetOffscreenImage(uint32 index) const;
+		VkImageView GetOffscreenImageView(uint32 index) const;
 
 	private:
 		enum BLEND_MODE
@@ -68,7 +75,17 @@ namespace GSH_Vulkan
 			VkSemaphore renderCompleteSemaphore = VK_NULL_HANDLE;
 		};
 
-		void UpdateBackbuffer(uint32, const SWAPCHAIN_SEMAPHORES&, const CGSHandler::DISPLAY_INFO&);
+		struct OFFSCREEN_IMAGE
+		{
+			Framework::Vulkan::CImage image;
+			VkImageView view = VK_NULL_HANDLE;
+			VkFramebuffer framebuffer = VK_NULL_HANDLE;
+			uint32 width = 0;
+			uint32 height = 0;
+		};
+
+		void UpdateBackbuffer(VkImage, VkFramebuffer, VkExtent2D, const SWAPCHAIN_SEMAPHORES*, const CGSHandler::DISPLAY_INFO&);
+		void DestroyOffscreenImage(OFFSCREEN_IMAGE&);
 		PRESENT_COMMANDBUFFER PrepareCommandBuffer();
 		VkDescriptorSet PrepareDescriptorSet(VkDescriptorSetLayout, uint32);
 
@@ -94,6 +111,7 @@ namespace GSH_Vulkan
 		std::vector<VkImageView> m_swapChainImageViews;
 		std::vector<VkFramebuffer> m_swapChainFramebuffers;
 		std::vector<SWAPCHAIN_SEMAPHORES> m_swapChainSemaphores;
+		std::vector<OFFSCREEN_IMAGE> m_offscreenImages;
 		uint32 m_currentSwapChainSemaphoreIndex = 0;
 		bool m_swapChainValid = false;
 		CGSHandler::PRESENTATION_VIEWPORT m_presentationViewport;

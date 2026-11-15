@@ -34,10 +34,33 @@ if(NOT TARGET gsh_opengl)
 endif()
 list(INSERT UI_LIBRETRO_PROJECT_LIBS 0 gsh_opengl)
 
+#Vulkan GS for frontends that give a Vulkan device. Only the headers are needed: Vulkan is loaded
+#at run time. Without them (no Vulkan SDK, no Vulkan_INCLUDE_DIR) the core is OpenGL only.
+if(NOT TARGET_PLATFORM_IOS)
+	if(NOT TARGET_PLATFORM_ANDROID AND NOT Vulkan_INCLUDE_DIR)
+		find_package(Vulkan)
+	endif()
+	if(TARGET_PLATFORM_ANDROID OR Vulkan_INCLUDE_DIR)
+		set(PLAY_LIBRETRO_VULKAN ON)
+	endif()
+endif()
+if(PLAY_LIBRETRO_VULKAN)
+	if(NOT TARGET gsh_vulkan)
+		add_subdirectory(
+			${CMAKE_CURRENT_SOURCE_DIR}/../gs/GSH_Vulkan
+			${CMAKE_CURRENT_BINARY_DIR}/gs/GSH_Vulkan
+		)
+	endif()
+	list(INSERT UI_LIBRETRO_PROJECT_LIBS 0 gsh_vulkan)
+	message("Building the libretro core with the Vulkan GS.")
+endif()
+
 set(SRC
 	main_libretro.cpp
 	GSH_OpenGL_Libretro.cpp
 	GSH_OpenGL_Libretro.h
+	GSH_Vulkan_Libretro.cpp
+	GSH_Vulkan_Libretro.h
 	PH_Libretro_Input.cpp
 	PH_Libretro_Input.h
 	SH_LibreAudio.cpp
@@ -58,9 +81,16 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GR
 	list(APPEND UI_LIBRETRO_PROJECT_LIBS "libstdc++fs.a")
 endif()
 
+if(NOT PLAY_LIBRETRO_VULKAN)
+	list(REMOVE_ITEM SRC GSH_Vulkan_Libretro.cpp GSH_Vulkan_Libretro.h)
+endif()
 add_library(play_libretro SHARED ${SRC})
+if(PLAY_LIBRETRO_VULKAN)
+	target_compile_definitions(play_libretro PRIVATE PLAY_LIBRETRO_VULKAN)
+endif()
 target_include_directories(play_libretro PRIVATE
 	./
+	./ext
 	../../
 	${CMAKE_CURRENT_BINARY_DIR}
 )
