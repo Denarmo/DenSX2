@@ -1,6 +1,11 @@
 #include "GSH_OpenGL.h"
 #include <assert.h>
+#include <cstdio>
+#include <cstring>
 #include <sstream>
+#include "Log.h"
+
+#define LOG_NAME "gsh_opengl"
 
 #ifdef GLES_COMPATIBILITY
 #define GLSL_VERSION "#version 300 es"
@@ -54,12 +59,157 @@ static const char* s_orFunction =
     "	return float(r);\r\n"
     "}\r\n";
 
+namespace
+{
+	std::string g_programCachePath;
+	const char g_programCacheMagic[8] = {'P', 'L', 'A', 'Y', 'G', 'L', 'P', '1'};
+	const size_t g_programCacheMaxSize = 64 * 1024 * 1024;
+
+	bool ReadExact(FILE* input, void* data, size_t size)
+	{
+		return fread(data, 1, size, input) == size;
+	}
+
+	bool WriteProgramBinary(FILE* output, uint64 caps, uint32 format, const std::vector<uint8>& data)
+	{
+		uint32 size = static_cast<uint32>(data.size());
+		return (fwrite(&caps, sizeof(caps), 1, output) == 1) &&
+		       (fwrite(&format, sizeof(format), 1, output) == 1) &&
+		       (fwrite(&size, sizeof(size), 1, output) == 1) &&
+		       (fwrite(data.data(), 1, size, output) == size);
+	}
+
+	std::string GetGlString(GLenum name)
+	{
+		auto value = reinterpret_cast<const char*>(glGetString(name));
+		return value ? value : "";
+	}
+}
+
+void CGSH_OpenGL::SetProgramCachePath(const std::string& path)
+{
+	g_programCachePath = path;
+}
+
+void CGSH_OpenGL::LoadProgramCache()
+{
+	m_programBinaries.clear();
+	m_programBinariesSupported = false;
+	if(g_programCachePath.empty()) return;
+#ifdef GLEW_VERSION
+	if(!glGetProgramBinary || !glProgramBinary || !glProgramParameteri) return;
+#endif
+	GLint formatCount = 0;
+	glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &formatCount);
+	if(formatCount <= 0) return;
+
+	//Binaries are only good for the build and driver that made them.
+	std::string key = std::string(PLAY_VERSION) + "|" + GetGlString(GL_VENDOR) + "|" + GetGlString(GL_RENDERER) + "|" +
+	                  GetGlString(GL_VERSION) + "|" + std::to_string(m_hasFramebufferFetchExtension) +
+	                  std::to_string(m_hasFramebufferFetchDepthExtension);
+
+	if(FILE* input = fopen(g_programCachePath.c_str(), "rb"))
+	{
+		char magic[sizeof(g_programCacheMagic)] = {};
+		uint32 keySize = 0;
+		std::string fileKey;
+		bool valid = ReadExact(input, magic, sizeof(magic)) && !memcmp(magic, g_programCacheMagic, sizeof(magic)) &&
+		             ReadExact(input, &keySize, sizeof(keySize)) && (keySize < 0x1000);
+		if(valid)
+		{
+			fileKey.resize(keySize);
+			valid = ReadExact(input, &fileKey[0], keySize) && (fileKey == key);
+		}
+		size_t totalSize = 0;
+		while(valid)
+		{
+			uint64 caps = 0;
+			uint32 format = 0, size = 0;
+			if(!ReadExact(input, &caps, sizeof(caps)) || !ReadExact(input, &format, sizeof(format)) ||
+			   !ReadExact(input, &size, sizeof(size))) break;
+			totalSize += size;
+			if(totalSize > g_programCacheMaxSize) break;
+			PROGRAM_BINARY binary;
+			binary.format = format;
+			binary.data.resize(size);
+			if(!ReadExact(input, binary.data.data(), size)) break;
+			m_programBinaries[caps] = std::move(binary);
+		}
+		fclose(input);
+	}
+
+	//Rewritten whole: drops a record cut short and binaries of another build or driver.
+	FILE* output = fopen(g_programCachePath.c_str(), "wb");
+	if(!output)
+	{
+		CLog::GetInstance().Warn(LOG_NAME, "Can't write the program cache '%s'.\r\n", g_programCachePath.c_str());
+		return;
+	}
+	uint32 keySize = static_cast<uint32>(key.size());
+	bool written = (fwrite(g_programCacheMagic, sizeof(g_programCacheMagic), 1, output) == 1) &&
+	               (fwrite(&keySize, sizeof(keySize), 1, output) == 1) && (fwrite(key.data(), 1, keySize, output) == keySize);
+	for(const auto& binary : m_programBinaries)
+	{
+		written = written && WriteProgramBinary(output, binary.first, binary.second.format, binary.second.data);
+	}
+	fclose(output);
+	m_programBinariesSupported = written;
+	CLog::GetInstance().Print(LOG_NAME, "Program cache: %d programs.\r\n", static_cast<int>(m_programBinaries.size()));
+}
+
+Framework::OpenGl::ProgramPtr CGSH_OpenGL::LoadCachedProgram(ShaderCapsInt caps)
+{
+	auto binaryIterator = m_programBinaries.find(caps);
+	if(binaryIterator == m_programBinaries.end()) return Framework::OpenGl::ProgramPtr();
+	const auto& binary = binaryIterator->second;
+	auto program = std::make_shared<Framework::OpenGl::CProgram>();
+	glProgramBinary(*program, binary.format, binary.data.data(), static_cast<GLsizei>(binary.data.size()));
+	GLint status = GL_FALSE;
+	glGetProgramiv(*program, GL_LINK_STATUS, &status);
+	if(status != GL_TRUE)
+	{
+		//The driver refused it (an update can do that): compile it again.
+		while(glGetError() != GL_NO_ERROR)
+		{
+		}
+		m_programBinaries.erase(binaryIterator);
+		return Framework::OpenGl::ProgramPtr();
+	}
+	return program;
+}
+
+void CGSH_OpenGL::SaveCachedProgram(ShaderCapsInt caps, GLuint program)
+{
+	if(!m_programBinariesSupported) return;
+	GLint length = 0;
+	glGetProgramiv(program, GL_PROGRAM_BINARY_LENGTH, &length);
+	if(length <= 0) return;
+	PROGRAM_BINARY binary;
+	binary.data.resize(length);
+	GLsizei writtenLength = 0;
+	GLenum format = 0;
+	glGetProgramBinary(program, length, &writtenLength, &format, binary.data.data());
+	if(writtenLength <= 0) return;
+	binary.data.resize(writtenLength);
+	binary.format = format;
+	if(FILE* output = fopen(g_programCachePath.c_str(), "ab"))
+	{
+		WriteProgramBinary(output, caps, binary.format, binary.data);
+		fclose(output);
+	}
+	m_programBinaries[caps] = std::move(binary);
+}
+
 Framework::OpenGl::ProgramPtr CGSH_OpenGL::GenerateShader(const SHADERCAPS& caps)
 {
 	auto vertexShader = GenerateVertexShader(caps);
 	auto fragmentShader = GenerateFragmentShader(caps);
 
 	auto result = std::make_shared<Framework::OpenGl::CProgram>();
+	if(m_programBinariesSupported)
+	{
+		glProgramParameteri(*result, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
+	}
 
 	result->AttachShader(vertexShader);
 	result->AttachShader(fragmentShader);

@@ -27,6 +27,8 @@ public:
 	virtual ~CGSH_OpenGL();
 
 	static void RegisterPreferences();
+	//Compiled programs are kept in this file between runs (empty: not kept). Set before the GS initializes.
+	static void SetProgramCachePath(const std::string&);
 
 	void LoadState(Framework::CZipArchiveReader&) override;
 
@@ -323,6 +325,9 @@ private:
 
 	Framework::OpenGl::ProgramPtr GetShaderFromCaps(const SHADERCAPS&);
 	Framework::OpenGl::ProgramPtr GenerateShader(const SHADERCAPS&);
+	void LoadProgramCache();
+	Framework::OpenGl::ProgramPtr LoadCachedProgram(ShaderCapsInt);
+	void SaveCachedProgram(ShaderCapsInt, GLuint);
 	Framework::OpenGl::CShader GenerateVertexShader(const SHADERCAPS&);
 	Framework::OpenGl::CShader GenerateFragmentShader(const SHADERCAPS&);
 	std::string GenerateTexCoordClampingSection(TEXTURE_CLAMP_MODE, const char*);
@@ -486,6 +491,14 @@ private:
 	};
 
 	ShaderMap m_shaders;
+
+	struct PROGRAM_BINARY
+	{
+		uint32 format = 0;
+		std::vector<uint8> data;
+	};
+	std::unordered_map<ShaderCapsInt, PROGRAM_BINARY> m_programBinaries;
+	bool m_programBinariesSupported = false;
 	RENDERSTATE m_renderState;
 	uint32 m_validGlState = 0;
 	VERTEXPARAMS m_vertexParams;

@@ -579,9 +579,57 @@ void checkVarsUpdates()
 	updates = false;
 }
 
+//Diagnostic, on while <save dir>/play/frame-stats.on exists: every 500 frames, a line in frame-stats.txt
+//with the longest interval between retro_run calls, how many were over 34 and 50 ms, and the longest run.
+struct FRAME_STATS
+{
+	std::string path;
+	std::chrono::steady_clock::time_point firstStart, lastStart;
+	uint32 frames = 0, over34 = 0, over50 = 0;
+	double maxInterval = 0, maxRun = 0;
+	std::string longIntervals;
+};
+static FRAME_STATS g_frameStats;
+
+static void UpdateFrameStats(std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point end)
+{
+	auto& stats = g_frameStats;
+	if(stats.lastStart.time_since_epoch().count() != 0)
+	{
+		double interval = std::chrono::duration<double, std::milli>(start - stats.lastStart).count();
+		stats.maxInterval = (std::max)(stats.maxInterval, interval);
+		stats.over34 += (interval > 34);
+		stats.over50 += (interval > 50);
+		if((interval > 34) && (stats.longIntervals.size() < 400))
+		{
+			char item[32];
+			snprintf(item, sizeof(item), " %.1fs:%.0f", std::chrono::duration<double>(start - stats.firstStart).count(), interval);
+			stats.longIntervals += item;
+		}
+	}
+	else
+	{
+		stats.firstStart = start;
+	}
+	stats.maxRun = (std::max)(stats.maxRun, std::chrono::duration<double, std::milli>(end - start).count());
+	stats.lastStart = start;
+	if(++stats.frames < 500) return;
+	if(FILE* output = fopen(stats.path.c_str(), "a"))
+	{
+		fprintf(output, "%.1fs: frames %u interval max %.1f ms, >34 ms %u, >50 ms %u, run max %.1f ms;%s\n",
+		        std::chrono::duration<double>(start - stats.firstStart).count(), stats.frames, stats.maxInterval,
+		        stats.over34, stats.over50, stats.maxRun, stats.longIntervals.c_str());
+		fclose(output);
+	}
+	stats.frames = stats.over34 = stats.over50 = 0;
+	stats.maxInterval = stats.maxRun = 0;
+	stats.longIntervals.clear();
+}
+
 void retro_run()
 {
 	// CLog::GetInstance().Print(LOG_NAME, "%s\n", __FUNCTION__);
+	auto runStart = std::chrono::steady_clock::now();
 
 	checkVarsUpdates();
 
@@ -627,6 +675,11 @@ void retro_run()
 			UpdateFrameRate(gsHandler->GetCrtFrameRate());
 			UpdateGeometry();
 		}
+	}
+
+	if(!g_frameStats.path.empty())
+	{
+		UpdateFrameStats(runStart, std::chrono::steady_clock::now());
 	}
 }
 
@@ -732,6 +785,18 @@ void retro_init()
 		Framework::PathUtils::SetCacheDirPath(saveDir);
 	}
 #endif
+	{
+		//Compiled GL programs are kept between runs: without them every shader met again stutters.
+		const char* saveDir = nullptr;
+		if(g_environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &saveDir) && saveDir && *saveDir)
+		{
+			std::error_code error;
+			auto cacheDir = fs::path(saveDir) / "play";
+			fs::create_directories(cacheDir, error);
+			if(!error) CGSH_OpenGL::SetProgramCachePath((cacheDir / "gl-programs.bin").string());
+			if(fs::exists(cacheDir / "frame-stats.on", error)) g_frameStats.path = (cacheDir / "frame-stats.txt").string();
+		}
+	}
 	CLog::GetInstance().Print(LOG_NAME, "%s\n", __FUNCTION__);
 
 	if(g_environ_cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL))

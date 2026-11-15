@@ -300,6 +300,7 @@ void CGSH_OpenGL::InitializeRC()
 
 	CheckExtensions();
 	SetupTextureUpdaters();
+	LoadProgramCache();
 
 	m_presentProgram = GeneratePresentProgram();
 	m_presentVertexBuffer = GeneratePresentVertexBuffer();
@@ -539,7 +540,12 @@ Framework::OpenGl::ProgramPtr CGSH_OpenGL::GetShaderFromCaps(const SHADERCAPS& s
 	auto shaderIterator = m_shaders.find(shaderCaps);
 	if(shaderIterator == m_shaders.end())
 	{
-		auto shader = GenerateShader(shaderCaps);
+		auto shader = LoadCachedProgram(shaderCaps);
+		if(!shader)
+		{
+			shader = GenerateShader(shaderCaps);
+			SaveCachedProgram(shaderCaps, *shader);
+		}
 
 		glUseProgram(*shader);
 		m_validGlState &= ~GLSTATE_PROGRAM;
