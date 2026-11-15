@@ -9,6 +9,8 @@ include(Header)
 project(Play_Libretro_Core)
 
 add_definitions(-DPLAY_VERSION="${PROJECT_Version}")
+#EmuDEN ships this core as DenSX2 (based on Play!)
+add_definitions(-DDENSX2_VERSION="1.0")
 
 if(NOT TARGET ui_shared)
 	add_subdirectory(
