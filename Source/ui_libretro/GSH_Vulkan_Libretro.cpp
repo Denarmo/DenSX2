@@ -137,6 +137,43 @@ CGSHandler::FactoryFunction CGSH_Vulkan_Libretro::GetFactoryFunction()
 	return []() { return new CGSH_Vulkan_Libretro(); };
 }
 
+bool CGSH_Vulkan_Libretro::IsSupported()
+{
+	//The same test as the standalone frontend's device list: the desktop GS needs fragment shader
+	//interlock, the mobile one runs on any device.
+	try
+	{
+		auto instance = CGSH_Vulkan::CreateInstance(false);
+
+		uint32_t deviceCount = 0;
+		if(instance.vkEnumeratePhysicalDevices(instance, &deviceCount, nullptr) != VK_SUCCESS) return false;
+		std::vector<VkPhysicalDevice> devices(deviceCount);
+		if(instance.vkEnumeratePhysicalDevices(instance, &deviceCount, devices.data()) != VK_SUCCESS) return false;
+
+		for(const auto& device : devices)
+		{
+#if GSH_VULKAN_IS_DESKTOP
+			uint32_t extensionCount = 0;
+			instance.vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount, nullptr);
+			std::vector<VkExtensionProperties> extensions(extensionCount);
+			instance.vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount, extensions.data());
+			bool hasInterlock = std::any_of(extensions.begin(), extensions.end(), [](const auto& extension) {
+				return strcmp(extension.extensionName, VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME) == 0;
+			});
+			if(hasInterlock) return true;
+#else
+			(void)device;
+			return true;
+#endif
+		}
+	}
+	catch(const std::exception& exception)
+	{
+		CLog::GetInstance().Warn(LOG_NAME, "Vulkan is not usable: %s\n", exception.what());
+	}
+	return false;
+}
+
 const retro_hw_render_context_negotiation_interface_vulkan* CGSH_Vulkan_Libretro::GetNegotiationInterface()
 {
 	static retro_hw_render_context_negotiation_interface_vulkan negotiation = {};

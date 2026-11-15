@@ -19,6 +19,8 @@ public:
 	virtual ~CGSH_Vulkan_Libretro() = default;
 
 	static FactoryFunction GetFactoryFunction();
+	//Whether this machine has a GPU the Vulkan GS can run on.
+	static bool IsSupported();
 	static const retro_hw_render_context_negotiation_interface_vulkan* GetNegotiationInterface();
 	//context_reset: the frontend's device. Must be set before the handler is made.
 	static void SetFrontendInterface(const retro_hw_render_interface_vulkan*);

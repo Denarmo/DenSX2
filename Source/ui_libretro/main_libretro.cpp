@@ -806,8 +806,11 @@ bool retro_load_game(const retro_game_info* info)
 	g_useVulkan = false;
 #ifdef PLAY_LIBRETRO_VULKAN
 	{
+		//Vulkan is asked for first where the GPU can run the Vulkan GS: a frontend that wants
+		//OpenGL refuses it and the core goes on with OpenGL.
 		unsigned preferred = 0;
-		if(g_environ_cb(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER, &preferred) && (preferred == RETRO_HW_CONTEXT_VULKAN))
+		bool prefersVulkan = g_environ_cb(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER, &preferred) && (preferred == RETRO_HW_CONTEXT_VULKAN);
+		if(prefersVulkan || CGSH_Vulkan_Libretro::IsSupported())
 		{
 			g_hw_render = {};
 			g_hw_render.context_type = RETRO_HW_CONTEXT_VULKAN;
