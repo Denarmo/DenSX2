@@ -319,9 +319,10 @@ void CGSH_OpenGL::InitializeRC()
 
 	glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &m_uniformBufferAlignment);
 	if(m_uniformBufferAlignment <= 0) m_uniformBufferAlignment = 256;
-	CreateStreamBuffer(m_primBuffer, m_primStream, GL_ARRAY_BUFFER, 0x1000000);
-	CreateStreamBuffer(m_vertexParamsBuffer, m_vertexParamsStream, GL_UNIFORM_BUFFER, 0x400000);
-	CreateStreamBuffer(m_fragmentParamsBuffer, m_fragmentParamsStream, GL_UNIFORM_BUFFER, 0x400000);
+	//Each segment switch costs a fence, which the driver submits: segments hold a few frames' worth.
+	CreateStreamBuffer(m_primBuffer, m_primStream, GL_ARRAY_BUFFER, 0x2000000);
+	CreateStreamBuffer(m_vertexParamsBuffer, m_vertexParamsStream, GL_UNIFORM_BUFFER, 0x1000000);
+	CreateStreamBuffer(m_fragmentParamsBuffer, m_fragmentParamsStream, GL_UNIFORM_BUFFER, 0x1000000);
 	m_unpackBuffer = Framework::OpenGl::CBuffer::Create();
 	CreateStreamBuffer(m_unpackBuffer, m_unpackStream, GL_PIXEL_UNPACK_BUFFER, 0x2000000);
 	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);

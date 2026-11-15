@@ -30,19 +30,18 @@ void CGsCachedArea::SetArea(uint32 psm, uint32 bufPtr, uint32 bufWidth, uint32 h
 	m_bufWidth = bufWidth;
 	m_height = height;
 
+	//Kept, since every transfer checks every cached texture against it
+	auto texturePageSize = CGsPixelFormats::GetPsmPageSize(m_psm);
+	m_pageCountX = (m_bufWidth + texturePageSize.first - 1) / texturePageSize.first;
+	m_pageCountY = (m_height + texturePageSize.second - 1) / texturePageSize.second;
+
 	//Check that we have enough bits to represent page dirtyness in m_dirtyPages
-	{
-		FRAMEWORK_MAYBE_UNUSED auto pageRect = GetAreaPageRect();
-		assert((pageRect.width * pageRect.height) <= MAX_DIRTYPAGES);
-	}
+	assert((m_pageCountX * m_pageCountY) <= MAX_DIRTYPAGES);
 }
 
 CGsCachedArea::PageRect CGsCachedArea::GetAreaPageRect() const
 {
-	auto texturePageSize = CGsPixelFormats::GetPsmPageSize(m_psm);
-	uint32 pageCountX = (m_bufWidth + texturePageSize.first - 1) / texturePageSize.first;
-	uint32 pageCountY = (m_height + texturePageSize.second - 1) / texturePageSize.second;
-	return PageRect{0, 0, pageCountX, pageCountY};
+	return PageRect{0, 0, m_pageCountX, m_pageCountY};
 }
 
 CGsCachedArea::PageRect CGsCachedArea::GetDirtyPageRect() const

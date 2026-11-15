@@ -45,15 +45,15 @@ public:
 	{
 		uint64 maskedTex0 = static_cast<uint64>(tex0) & TEX0_CLUTINFO_MASK;
 
+		//By reference, and moved to the front with splice: no reference count or list node changes per lookup.
 		for(auto textureIterator(m_textureCache.begin());
 		    textureIterator != m_textureCache.end(); textureIterator++)
 		{
-			auto texture = *textureIterator;
+			const auto& texture = *textureIterator;
 			if(!texture->m_live) continue;
 			if(maskedTex0 != texture->m_tex0) continue;
-			m_textureCache.erase(textureIterator);
-			m_textureCache.push_front(texture);
-			return texture.get();
+			m_textureCache.splice(m_textureCache.begin(), m_textureCache, textureIterator);
+			return m_textureCache.front().get();
 		}
 
 		return nullptr;
@@ -79,8 +79,7 @@ public:
 		texture->m_textureHandle = std::move(textureHandle);
 		texture->m_live = true;
 
-		m_textureCache.pop_back();
-		m_textureCache.push_front(texture);
+		m_textureCache.splice(m_textureCache.begin(), m_textureCache, std::prev(m_textureCache.end()));
 	}
 
 	void InvalidateRange(uint32 start, uint32 size)

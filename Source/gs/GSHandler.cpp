@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <functional>
+#include <algorithm>
 #include "AppConfig.h"
 #include "Log.h"
 #include "../states/MemoryStateFile.h"
@@ -984,20 +985,15 @@ bool CGSHandler::TransferWriteHandlerGeneric(const void* pData, uint32 nLength)
 
 	auto pSrc = reinterpret_cast<const typename Storage::Unit*>(pData);
 
-	for(unsigned int i = 0; i < nLength; i++)
+	//A row at a time
+	unsigned int i = 0;
+	while(i < nLength)
 	{
-		uint32 nX = (m_trxCtx.nRRX + trxPos.nDSAX) % 2048;
-		uint32 nY = (m_trxCtx.nRRY + trxPos.nDSAY) % 2048;
-
-		auto pPixel = Indexor.GetPixelAddress(nX, nY);
-
-		if((*pPixel) != pSrc[i])
-		{
-			(*pPixel) = pSrc[i];
-			nDirty = true;
-		}
-
-		m_trxCtx.nRRX++;
+		//Past the width (a width of 0), the rest stays on this row
+		uint32 count = (m_trxCtx.nRRX < trxReg.nRRW) ? std::min<uint32>(trxReg.nRRW - m_trxCtx.nRRX, nLength - i) : (nLength - i);
+		nDirty |= Indexor.WriteRow(m_trxCtx.nRRX + trxPos.nDSAX, m_trxCtx.nRRY + trxPos.nDSAY, pSrc + i, count);
+		i += count;
+		m_trxCtx.nRRX += count;
 		if(m_trxCtx.nRRX == trxReg.nRRW)
 		{
 			m_trxCtx.nRRX = 0;

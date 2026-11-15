@@ -332,6 +332,28 @@ public:
 			return reinterpret_cast<typename Storage::Unit*>(pixelAddr);
 		}
 
+		//Writes count units from (nX, nY) rightwards, wrapping at 2048 as the GS does. The row's page
+		//line and offsets are looked up once. Returns whether any unit changed.
+		bool WriteRow(unsigned int nX, unsigned int nY, const typename Storage::Unit* src, unsigned int count)
+		{
+			nY %= 2048;
+			uint32 pageRow = ((nY / Storage::PAGEHEIGHT) * (m_nWidth * 64)) / Storage::PAGEWIDTH;
+			const uint32* rowOffsets = m_pageOffsets[nY % Storage::PAGEHEIGHT];
+			bool changed = false;
+			for(unsigned int i = 0; i < count; i++)
+			{
+				uint32 x = (nX + i) % 2048;
+				uint32 address = (m_nPointer + (pageRow + (x / Storage::PAGEWIDTH)) * PAGESIZE + rowOffsets[x % Storage::PAGEWIDTH]) & (CGSHandler::RAMSIZE - 1);
+				auto pixel = reinterpret_cast<typename Storage::Unit*>(m_pMemory + address);
+				if(*pixel != src[i])
+				{
+					*pixel = src[i];
+					changed = true;
+				}
+			}
+			return changed;
+		}
+
 		static uint32* GetPageOffsets()
 		{
 			BuildPageOffsetTable();

@@ -44,6 +44,8 @@ private:
 	uint32 m_bufPtr = 0;
 	uint32 m_bufWidth = 0;
 	uint32 m_height = 0;
+	uint32 m_pageCountX = 0;
+	uint32 m_pageCountY = 0;
 
 	DirtyPageHolder m_dirtyPages[MAX_DIRTYPAGES_SECTIONS];
 };
