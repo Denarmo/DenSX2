@@ -1141,7 +1141,6 @@ protected:
 	std::unique_ptr<CFrameDump> m_frameDump;
 	FrameDumpCallback m_frameDumpCallback;
 	bool m_regsDirty = false;
-	uint32 m_lastFlipBufPtr = 0;
 	bool m_drawEnabled = true;
 	CINTC* m_intc = nullptr;
 	bool m_gsThreaded = true;
