@@ -567,7 +567,18 @@ void CGSHandler::Flip(uint32 flags)
 	bool waitForCompletion = (flags & FLIP_FLAG_WAIT) != 0;
 	bool force = (flags & FLIP_FLAG_FORCE) != 0;
 	auto displayInfo = GetCurrentDisplayInfo();
-	displayInfo.oddField = GetCrtIsInterlaced() && GetCrtIsFrameMode() && ((m_nCSR & CSR_FIELD) != 0);
+	if(GetCrtIsInterlaced() && GetCrtIsFrameMode())
+	{
+		//Measured on screenshots of paused games: a game that draws every field in the same buffer (Colin McRae
+		//Rally 3) lines up with its odd field half a line higher, one that shows a buffer of its own every field
+		//(Gran Turismo 4) a whole line higher.
+		uint32 bufPtr = displayInfo.layers[0].bufPtr;
+		if((m_nCSR & CSR_FIELD) != 0)
+		{
+			displayInfo.oddFieldOffset = (bufPtr != m_lastFlipBufPtr) ? 1.0f : 0.5f;
+		}
+		m_lastFlipBufPtr = bufPtr;
+	}
 	SendGSCall(
 	    [this, displayInfo, force]() {
 		    if(force || m_regsDirty)

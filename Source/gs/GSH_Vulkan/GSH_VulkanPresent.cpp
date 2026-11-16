@@ -220,6 +220,16 @@ void CPresent::UpdateBackbuffer(VkImage swapChainImage, VkFramebuffer framebuffe
 		viewport.y = m_presentationViewport.offsetY;
 		viewport.width = m_presentationViewport.width;
 		viewport.height = m_presentationViewport.height;
+		//Without this, interlaced frame mode pictures move up and down every field
+		if(dispInfo.oddFieldOffset != 0)
+		{
+			for(const auto& dispLayer : dispInfo.layers)
+			{
+				if(!dispLayer.enabled || (dispLayer.height == 0)) continue;
+				viewport.y -= dispInfo.oddFieldOffset * viewport.height / static_cast<float>(dispLayer.height);
+				break;
+			}
+		}
 		viewport.maxDepth = 1.0f;
 		m_context->device.vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
 

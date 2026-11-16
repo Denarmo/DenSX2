@@ -181,8 +181,9 @@ public:
 
 		uint32 width = 0;
 		uint32 height = 0;
-		//Interlaced frame mode: the odd field sits half a buffer line lower on the screen.
-		bool oddField = false;
+		//Interlaced frame mode: the odd field is presented this many buffer lines higher, so that it lines up with
+		//the even one (0 otherwise).
+		float oddFieldOffset = 0;
 	};
 
 	enum FLIP_FLAGS
@@ -1140,6 +1141,7 @@ protected:
 	std::unique_ptr<CFrameDump> m_frameDump;
 	FrameDumpCallback m_frameDumpCallback;
 	bool m_regsDirty = false;
+	uint32 m_lastFlipBufPtr = 0;
 	bool m_drawEnabled = true;
 	CINTC* m_intc = nullptr;
 	bool m_gsThreaded = true;
