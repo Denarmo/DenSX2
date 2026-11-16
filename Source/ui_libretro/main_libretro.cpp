@@ -67,10 +67,10 @@ bool g_forceBilinearTextures = false;
 
 static std::vector<struct retro_variable> m_vars =
     {
-        {"play_res_multi", "Resolution Multiplier; 1x|2x|4x|8x"},
-        {"play_presentation_mode", "Presentation Mode; Fill Screen|Fit Screen|Original Size"},
-        {"play_bilinear_filtering", "Force Bilinear Filtering; false|true"},
-        {"play_widescreen", "Widescreen (games with a patch); disabled|enabled"},
+        {"densx2_res_multi", "Resolution Multiplier; 1x|2x|4x|8x"},
+        {"densx2_presentation_mode", "Presentation Mode; Fill Screen|Fit Screen|Original Size"},
+        {"densx2_bilinear_filtering", "Force Bilinear Filtering; false|true"},
+        {"densx2_widescreen", "Widescreen (games with a patch); disabled|enabled"},
         {NULL, NULL},
 };
 
@@ -361,9 +361,8 @@ void SetupInputHandler()
 void retro_get_system_info(struct retro_system_info* info)
 {
 	*info = {};
-	//EmuDEN keys save states and core options by this name, so it stays "Play!"; users see DenSX2 from the plugin
-	info->library_name = "Play!";
-	info->library_version = "DenSX2 " DENSX2_VERSION " (based on Play! " PLAY_VERSION ")";
+	info->library_name = "DenSX2";
+	info->library_version = DENSX2_VERSION " (based on Play! " PLAY_VERSION ")";
 	info->need_fullpath = true;
 	info->valid_extensions = "elf|iso|cso|isz|cue|chd";
 }

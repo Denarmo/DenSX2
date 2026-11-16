@@ -112,3 +112,4 @@ endif()
 
 target_link_libraries(play_libretro ${UI_LIBRETRO_PROJECT_LIBS})
 set_target_properties(play_libretro PROPERTIES PREFIX "")
+set_target_properties(play_libretro PROPERTIES OUTPUT_NAME "densx2_libretro")

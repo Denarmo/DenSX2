@@ -1,4 +1,4 @@
-# Play! #
+# DenSX2 #
 
 > This is DenSX2, the PlayStation 2 core of [EmuDEN](https://github.com/Denarmo/emuden): a fork of Play! with
 > faster JIT and rendering on Android. DenSX2 is based on Play! by Jean-Philip Desjardins and contributors

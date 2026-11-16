@@ -62,8 +62,8 @@ namespace
 	{
 		static VkApplicationInfo appInfo = {};
 		appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-		appInfo.pApplicationName = "Play!";
-		appInfo.pEngineName = "Play!";
+		appInfo.pApplicationName = "DenSX2";
+		appInfo.pEngineName = "DenSX2";
 #if GSH_VULKAN_IS_DESKTOP
 		appInfo.apiVersion = VK_API_VERSION_1_2;
 #else
