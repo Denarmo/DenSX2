@@ -32,6 +32,8 @@ namespace GSH_Vulkan
 		Framework::Vulkan::CShaderModule CreateDrawFragmentShader(const PIPELINE_CAPS&);
 
 		static PIPELINE_CAPS MakeLoadStorePipelineCaps(const PIPELINE_CAPS&);
+		bool FramebufferOverlapsDepthbuffer() const;
+		bool TextureOverlapsDepthbuffer() const;
 
 		PIPELINE CreateLoadPipeline(const PIPELINE_CAPS&);
 		PIPELINE CreateStorePipeline(const PIPELINE_CAPS&);
@@ -66,6 +68,10 @@ namespace GSH_Vulkan
 
 		std::vector<PENDING_DRAW> m_pendingDraws;
 		DRAW_PIPELINE_PUSHCONSTANTS m_passLoadPushConstants;
+
+		//The pass stores depth back to memory if any of its draws writes depth. Draws that don't
+		//write it output the depth they loaded, so storing it is harmless for them.
+		bool m_passWriteDepth = false;
 
 		float m_renderPassMinX = FLT_MAX;
 		float m_renderPassMinY = FLT_MAX;

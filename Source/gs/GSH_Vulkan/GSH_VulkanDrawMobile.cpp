@@ -55,6 +55,14 @@ void CDrawMobile::SetPipelineCaps(const PIPELINE_CAPS& caps)
 	if(!changed) return;
 	auto prevLoadStoreCaps = MakeLoadStorePipelineCaps(m_pipelineCaps);
 	auto nextLoadStoreCaps = MakeLoadStorePipelineCaps(caps);
+	//Games switch depth writes on and off between draws all the time (Need for Speed: Most Wanted:
+	//~800 times a frame). The load always reads depth and draws that don't write it keep the loaded
+	//value, so the pass can go on and store depth at its end, unless the depth buffer shares memory
+	//with the framebuffer: then its store order matters.
+	if(prevLoadStoreCaps.writeDepth != nextLoadStoreCaps.writeDepth && !FramebufferOverlapsDepthbuffer())
+	{
+		prevLoadStoreCaps.writeDepth = nextLoadStoreCaps.writeDepth;
+	}
 	if(static_cast<uint64>(prevLoadStoreCaps) != static_cast<uint64>(nextLoadStoreCaps))
 	{
 		FlushRenderPass();
@@ -119,6 +127,18 @@ void CDrawMobile::FlushVertices()
 	uint32 vertexCount = m_passVertexEnd - m_passVertexStart;
 	if(vertexCount == 0) return;
 
+	//Draws only see memory as it was when the pass began: one that samples the depth buffer after
+	//draws of this pass wrote depth goes to a new pass, which sees that depth stored.
+	if(m_passWriteDepth && m_pipelineCaps.hasTexture && !m_pendingDraws.empty() && TextureOverlapsDepthbuffer())
+	{
+		uint32 vertexStart = m_passVertexStart;
+		uint32 vertexEnd = m_passVertexEnd;
+		m_passVertexEnd = m_passVertexStart;
+		FlushRenderPass();
+		m_passVertexStart = vertexStart;
+		m_passVertexEnd = vertexEnd;
+	}
+
 	auto& frame = m_frames[m_frameCommandBuffer->GetCurrentFrame()];
 
 	for(auto vertex = frame.vertexBufferPtr + m_passVertexStart; vertex != frame.vertexBufferPtr + m_passVertexEnd; vertex++)
@@ -152,6 +172,8 @@ void CDrawMobile::FlushVertices()
 	descriptorSetCaps.framebufferFormat = m_pipelineCaps.framebufferFormat;
 	descriptorSetCaps.depthbufferFormat = m_pipelineCaps.depthbufferFormat;
 	descriptorSetCaps.textureFormat = m_pipelineCaps.textureFormat;
+
+	m_passWriteDepth |= m_pipelineCaps.writeDepth;
 
 	PENDING_DRAW draw;
 	draw.pipeline = drawPipeline;
@@ -188,6 +210,7 @@ void CDrawMobile::FlushRenderPass()
 		}
 		m_pendingDraws.clear();
 	}
+	m_passWriteDepth = false;
 	m_renderPassMinX = FLT_MAX;
 	m_renderPassMinY = FLT_MAX;
 	m_renderPassMaxX = -FLT_MAX;
@@ -220,7 +243,7 @@ bool CDrawMobile::CanLoadClutDuringPass(uint32 clutBufferOffset, uint32 address,
 	};
 
 	if(overlaps(m_pushConstants.fbBufAddr, m_pushConstants.fbBufWidth)) return false;
-	if(m_pipelineCaps.writeDepth && overlaps(m_pushConstants.depthBufAddr, m_pushConstants.depthBufWidth)) return false;
+	if((m_passWriteDepth || m_pipelineCaps.writeDepth) && overlaps(m_pushConstants.depthBufAddr, m_pushConstants.depthBufWidth)) return false;
 	return true;
 }
 
@@ -255,6 +278,7 @@ void CDrawMobile::RecordRenderPass(int32 x, int32 y, int32 width, int32 height)
 	m_context->device.vkCmdBeginRenderPass(commandBuffer, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
 
 	auto strippedCaps = MakeLoadStorePipelineCaps(m_pipelineCaps);
+	strippedCaps.writeDepth = m_passWriteDepth;
 	auto loadStoreDescriptorSetCaps = make_convertible<DESCRIPTORSET_CAPS>(0);
 	loadStoreDescriptorSetCaps.framebufferFormat = m_pipelineCaps.framebufferFormat;
 	loadStoreDescriptorSetCaps.depthbufferFormat = m_pipelineCaps.depthbufferFormat;
@@ -1294,6 +1318,36 @@ CDrawMobile::PIPELINE_CAPS CDrawMobile::MakeLoadStorePipelineCaps(const PIPELINE
 	strippedCaps.depthbufferFormat = caps.depthbufferFormat;
 	strippedCaps.writeDepth = caps.writeDepth;
 	return strippedCaps;
+}
+
+bool CDrawMobile::FramebufferOverlapsDepthbuffer() const
+{
+	//Whole pages from the top of each buffer to the bottom of the scissor, 32 rows a page (16-bit
+	//formats have 64, so this is on the safe side).
+	uint32 pageRows = (m_scissorY + m_scissorHeight + 31) / 32;
+	auto range = [&](uint32 bufAddress, uint32 bufWidth) {
+		uint32 pagesPerRow = std::max<uint32>((bufWidth + 63) / 64, 1);
+		uint64 start = bufAddress;
+		return std::make_pair(start, start + static_cast<uint64>(pageRows) * pagesPerRow * CGsPixelFormats::PAGESIZE);
+	};
+	auto fb = range(m_pushConstants.fbBufAddr, m_pushConstants.fbBufWidth);
+	auto depth = range(m_pushConstants.depthBufAddr, m_pushConstants.depthBufWidth);
+	if((fb.second > CGSHandler::RAMSIZE) || (depth.second > CGSHandler::RAMSIZE)) return true;
+	return (fb.first < depth.second) && (depth.first < fb.second);
+}
+
+bool CDrawMobile::TextureOverlapsDepthbuffer() const
+{
+	//Same page estimate as above, for the texture's rows and the depth buffer down to the scissor.
+	auto range = [](uint32 bufAddress, uint32 bufWidth, uint32 rows) {
+		uint32 pagesPerRow = std::max<uint32>((bufWidth + 63) / 64, 1);
+		uint64 start = bufAddress;
+		return std::make_pair(start, start + static_cast<uint64>((rows + 31) / 32) * pagesPerRow * CGsPixelFormats::PAGESIZE);
+	};
+	auto tex = range(m_pushConstants.texBufAddr, m_pushConstants.texBufWidth, m_pushConstants.texHeight);
+	auto depth = range(m_pushConstants.depthBufAddr, m_pushConstants.depthBufWidth, m_scissorY + m_scissorHeight);
+	if((tex.second > CGSHandler::RAMSIZE) || (depth.second > CGSHandler::RAMSIZE)) return true;
+	return (tex.first < depth.second) && (depth.first < tex.second);
 }
 
 PIPELINE CDrawMobile::CreateLoadPipeline(const PIPELINE_CAPS& caps)
