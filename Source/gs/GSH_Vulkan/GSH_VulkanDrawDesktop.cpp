@@ -301,7 +301,7 @@ PIPELINE CDrawDesktop::CreateDrawPipeline(const PIPELINE_CAPS& caps)
 	pipelineCreateInfo.renderPass = m_renderPass;
 	pipelineCreateInfo.layout = drawPipeline.pipelineLayout;
 
-	result = m_context->device.vkCreateGraphicsPipelines(m_context->device, VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, &drawPipeline.pipeline);
+	result = m_context->device.vkCreateGraphicsPipelines(m_context->device, m_context->pipelineCache, 1, &pipelineCreateInfo, nullptr, &drawPipeline.pipeline);
 	CHECKVULKANERROR(result);
 
 	return drawPipeline;
@@ -731,15 +731,28 @@ Framework::Vulkan::CShaderModule CDrawDesktop::CreateFragmentShader(const PIPELI
 			[[fallthrough]];
 		case CGSHandler::PSMCT32:
 		case CGSHandler::PSMCT24:
-		case CGSHandler::PSMZ32:
-		case CGSHandler::PSMZ24:
 			fbAddress = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMCT32>(
 			    b, fbSwizzleTable, fbBufAddress, fbBufWidth, screenPos);
 			break;
+		case CGSHandler::PSMZ32:
+		case CGSHandler::PSMZ24:
+			fbAddress = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMZ32>(
+			    b, fbSwizzleTable, fbBufAddress, fbBufWidth, screenPos);
+			break;
 		case CGSHandler::PSMCT16:
-		case CGSHandler::PSMCT16S:
-		case CGSHandler::PSMZ16S:
 			fbAddress = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMCT16>(
+			    b, fbSwizzleTable, fbBufAddress, fbBufWidth, screenPos);
+			break;
+		case CGSHandler::PSMCT16S:
+			fbAddress = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMCT16S>(
+			    b, fbSwizzleTable, fbBufAddress, fbBufWidth, screenPos);
+			break;
+		case CGSHandler::PSMZ16:
+			fbAddress = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMZ16>(
+			    b, fbSwizzleTable, fbBufAddress, fbBufWidth, screenPos);
+			break;
+		case CGSHandler::PSMZ16S:
+			fbAddress = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMZ16S>(
 			    b, fbSwizzleTable, fbBufAddress, fbBufWidth, screenPos);
 			break;
 		}
@@ -755,8 +768,11 @@ Framework::Vulkan::CShaderModule CDrawDesktop::CreateFragmentShader(const PIPELI
 			    b, depthSwizzleTable, depthBufAddress, depthBufWidth, screenPos);
 			break;
 		case CGSHandler::PSMZ16:
-		case CGSHandler::PSMZ16S:
 			depthAddress = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMZ16>(
+			    b, depthSwizzleTable, depthBufAddress, depthBufWidth, screenPos);
+			break;
+		case CGSHandler::PSMZ16S:
+			depthAddress = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMZ16S>(
 			    b, depthSwizzleTable, depthBufAddress, depthBufWidth, screenPos);
 			break;
 		}

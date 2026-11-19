@@ -101,12 +101,134 @@ namespace GSH_Vulkan
 		void SetMemoryCopyParams(uint32, uint32);
 
 		void AddVertices(const PRIM_VERTEX*, const PRIM_VERTEX*);
+		inline bool WillFlushOnReserve(uint32 amount) const
+		{
+			return (m_passVertexEnd + amount) > MAX_VERTEX_COUNT;
+		}
+		inline PRIM_VERTEX* GetCurrentVertexPtr() const
+		{
+			return m_curVertexBufferPtr + m_passVertexEnd;
+		}
+		inline uint32 GetRemainingVertices() const
+		{
+			return MAX_VERTEX_COUNT - m_passVertexEnd;
+		}
+		inline void AdvanceVertices(uint32 amount)
+		{
+			m_passVertexEnd += amount;
+		}
+		inline PRIM_VERTEX* ReserveVertices(uint32 amount)
+		{
+			if((m_passVertexEnd + amount) > MAX_VERTEX_COUNT)
+			{
+				m_frameCommandBuffer->Flush();
+				assert((m_passVertexEnd + amount) <= MAX_VERTEX_COUNT);
+			}
+			PRIM_VERTEX* dst = m_curVertexBufferPtr + m_passVertexEnd;
+			m_passVertexEnd += amount;
+			return dst;
+		}
+		inline void UpdateDrawBounds(float x, float y)
+		{
+			if(x < m_curDrawMinX) m_curDrawMinX = x;
+			if(y < m_curDrawMinY) m_curDrawMinY = y;
+			if(x > m_curDrawMaxX) m_curDrawMaxX = x;
+			if(y > m_curDrawMaxY) m_curDrawMaxY = y;
+		}
+		inline bool IsMemoryCopyActive() const
+		{
+			return m_pipelineCaps.textureUseMemoryCopy != 0;
+		}
 		virtual void FlushVertices() = 0;
 		virtual void FlushRenderPass() = 0;
+
+		virtual void SyncMemoryForRead(uint32 /*address*/, uint32 /*size*/) {}
+		virtual void SyncMemoryForWrite(uint32 /*address*/, uint32 /*size*/) {}
+		virtual void FlushDirtyColorSlots() {}
+		virtual void FlushAllResidentMemory() {}
+		virtual void InvalidateAllResidentMemory() {}
+
+		struct STATS
+		{
+			uint32 passes = 0;
+			uint32 depthWritePasses = 0;
+			uint32 draws = 0;
+			uint32 vkDraws = 0;
+			uint32 vkPipes = 0;
+			uint32 dmPipe = 0;
+			uint32 dmDesc = 0;
+			uint32 dmTex = 0;
+			uint32 dmOth = 0;
+			uint64 dmXorKeys[64] = {};
+			uint32 dmXorCnts[64] = {};
+			uint32 verts = 0;
+			uint64 pixels = 0;
+			uint32 barriers = 0;
+			uint32 barAlpha = 0;
+			uint32 barDepthOnly = 0;
+			uint32 barOther = 0;
+			uint32 barOtherMask = 0;
+			uint32 barOtherATest = 0;
+			uint32 drawHwFast = 0;
+			uint32 drawHwDual = 0;
+			uint32 drawHwMask = 0;
+			uint32 drawSwFb = 0;
+			uint32 drawSwDepth = 0;
+			uint32 drawSkipped = 0;
+			uint32 abStd = 0;
+			uint32 abAdd = 0;
+			uint32 abFix = 0;
+			uint32 abOther = 0;
+			uint32 abModes[256] = {};
+			uint32 flushCapsFmt = 0;
+			uint32 flushCapsDepthOverlap = 0;
+			uint32 flushCapsMemCopy = 0;
+			uint32 flushFbAddr = 0;
+			uint32 flushZbAddr = 0;
+			uint32 flushScissor = 0;
+			uint32 flushTexDepthOverlap = 0;
+			uint32 flushOther = 0;
+			uint32 drawDynMip = 0;
+			uint32 drawStatMip = 0;
+			uint32 drawLinear = 0;
+			uint32 drawMemCopy = 0;
+			uint32 drawTexOverlapsFb = 0;
+			uint32 drawPoints = 0;
+			uint32 drawLines = 0;
+			uint32 drawAlphaBlend = 0;
+			uint32 drawDstAlphaTest = 0;
+			uint64 fbPsmMask = 0;
+			uint64 zbPsmMask = 0;
+			uint64 texPsmMask = 0;
+			uint32 resColorLoads = 0;
+			uint32 resColorStores = 0;
+			uint32 resDepthLoads = 0;
+			uint32 resDepthStores = 0;
+			uint32 resDepthStoreEvict = 0;
+			uint32 resDepthStoreOverlap = 0;
+			uint32 resDepthStoreSyncW = 0;
+			uint32 resDepthStoreSyncR = 0;
+			uint32 resDepthStoreSelf = 0;
+			uint32 resColorStoreEvict = 0;
+			uint32 resColorStoreOverlap = 0;
+			uint32 resColorStoreSyncW = 0;
+			uint32 resColorStoreSyncR = 0;
+		};
+
+		virtual void SetStatsEnabled(bool)
+		{
+		}
+		virtual STATS TakeStats()
+		{
+			return {};
+		}
 
 		//Whether a CLUT load into the given slot, reading the given GS memory range, can be recorded
 		//before the draws waiting for the current render pass, which is then not cut.
 		virtual bool CanLoadClutDuringPass(uint32 clutBufferOffset, uint32 address, uint32 size);
+		//Whether a host-to-local transfer writing the given GS memory range can be recorded before
+		//the draws waiting for the current render pass without cutting the pass.
+		virtual bool CanHostTransferDuringPass(uint32 address, uint32 size);
 
 		void PreFlushFrameCommandBuffer() override;
 		void PostFlushFrameCommandBuffer() override;
@@ -117,6 +239,7 @@ namespace GSH_Vulkan
 			DRAW_AREA_SIZE = 2048
 		};
 
+		static constexpr uint32 MAX_VERTEX_COUNT = 1024 * 512;
 		static constexpr uint32 MAX_MIPPARAMS_COUNT = 2048;
 
 		typedef uint32 DescriptorSetCapsInt;
@@ -129,6 +252,9 @@ namespace GSH_Vulkan
 			uint32 framebufferFormat : 6;
 			uint32 depthbufferFormat : 6;
 			uint32 frameNumber : 2;
+			uint32 colorSlot : 3;
+			uint32 depthSlot : 3;
+			uint32 inputLayoutGeneral : 1;
 		};
 		static_assert(sizeof(DESCRIPTORSET_CAPS) == sizeof(DescriptorSetCapsInt));
 		typedef std::unordered_map<DescriptorSetCapsInt, VkDescriptorSet> DescriptorSetCache;
@@ -210,12 +336,21 @@ namespace GSH_Vulkan
 		DescriptorSetCache m_descriptorSetCache;
 
 		FRAMECONTEXT m_frames[MAX_FRAMES];
+		PRIM_VERTEX* m_curVertexBufferPtr = nullptr;
 
 		uint32 m_passVertexStart = 0;
 		uint32 m_passVertexEnd = 0;
 		bool m_renderPassBegun = false;
 
+		float m_curDrawMinX = 3.402823466e+38f;
+		float m_curDrawMinY = 3.402823466e+38f;
+		float m_curDrawMaxX = -3.402823466e+38f;
+		float m_curDrawMaxY = -3.402823466e+38f;
+
 		uint32 m_mipParamsIndex = 0;
+		bool m_mipParamsSlot0Valid = false;
+		DRAW_PIPELINE_MIPPARAMS_UNIFORMS m_lastMipParams = {};
+		std::vector<DRAW_PIPELINE_MIPPARAMS_UNIFORMS> m_mipParamsCpuCache;
 
 		PIPELINE_CAPS m_pipelineCaps;
 		DRAW_PIPELINE_PUSHCONSTANTS m_pushConstants;

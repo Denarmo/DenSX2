@@ -17,8 +17,6 @@ enum DESCRIPTORS
 	DESCRIPTOR_LOCATION_SWIZZLETABLE_DST,
 };
 
-#define TRANSFER_USE_8_16_BIT GSH_VULKAN_IS_DESKTOP
-
 CTransferLocal::CTransferLocal(const ContextPtr& context, const FrameCommandBufferPtr& frameCommandBuffer)
     : m_context(context)
     , m_frameCommandBuffer(frameCommandBuffer)
@@ -54,10 +52,13 @@ void CTransferLocal::DoTransfer()
 
 	auto descriptorSet = PrepareDescriptorSet(xferPipeline->descriptorSetLayout, descriptorSetCaps);
 	auto commandBuffer = m_frameCommandBuffer->GetCommandBuffer();
+	m_context->ResetHostXferBatch();
+	m_context->clutNeedsHostBarrier = true;
 
 	uint32 workUnitsX = (Params.rrw + m_localSize - 1) / m_localSize;
 	uint32 workUnitsY = (Params.rrh + m_localSize - 1) / m_localSize;
 
+	m_context->ResetHostXferBatch();
 	//Add a barrier to ensure reads are complete before writing to GS memory
 	{
 		auto memoryBarrier = Framework::Vulkan::MemoryBarrier();
@@ -128,7 +129,7 @@ VkDescriptorSet CTransferLocal::PrepareDescriptorSet(VkDescriptorSetLayout descr
 		}
 
 		//Memory Image Descriptor 8 bit
-		if(TRANSFER_USE_8_16_BIT)
+		if(m_context->has8BitStorage)
 		{
 			auto writeSet = Framework::Vulkan::WriteDescriptorSet();
 			writeSet.dstSet = descriptorSet;
@@ -140,7 +141,7 @@ VkDescriptorSet CTransferLocal::PrepareDescriptorSet(VkDescriptorSetLayout descr
 		}
 
 		//Memory Image Descriptor 16 bit
-		if(TRANSFER_USE_8_16_BIT)
+		if(m_context->has16BitStorage)
 		{
 			auto writeSet = Framework::Vulkan::WriteDescriptorSet();
 			writeSet.dstSet = descriptorSet;
@@ -204,10 +205,6 @@ Framework::Vulkan::CShaderModule CTransferLocal::CreateShader(const PIPELINE_CAP
 	{
 		auto inputInvocationId = CInt4Lvalue(b.CreateInputInt(Nuanceur::SEMANTIC_SYSTEM_GIID));
 		auto memoryBuffer = CArrayUintValue(b.CreateUniformArrayUint("memoryBuffer", DESCRIPTOR_LOCATION_MEMORY));
-#if TRANSFER_USE_8_16_BIT
-		auto memoryBuffer8 = CArrayUcharValue(b.CreateUniformArrayUchar("memoryBuffer8", DESCRIPTOR_LOCATION_MEMORY_8BIT));
-		auto memoryBuffer16 = CArrayUshortValue(b.CreateUniformArrayUshort("memoryBuffer16", DESCRIPTOR_LOCATION_MEMORY_16BIT));
-#endif
 		auto memoryBufferCopy = CArrayUintValue(b.CreateUniformArrayUint("memoryBufferCopy", DESCRIPTOR_LOCATION_MEMORY_COPY));
 
 		auto srcSwizzleTable = CImageUint2DValue(b.CreateImage2DUint(DESCRIPTOR_LOCATION_SWIZZLETABLE_SRC));
@@ -303,22 +300,30 @@ Framework::Vulkan::CShaderModule CTransferLocal::CreateShader(const PIPELINE_CAP
 		{
 			auto address = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMCT16>(
 			    b, dstSwizzleTable, dstBufAddress, dstBufWidth, dstPos);
-#if TRANSFER_USE_8_16_BIT
-			CMemoryUtils::Memory_Write16(b, memoryBuffer16, address, pixel);
-#else
-			CMemoryUtils::Memory_Write16(b, memoryBuffer, address, pixel);
-#endif
+			if(m_context->has16BitStorage)
+			{
+				auto memoryBuffer16 = CArrayUshortValue(b.CreateUniformArrayUshort("memoryBuffer16", DESCRIPTOR_LOCATION_MEMORY_16BIT));
+				CMemoryUtils::Memory_Write16(b, memoryBuffer16, address, pixel);
+			}
+			else
+			{
+				CMemoryUtils::Memory_Write16(b, memoryBuffer, address, pixel);
+			}
 		}
 		break;
 		case CGSHandler::PSMT8:
 		{
 			auto address = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMT8>(
 			    b, dstSwizzleTable, dstBufAddress, dstBufWidth, dstPos);
-#if TRANSFER_USE_8_16_BIT
-			CMemoryUtils::Memory_Write8(b, memoryBuffer8, address, pixel);
-#else
-			CMemoryUtils::Memory_Write8(b, memoryBuffer, address, pixel);
-#endif
+			if(m_context->has8BitStorage)
+			{
+				auto memoryBuffer8 = CArrayUcharValue(b.CreateUniformArrayUchar("memoryBuffer8", DESCRIPTOR_LOCATION_MEMORY_8BIT));
+				CMemoryUtils::Memory_Write8(b, memoryBuffer8, address, pixel);
+			}
+			else
+			{
+				CMemoryUtils::Memory_Write8(b, memoryBuffer, address, pixel);
+			}
 		}
 		break;
 		case CGSHandler::PSMT4:
@@ -344,8 +349,7 @@ Framework::Vulkan::CShaderModule CTransferLocal::CreateShader(const PIPELINE_CAP
 
 	Framework::CMemStream shaderStream;
 	Nuanceur::CSpirvShaderGenerator::Generate(shaderStream, b, Nuanceur::CSpirvShaderGenerator::SHADER_TYPE_COMPUTE);
-	shaderStream.Seek(0, Framework::STREAM_SEEK_SET);
-	return Framework::Vulkan::CShaderModule(m_context->device, shaderStream);
+	return m_context->CreateShaderModule(shaderStream);
 }
 
 PIPELINE CTransferLocal::CreatePipeline(const PIPELINE_CAPS& caps)
@@ -370,7 +374,7 @@ PIPELINE CTransferLocal::CreatePipeline(const PIPELINE_CAPS& caps)
 		}
 
 		//GS memory 8 bit
-		if(TRANSFER_USE_8_16_BIT)
+		if(m_context->has8BitStorage)
 		{
 			VkDescriptorSetLayoutBinding binding = {};
 			binding.binding = DESCRIPTOR_LOCATION_MEMORY_8BIT;
@@ -381,7 +385,7 @@ PIPELINE CTransferLocal::CreatePipeline(const PIPELINE_CAPS& caps)
 		}
 
 		//GS memory 16 bit
-		if(TRANSFER_USE_8_16_BIT)
+		if(m_context->has16BitStorage)
 		{
 			VkDescriptorSetLayoutBinding binding = {};
 			binding.binding = DESCRIPTOR_LOCATION_MEMORY_16BIT;
@@ -452,7 +456,7 @@ PIPELINE CTransferLocal::CreatePipeline(const PIPELINE_CAPS& caps)
 		createInfo.stage.module = xferShader;
 		createInfo.layout = xferPipeline.pipelineLayout;
 
-		result = m_context->device.vkCreateComputePipelines(m_context->device, VK_NULL_HANDLE, 1, &createInfo, nullptr, &xferPipeline.pipeline);
+		result = m_context->device.vkCreateComputePipelines(m_context->device, m_context->pipelineCache, 1, &createInfo, nullptr, &xferPipeline.pipeline);
 		CHECKVULKANERROR(result);
 	}
 

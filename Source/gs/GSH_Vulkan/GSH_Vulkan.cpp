@@ -1,5 +1,9 @@
 #include "GSH_Vulkan.h"
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include "std_experimental_map.h"
 #include "../GsPixelFormats.h"
 #include "../GsTransferRange.h"
@@ -44,6 +48,19 @@ static Framework::Vulkan::CImage CreateSwizzleTable(Framework::Vulkan::CDevice& 
 	            CGsPixelFormats::CPixelIndexor<StorageFormat>::GetPageOffsets());
 	result.SetLayout(queue, commandBufferPool, VK_IMAGE_LAYOUT_GENERAL);
 	return result;
+}
+
+std::string CGSH_Vulkan::m_statsPath;
+std::string CGSH_Vulkan::m_pipelineCachePath;
+
+void CGSH_Vulkan::SetStatsPath(std::string path)
+{
+	m_statsPath = std::move(path);
+}
+
+void CGSH_Vulkan::SetPipelineCachePath(std::string path)
+{
+	m_pipelineCachePath = std::move(path);
 }
 
 CGSH_Vulkan::CGSH_Vulkan()
@@ -171,6 +188,52 @@ void CGSH_Vulkan::InitializeImpl()
 	m_context->device.vkGetDeviceQueue(m_context->device, renderQueueFamily, 0, &m_context->queue);
 	m_context->commandBufferPool = Framework::Vulkan::CCommandBufferPool(m_context->device, renderQueueFamily);
 
+	//Create device-specialized pipeline cache, seeded from disk if available
+	{
+		m_devicePipelineCachePath.clear();
+		if(!m_pipelineCachePath.empty())
+		{
+			VkPhysicalDeviceProperties props = {};
+			m_instance.vkGetPhysicalDeviceProperties(m_context->physicalDevice, &props);
+			std::string base = m_pipelineCachePath;
+			if((base.size() >= 4) && (base.compare(base.size() - 4, 4, ".bin") == 0))
+			{
+				base.resize(base.size() - 4);
+			}
+			char suffix[64];
+			snprintf(suffix, sizeof(suffix), "-v2-%04x-%04x-%08x.bin",
+			         props.vendorID, props.deviceID, props.driverVersion);
+			m_devicePipelineCachePath = base + suffix;
+			char spirvSuffix[64];
+			snprintf(spirvSuffix, sizeof(spirvSuffix), "-spirv-v%u-%02x.bin",
+			         CContext::SPIRV_CACHE_VERSION, m_context->GetSpirvCapsMask());
+			m_context->LoadSpirvCache(base + spirvSuffix);
+		}
+		std::vector<uint8> cacheData;
+		if(!m_devicePipelineCachePath.empty())
+		{
+			std::ifstream in(m_devicePipelineCachePath, std::ios::binary | std::ios::ate);
+			if(in)
+			{
+				auto sz = in.tellg();
+				if(sz > 0 && sz < (32 * 1024 * 1024))
+				{
+					cacheData.resize(static_cast<size_t>(sz));
+					in.seekg(0);
+					in.read(reinterpret_cast<char*>(cacheData.data()), sz);
+				}
+			}
+		}
+		m_pipelineCacheSavedSize = cacheData.size();
+		auto cacheInfo = Framework::Vulkan::PipelineCacheCreateInfo();
+		cacheInfo.initialDataSize = cacheData.size();
+		cacheInfo.pInitialData = cacheData.empty() ? nullptr : cacheData.data();
+		if(m_context->device.vkCreatePipelineCache(m_context->device, &cacheInfo, nullptr, &m_context->pipelineCache) != VK_SUCCESS)
+		{
+			m_context->pipelineCache = VK_NULL_HANDLE;
+		}
+	}
+
 	CreateDescriptorPool();
 	CreateMemoryBuffer();
 	CreateClutBuffer();
@@ -226,7 +289,42 @@ void CGSH_Vulkan::InitializeImpl()
 
 	m_frameCommandBuffer->RegisterWriter(m_draw.get());
 	m_frameCommandBuffer->RegisterWriter(m_transferHost.get());
+	m_statsEnabled = !m_statsPath.empty();
+	m_draw->SetStatsEnabled(m_statsEnabled);
 	m_frameCommandBuffer->BeginFrame();
+}
+
+void CGSH_Vulkan::SavePipelineCache()
+{
+	m_context->SaveSpirvCache();
+	if((m_context->pipelineCache == VK_NULL_HANDLE) || m_devicePipelineCachePath.empty())
+	{
+		return;
+	}
+	auto getCacheData = reinterpret_cast<PFN_vkGetPipelineCacheData>(
+	    m_instance.vkGetDeviceProcAddr(m_context->device, "vkGetPipelineCacheData"));
+	if(!getCacheData) return;
+	size_t dataSize = 0;
+	if((getCacheData(m_context->device, m_context->pipelineCache, &dataSize, nullptr) == VK_SUCCESS) &&
+	   (dataSize > 0) && (dataSize != m_pipelineCacheSavedSize))
+	{
+		std::vector<uint8> cacheData(dataSize);
+		if(getCacheData(m_context->device, m_context->pipelineCache, &dataSize, cacheData.data()) == VK_SUCCESS)
+		{
+			std::string tmpPath = m_devicePipelineCachePath + ".tmp";
+			{
+				std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
+				if(!out) return;
+				out.write(reinterpret_cast<const char*>(cacheData.data()), static_cast<std::streamsize>(dataSize));
+				if(!out) return;
+			}
+			std::remove(m_devicePipelineCachePath.c_str());
+			if(std::rename(tmpPath.c_str(), m_devicePipelineCachePath.c_str()) == 0)
+			{
+				m_pipelineCacheSavedSize = dataSize;
+			}
+		}
+	}
 }
 
 void CGSH_Vulkan::ReleaseImpl()
@@ -262,6 +360,12 @@ void CGSH_Vulkan::ReleaseImpl()
 	m_swizzleTablePSMZ16S.Reset();
 
 	m_context->device.vkDestroyDescriptorPool(m_context->device, m_context->descriptorPool, nullptr);
+	if(m_context->pipelineCache != VK_NULL_HANDLE)
+	{
+		SavePipelineCache();
+		m_context->device.vkDestroyPipelineCache(m_context->device, m_context->pipelineCache, nullptr);
+		m_context->pipelineCache = VK_NULL_HANDLE;
+	}
 	m_context->clutBuffer.Reset();
 	m_context->memoryBuffer.Reset();
 	m_context->memoryBufferCopy.Reset();
@@ -276,10 +380,14 @@ void CGSH_Vulkan::ReleaseImpl()
 void CGSH_Vulkan::ResetImpl()
 {
 	m_vtxCount = 0;
+	m_stripHaveVerts = 0;
+	m_stripFastActive = false;
 	m_primitiveType = PRIM_INVALID;
 	m_pendingPrim = false;
 	m_pendingPrimValue = 0;
 	m_regState.isValid = false;
+	m_renderContextDirty = true;
+	m_lastPrimitiveMode = ~0ULL;
 	ClearClutCache();
 	memset(m_memoryCache, 0, RAMSIZE);
 	WriteBackMemoryCache();
@@ -293,10 +401,215 @@ void CGSH_Vulkan::SetPresentationParams(const CGSHandler::PRESENTATION_PARAMS& p
 
 void CGSH_Vulkan::MarkNewFrame()
 {
+	m_draw->FlushDirtyColorSlots();
 	m_drawCallCount = m_frameCommandBuffer->GetFlushCount();
 	m_frameCommandBuffer->ResetFlushCount();
 	m_frameCommandBuffer->EndFrame();
 	m_frameCommandBuffer->BeginFrame();
+	m_regState.isValid = false;
+	m_renderContextDirty = true;
+	++m_pipelineCacheSaveFrames;
+	if((m_pipelineCacheSaveFrames == 180) || ((m_pipelineCacheSaveFrames % 1800) == 0))
+	{
+		SavePipelineCache();
+	}
+	if(m_statsEnabled)
+	{
+		auto nowNs = static_cast<uint64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                     std::chrono::steady_clock::now().time_since_epoch())
+		                                     .count());
+		if(m_statsWindowStartNs == 0) m_statsWindowStartNs = nowNs;
+		m_statsFenceWaitNs += m_frameCommandBuffer->TakeFenceWaitNs();
+		m_statsCmdFlushes += m_drawCallCount;
+		auto s = m_draw->TakeStats();
+		m_statsDrawAcc.passes += s.passes;
+		m_statsDrawAcc.depthWritePasses += s.depthWritePasses;
+		m_statsDrawAcc.draws += s.draws;
+		m_statsDrawAcc.vkDraws += s.vkDraws;
+		m_statsDrawAcc.vkPipes += s.vkPipes;
+		m_statsDrawAcc.dmPipe += s.dmPipe;
+		m_statsDrawAcc.dmDesc += s.dmDesc;
+		m_statsDrawAcc.dmTex += s.dmTex;
+		m_statsDrawAcc.dmOth += s.dmOth;
+		for(int k = 0; k < 64; k++)
+		{
+			if(s.dmXorCnts[k] == 0) continue;
+			uint32 h = static_cast<uint32>((s.dmXorKeys[k] * 0x9E3779B97F4A7C15ULL) >> 58);
+			for(int step = 0; step < 64; step++)
+			{
+				uint32 j = (h + step) & 63U;
+				if(m_statsDrawAcc.dmXorKeys[j] == s.dmXorKeys[k] || m_statsDrawAcc.dmXorCnts[j] == 0)
+				{
+					m_statsDrawAcc.dmXorKeys[j] = s.dmXorKeys[k];
+					m_statsDrawAcc.dmXorCnts[j] += s.dmXorCnts[k];
+					break;
+				}
+			}
+		}
+		m_statsDrawAcc.verts += s.verts;
+		m_statsDrawAcc.pixels += s.pixels;
+		m_statsDrawAcc.barriers += s.barriers;
+		m_statsDrawAcc.barAlpha += s.barAlpha;
+		m_statsDrawAcc.barDepthOnly += s.barDepthOnly;
+		m_statsDrawAcc.barOther += s.barOther;
+		m_statsDrawAcc.barOtherMask += s.barOtherMask;
+		m_statsDrawAcc.barOtherATest += s.barOtherATest;
+		m_statsDrawAcc.drawHwFast += s.drawHwFast;
+		m_statsDrawAcc.drawHwDual += s.drawHwDual;
+		m_statsDrawAcc.drawHwMask += s.drawHwMask;
+		m_statsDrawAcc.drawSwFb += s.drawSwFb;
+		m_statsDrawAcc.drawSwDepth += s.drawSwDepth;
+		m_statsDrawAcc.drawSkipped += s.drawSkipped;
+		m_statsDrawAcc.abStd += s.abStd;
+		m_statsDrawAcc.abAdd += s.abAdd;
+		m_statsDrawAcc.abFix += s.abFix;
+		m_statsDrawAcc.abOther += s.abOther;
+		for(uint32 i = 0; i < 256; i++)
+		{
+			m_statsDrawAcc.abModes[i] += s.abModes[i];
+		}
+		m_statsDrawAcc.flushCapsFmt += s.flushCapsFmt;
+		m_statsDrawAcc.flushCapsDepthOverlap += s.flushCapsDepthOverlap;
+		m_statsDrawAcc.flushCapsMemCopy += s.flushCapsMemCopy;
+		m_statsDrawAcc.flushFbAddr += s.flushFbAddr;
+		m_statsDrawAcc.flushZbAddr += s.flushZbAddr;
+		m_statsDrawAcc.flushScissor += s.flushScissor;
+		m_statsDrawAcc.flushTexDepthOverlap += s.flushTexDepthOverlap;
+		m_statsDrawAcc.drawDynMip += s.drawDynMip;
+		m_statsDrawAcc.drawStatMip += s.drawStatMip;
+		m_statsDrawAcc.drawLinear += s.drawLinear;
+		m_statsDrawAcc.drawMemCopy += s.drawMemCopy;
+		m_statsDrawAcc.drawTexOverlapsFb += s.drawTexOverlapsFb;
+		m_statsDrawAcc.drawPoints += s.drawPoints;
+		m_statsDrawAcc.drawLines += s.drawLines;
+		m_statsDrawAcc.drawAlphaBlend += s.drawAlphaBlend;
+		m_statsDrawAcc.drawDstAlphaTest += s.drawDstAlphaTest;
+		m_statsDrawAcc.fbPsmMask |= s.fbPsmMask;
+		m_statsDrawAcc.zbPsmMask |= s.zbPsmMask;
+		m_statsDrawAcc.texPsmMask |= s.texPsmMask;
+		m_statsDrawAcc.resColorLoads += s.resColorLoads;
+		m_statsDrawAcc.resColorStores += s.resColorStores;
+		m_statsDrawAcc.resDepthLoads += s.resDepthLoads;
+		m_statsDrawAcc.resDepthStores += s.resDepthStores;
+		m_statsDrawAcc.resDepthStoreEvict += s.resDepthStoreEvict;
+		m_statsDrawAcc.resDepthStoreOverlap += s.resDepthStoreOverlap;
+		m_statsDrawAcc.resDepthStoreSyncW += s.resDepthStoreSyncW;
+		m_statsDrawAcc.resDepthStoreSyncR += s.resDepthStoreSyncR;
+		m_statsDrawAcc.resDepthStoreSelf += s.resDepthStoreSelf;
+		m_statsDrawAcc.resColorStoreEvict += s.resColorStoreEvict;
+		m_statsDrawAcc.resColorStoreOverlap += s.resColorStoreOverlap;
+		m_statsDrawAcc.resColorStoreSyncW += s.resColorStoreSyncW;
+		m_statsDrawAcc.resColorStoreSyncR += s.resColorStoreSyncR;
+		if(++m_statsFrames >= 60)
+		{
+			double f = static_cast<double>(m_statsFrames);
+			double frameMs = static_cast<double>(nowNs - m_statsWindowStartNs) / (1e6 * f);
+			double fenceMs = static_cast<double>(m_statsFenceWaitNs) / (1e6 * f);
+			if(FILE* out = fopen(m_statsPath.c_str(), "a"))
+			{
+				uint32 topCode[4] = {0, 0, 0, 0};
+				uint32 topCnt[4] = {0, 0, 0, 0};
+				for(uint32 c = 0; c < 256; c++)
+				{
+					uint32 cnt = m_statsDrawAcc.abModes[c];
+					if(cnt == 0) continue;
+					for(int k = 0; k < 4; k++)
+					{
+						if(cnt > topCnt[k])
+						{
+							for(int j = 3; j > k; j--)
+							{
+								topCnt[j] = topCnt[j - 1];
+								topCode[j] = topCode[j - 1];
+							}
+							topCnt[k] = cnt;
+							topCode[k] = c;
+							break;
+						}
+					}
+				}
+				uint64 topXor0 = 0, topXor1 = 0;
+				uint32 topXorCnt0 = 0, topXorCnt1 = 0;
+				for(int k = 0; k < 64; k++)
+				{
+					uint32 c = m_statsDrawAcc.dmXorCnts[k];
+					if(c > topXorCnt0)
+					{
+						topXorCnt1 = topXorCnt0;
+						topXor1 = topXor0;
+						topXorCnt0 = c;
+						topXor0 = m_statsDrawAcc.dmXorKeys[k];
+					}
+					else if(c > topXorCnt1)
+					{
+						topXorCnt1 = c;
+						topXor1 = m_statsDrawAcc.dmXorKeys[k];
+					}
+				}
+				fprintf(out,
+				        "gs: %.2f fps (%.2f ms/f, fence %.2f ms/f) passes=%.1f (zW=%.1f) draws=%.1f(vk=%.0f,vp=%.0f,hw=%.0f,ds=%.0f,mk=%.0f,sw=%.0f,swZ=%.0f,sk=%.0f) bar=%.1f(ab=%.0f,z=%.0f,o=%.0f[m=%.0f,a=%.0f]) verts=%.0f Mpx=%.2f "
+				        "flushes[fmt=%.1f zOv=%.1f mCp=%.1f fb=%.1f zb=%.1f sc=%.1f tZOv=%.1f clut=%.1f hX=%.1f(%.0fKB) lX=%.1f rb=%.1f cmd=%.1f] "
+				        "clut[ld=%.1f clr=%.1f] feat[dMip=%.1f sMip=%.1f lin=%.1f mCp=%.1f tFbOv=%.1f pt=%.1f ln=%.1f ab=%.1f(std=%.0f,add=%.0f,fix=%.0f,oth=%.0f) abTop[%u%u%u%u=%.0f,%u%u%u%u=%.0f,%u%u%u%u=%.0f] abId=%.1f dat=%.1f] "
+				        "psm[fb=%llx zb=%llx tx=%llx] res[cL=%.1f cS=%.1f(ev=%.1f,ov=%.1f,w=%.1f,r=%.1f) zL=%.1f zS=%.1f(ev=%.1f,ov=%.1f,w=%.1f,r=%.1f,s=%.1f)] dm[p=%.0f(%llx:%.0f,%llx:%.0f),d=%.0f,t=%.0f,o=%.0f] s8=%d s16=%d dsb=%d son=%d qm=%x\n",
+				        1000.0 / frameMs, frameMs, fenceMs,
+				        m_statsDrawAcc.passes / f, m_statsDrawAcc.depthWritePasses / f,
+				        m_statsDrawAcc.draws / f, m_statsDrawAcc.vkDraws / f, m_statsDrawAcc.vkPipes / f,
+				        m_statsDrawAcc.drawHwFast / f, m_statsDrawAcc.drawHwDual / f, m_statsDrawAcc.drawHwMask / f,
+				        m_statsDrawAcc.drawSwFb / f, m_statsDrawAcc.drawSwDepth / f, m_statsDrawAcc.drawSkipped / f,
+				        m_statsDrawAcc.barriers / f,
+				        m_statsDrawAcc.barAlpha / f, m_statsDrawAcc.barDepthOnly / f, m_statsDrawAcc.barOther / f,
+				        m_statsDrawAcc.barOtherMask / f, m_statsDrawAcc.barOtherATest / f,
+				        m_statsDrawAcc.verts / f,
+				        static_cast<double>(m_statsDrawAcc.pixels) / (1e6 * f),
+				        m_statsDrawAcc.flushCapsFmt / f, m_statsDrawAcc.flushCapsDepthOverlap / f,
+				        m_statsDrawAcc.flushCapsMemCopy / f, m_statsDrawAcc.flushFbAddr / f,
+				        m_statsDrawAcc.flushZbAddr / f, m_statsDrawAcc.flushScissor / f,
+				        m_statsDrawAcc.flushTexDepthOverlap / f, m_statsClutFlushes / f,
+				        m_statsHostXfers / f, static_cast<double>(m_statsHostXferBytes) / (1024.0 * f),
+				        m_statsLocalXfers / f, m_statsReadbacks / f, m_statsCmdFlushes / f,
+				        m_statsClutLoads / f, m_statsClutClears / f,
+				        m_statsDrawAcc.drawDynMip / f, m_statsDrawAcc.drawStatMip / f,
+				        m_statsDrawAcc.drawLinear / f, m_statsDrawAcc.drawMemCopy / f,
+				        m_statsDrawAcc.drawTexOverlapsFb / f, m_statsDrawAcc.drawPoints / f,
+				        m_statsDrawAcc.drawLines / f, m_statsDrawAcc.drawAlphaBlend / f,
+				        m_statsDrawAcc.abStd / f, m_statsDrawAcc.abAdd / f, m_statsDrawAcc.abFix / f, m_statsDrawAcc.abOther / f,
+				        (topCode[0] >> 6) & 3, (topCode[0] >> 4) & 3, (topCode[0] >> 2) & 3, topCode[0] & 3, topCnt[0] / f,
+				        (topCode[1] >> 6) & 3, (topCode[1] >> 4) & 3, (topCode[1] >> 2) & 3, topCode[1] & 3, topCnt[1] / f,
+				        (topCode[2] >> 6) & 3, (topCode[2] >> 4) & 3, (topCode[2] >> 2) & 3, topCode[2] & 3, topCnt[2] / f,
+				        m_statsAlphaIdentity / f, m_statsDrawAcc.drawDstAlphaTest / f,
+				        static_cast<unsigned long long>(m_statsDrawAcc.fbPsmMask),
+				        static_cast<unsigned long long>(m_statsDrawAcc.zbPsmMask),
+				        static_cast<unsigned long long>(m_statsDrawAcc.texPsmMask),
+				        m_statsDrawAcc.resColorLoads / f, m_statsDrawAcc.resColorStores / f,
+				        m_statsDrawAcc.resColorStoreEvict / f, m_statsDrawAcc.resColorStoreOverlap / f,
+				        m_statsDrawAcc.resColorStoreSyncW / f, m_statsDrawAcc.resColorStoreSyncR / f,
+				        m_statsDrawAcc.resDepthLoads / f, m_statsDrawAcc.resDepthStores / f,
+				        m_statsDrawAcc.resDepthStoreEvict / f, m_statsDrawAcc.resDepthStoreOverlap / f,
+				        m_statsDrawAcc.resDepthStoreSyncW / f, m_statsDrawAcc.resDepthStoreSyncR / f,
+				        m_statsDrawAcc.resDepthStoreSelf / f,
+				        m_statsDrawAcc.dmPipe / f,
+				        static_cast<unsigned long long>(topXor0), topXorCnt0 / f,
+				        static_cast<unsigned long long>(topXor1), topXorCnt1 / f,
+				        m_statsDrawAcc.dmDesc / f, m_statsDrawAcc.dmTex / f, m_statsDrawAcc.dmOth / f,
+				        m_context->has8BitStorage ? 1 : 0, m_context->has16BitStorage ? 1 : 0,
+				        m_context->hasDualSrcBlend ? 1 : 0, m_context->hasStoreOpNone ? 1 : 0, m_context->storageQueryMask);
+				fclose(out);
+			}
+			m_statsFrames = 0;
+			m_statsWindowStartNs = nowNs;
+			m_statsFenceWaitNs = 0;
+			m_statsHostXfers = 0;
+			m_statsHostXferBytes = 0;
+			m_statsLocalXfers = 0;
+			m_statsReadbacks = 0;
+			m_statsClutLoads = 0;
+			m_statsClutFlushes = 0;
+			m_statsClutClears = 0;
+			m_statsCmdFlushes = 0;
+			m_statsAlphaIdentity = 0;
+			m_statsDrawAcc = {};
+		}
+	}
 	CGSHandler::MarkNewFrame();
 }
 
@@ -437,10 +750,119 @@ std::vector<VkSurfaceFormatKHR> CGSH_Vulkan::GetDeviceSurfaceFormats(VkPhysicalD
 	return surfaceFormats;
 }
 
+void CGSH_Vulkan::Query8And16BitStorage(const Framework::Vulkan::CInstance& instance, VkPhysicalDevice physicalDevice, bool& has8BitStorage, bool& has16BitStorage, bool* hasUniform8, bool* hasUniform16, uint32* diagMask)
+{
+#if GSH_VULKAN_IS_DESKTOP
+	(void)instance;
+	(void)physicalDevice;
+	has8BitStorage = true;
+	has16BitStorage = true;
+	if(hasUniform8) *hasUniform8 = true;
+	if(hasUniform16) *hasUniform16 = true;
+	if(diagMask) *diagMask = 0xFFFF;
+#else
+	has8BitStorage = false;
+	has16BitStorage = false;
+	if(hasUniform8) *hasUniform8 = false;
+	if(hasUniform16) *hasUniform16 = false;
+	uint32 mask = 0;
+
+	VkPhysicalDeviceProperties props = {};
+	instance.vkGetPhysicalDeviceProperties(physicalDevice, &props);
+	if(props.apiVersion >= VK_API_VERSION_1_1) mask |= 0x01;
+	if(props.apiVersion < VK_API_VERSION_1_1)
+	{
+		if(diagMask) *diagMask = mask;
+		return;
+	}
+
+	uint32_t extCount = 0;
+	if(instance.vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, nullptr) != VK_SUCCESS)
+	{
+		if(diagMask) *diagMask = mask;
+		return;
+	}
+	std::vector<VkExtensionProperties> exts(extCount);
+	instance.vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, exts.data());
+	auto hasExt = [&](const char* name) {
+		return std::any_of(exts.begin(), exts.end(), [&](const VkExtensionProperties& e) { return strcmp(e.extensionName, name) == 0; });
+	};
+	bool hasExt8 = hasExt(VK_KHR_8BIT_STORAGE_EXTENSION_NAME) && hasExt(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
+	if(hasExt8) mask |= 0x02;
+
+	auto getFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+	    Framework::Vulkan::CLoader::GetInstance().vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures2"));
+	if(!getFeatures2)
+	{
+		getFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2KHR>(
+		    Framework::Vulkan::CLoader::GetInstance().vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures2KHR"));
+	}
+	if(!getFeatures2)
+	{
+		if(diagMask) *diagMask = mask;
+		return;
+	}
+	mask |= 0x04;
+
+	VkPhysicalDeviceFeatures2 features2 = {};
+	features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+
+	VkPhysicalDevice16BitStorageFeatures features16 = {};
+	features16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+	features2.pNext = &features16;
+
+	VkPhysicalDevice8BitStorageFeaturesKHR features8 = {};
+	features8.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR;
+	VkPhysicalDeviceShaderFloat16Int8FeaturesKHR featuresF16I8 = {};
+	featuresF16I8.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR;
+	if(hasExt8)
+	{
+		features16.pNext = &features8;
+		features8.pNext = &featuresF16I8;
+	}
+
+	getFeatures2(physicalDevice, &features2);
+
+	if(features2.features.shaderInt16) mask |= 0x10;
+	if(features16.storageBuffer16BitAccess) mask |= 0x20;
+	if(features16.uniformAndStorageBuffer16BitAccess) mask |= 0x40;
+	if(featuresF16I8.shaderInt8) mask |= 0x100;
+	if(features8.storageBuffer8BitAccess) mask |= 0x200;
+	if(features8.uniformAndStorageBuffer8BitAccess) mask |= 0x400;
+	if(diagMask) *diagMask = mask;
+
+	has8BitStorage =
+	    hasExt8 &&
+	    (featuresF16I8.shaderInt8 == VK_TRUE) &&
+	    (features8.storageBuffer8BitAccess == VK_TRUE);
+	//Nuanceur emits 8-bit storage capabilities whenever 16-bit storage is used.
+	has16BitStorage =
+	    has8BitStorage &&
+	    (features2.features.shaderInt16 == VK_TRUE) &&
+	    (features16.storageBuffer16BitAccess == VK_TRUE);
+	if(hasUniform16) *hasUniform16 = has16BitStorage && (features16.uniformAndStorageBuffer16BitAccess == VK_TRUE);
+	if(hasUniform8) *hasUniform8 = has8BitStorage && (features8.uniformAndStorageBuffer8BitAccess == VK_TRUE);
+#endif
+}
+
 void CGSH_Vulkan::CreateDevice(VkPhysicalDevice physicalDevice)
 {
 	assert(m_context->device.IsEmpty());
 
+	Query8And16BitStorage(m_instance, physicalDevice,
+	                      m_context->has8BitStorage, m_context->has16BitStorage,
+	                      &m_context->hasUniform8BitStorage, &m_context->hasUniform16BitStorage,
+	                      &m_context->storageQueryMask);
+	{
+		VkPhysicalDeviceFeatures deviceFeatures = {};
+		auto getFeatures = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures>(
+		    Framework::Vulkan::CLoader::GetInstance().vkGetInstanceProcAddr(m_instance, "vkGetPhysicalDeviceFeatures"));
+		if(getFeatures)
+		{
+			getFeatures(physicalDevice, &deviceFeatures);
+		}
+		m_context->hasDualSrcBlend = (deviceFeatures.dualSrcBlend == VK_TRUE);
+	}
 	m_context->device = CreateDeviceObject(m_instance, physicalDevice, m_context->surface != VK_NULL_HANDLE);
 
 	{
@@ -448,6 +870,28 @@ void CGSH_Vulkan::CreateDevice(VkPhysicalDevice physicalDevice)
 		m_context->instance->vkGetPhysicalDeviceProperties(physicalDevice, &deviceProperties);
 		m_context->storageBufferAlignment = deviceProperties.limits.minStorageBufferOffsetAlignment;
 		m_context->computeWorkgroupInvocations = deviceProperties.limits.maxComputeWorkGroupInvocations;
+		if(deviceProperties.apiVersion >= VK_API_VERSION_1_3)
+		{
+			m_context->hasStoreOpNone = true;
+		}
+		else
+		{
+			uint32_t extCount = 0;
+			if(m_instance.vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, nullptr) == VK_SUCCESS)
+			{
+				std::vector<VkExtensionProperties> exts(extCount);
+				m_instance.vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, exts.data());
+				for(const auto& e : exts)
+				{
+					if((strcmp(e.extensionName, "VK_EXT_load_store_op_none") == 0) ||
+					   (strcmp(e.extensionName, "VK_KHR_load_store_op_none") == 0))
+					{
+						m_context->hasStoreOpNone = true;
+						break;
+					}
+				}
+			}
+		}
 	}
 
 	m_context->annotations = decltype(m_context->annotations)(m_context->instance, &m_context->device);
@@ -455,6 +899,12 @@ void CGSH_Vulkan::CreateDevice(VkPhysicalDevice physicalDevice)
 
 Framework::Vulkan::CDevice CGSH_Vulkan::CreateDeviceObject(const Framework::Vulkan::CInstance& instance, VkPhysicalDevice physicalDevice, bool withSwapchain)
 {
+	bool has8BitStorage = false;
+	bool has16BitStorage = false;
+	bool hasUniform8 = false;
+	bool hasUniform16 = false;
+	Query8And16BitStorage(instance, physicalDevice, has8BitStorage, has16BitStorage, &hasUniform8, &hasUniform16);
+
 	float queuePriorities[] = {1.0f};
 
 	auto deviceQueueCreateInfo = Framework::Vulkan::DeviceQueueCreateInfo();
@@ -470,6 +920,36 @@ Framework::Vulkan::CDevice CGSH_Vulkan::CreateDeviceObject(const Framework::Vulk
 	}
 #if GSH_VULKAN_IS_DESKTOP
 	enabledExtensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
+#else
+	if(has8BitStorage)
+	{
+		enabledExtensions.push_back(VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
+		enabledExtensions.push_back(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
+	}
+	{
+		VkPhysicalDeviceProperties props = {};
+		instance.vkGetPhysicalDeviceProperties(physicalDevice, &props);
+		if(props.apiVersion < VK_API_VERSION_1_3)
+		{
+			uint32_t extCount = 0;
+			if(instance.vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, nullptr) == VK_SUCCESS)
+			{
+				std::vector<VkExtensionProperties> exts(extCount);
+				instance.vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, exts.data());
+				auto hasExt = [&](const char* name) {
+					return std::any_of(exts.begin(), exts.end(), [&](const VkExtensionProperties& e) { return strcmp(e.extensionName, name) == 0; });
+				};
+				if(hasExt("VK_KHR_load_store_op_none"))
+				{
+					enabledExtensions.push_back("VK_KHR_load_store_op_none");
+				}
+				else if(hasExt("VK_EXT_load_store_op_none"))
+				{
+					enabledExtensions.push_back("VK_EXT_load_store_op_none");
+				}
+			}
+		}
+	}
 #endif
 
 	std::vector<const char*> enabledLayers;
@@ -485,14 +965,27 @@ Framework::Vulkan::CDevice CGSH_Vulkan::CreateDeviceObject(const Framework::Vulk
 #endif
 
 	{
+		VkPhysicalDeviceFeatures supportedFeatures = {};
+		auto getFeatures = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures>(
+		    Framework::Vulkan::CLoader::GetInstance().vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures"));
+		if(getFeatures)
+		{
+			getFeatures(physicalDevice, &supportedFeatures);
+		}
+
 		auto physicalDeviceFeatures2 = Framework::Vulkan::PhysicalDeviceFeatures2KHR();
 #ifndef __APPLE__
 		//MoltenVK doesn't report this properly (probably due to mobile devices supporting buffer stores and not image stores)
 		physicalDeviceFeatures2.features.fragmentStoresAndAtomics = VK_TRUE;
 #endif
-#if GSH_VULKAN_IS_DESKTOP
-		physicalDeviceFeatures2.features.shaderInt16 = VK_TRUE;
-#endif
+		if(supportedFeatures.dualSrcBlend == VK_TRUE)
+		{
+			physicalDeviceFeatures2.features.dualSrcBlend = VK_TRUE;
+		}
+		if(has16BitStorage)
+		{
+			physicalDeviceFeatures2.features.shaderInt16 = VK_TRUE;
+		}
 		createDeviceStructs.AddStruct(physicalDeviceFeatures2);
 	}
 
@@ -504,14 +997,29 @@ Framework::Vulkan::CDevice CGSH_Vulkan::CreateDeviceObject(const Framework::Vulk
 		physicalDeviceVulkan12Features.uniformAndStorageBuffer8BitAccess = VK_TRUE;
 		createDeviceStructs.AddStruct(physicalDeviceVulkan12Features);
 	}
+#else
+	if(has8BitStorage)
+	{
+		VkPhysicalDevice8BitStorageFeaturesKHR features8 = {};
+		features8.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR;
+		features8.storageBuffer8BitAccess = VK_TRUE;
+		features8.uniformAndStorageBuffer8BitAccess = hasUniform8 ? VK_TRUE : VK_FALSE;
+		createDeviceStructs.AddStruct(features8);
 
+		VkPhysicalDeviceShaderFloat16Int8FeaturesKHR featuresF16I8 = {};
+		featuresF16I8.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR;
+		featuresF16I8.shaderInt8 = VK_TRUE;
+		createDeviceStructs.AddStruct(featuresF16I8);
+	}
+#endif
+
+	if(has16BitStorage)
 	{
 		auto physicalDevice16BitStorageFeatures = Framework::Vulkan::PhysicalDevice16BitStorageFeatures();
 		physicalDevice16BitStorageFeatures.storageBuffer16BitAccess = VK_TRUE;
-		physicalDevice16BitStorageFeatures.uniformAndStorageBuffer16BitAccess = VK_TRUE;
+		physicalDevice16BitStorageFeatures.uniformAndStorageBuffer16BitAccess = hasUniform16 ? VK_TRUE : VK_FALSE;
 		createDeviceStructs.AddStruct(physicalDevice16BitStorageFeatures);
 	}
-#endif
 
 	auto deviceCreateInfo = Framework::Vulkan::DeviceCreateInfo();
 	deviceCreateInfo.pNext = createDeviceStructs.GetNext();
@@ -625,9 +1133,40 @@ void CGSH_Vulkan::ProcessPrim(uint64 data)
 	unsigned int newPrimitiveType = static_cast<unsigned int>(data & 0x07);
 	if(newPrimitiveType != m_primitiveType)
 	{
-		m_draw->FlushVertices();
+		auto toPipelinePrim = [](unsigned int primType) {
+			switch(primType)
+			{
+			case PRIM_POINT:
+				return CDraw::PIPELINE_PRIMITIVE_POINT;
+			case PRIM_LINE:
+			case PRIM_LINESTRIP:
+				return CDraw::PIPELINE_PRIMITIVE_LINE;
+			default:
+				return CDraw::PIPELINE_PRIMITIVE_TRIANGLE;
+			}
+		};
+		bool topoChanged = toPipelinePrim(newPrimitiveType) != toPipelinePrim(m_primitiveType);
+		bool spriteChanged = (newPrimitiveType == PRIM_SPRITE) != (m_primitiveType == PRIM_SPRITE);
+		if(topoChanged)
+		{
+			m_draw->FlushVertices();
+		}
+		if(topoChanged || spriteChanged)
+		{
+			m_renderContextDirty = true;
+		}
 	}
 	m_primitiveType = newPrimitiveType;
+	m_stripHaveVerts = 0;
+	if((newPrimitiveType == PRIM_TRIANGLESTRIP) && !m_renderContextDirty &&
+	   ((((m_nReg[GS_REG_PRMODECONT] & 1) != 0) ? data : m_nReg[GS_REG_PRMODE]) == m_lastPrimitiveMode))
+	{
+		m_stripFastActive = true;
+	}
+	else
+	{
+		m_stripFastActive = false;
+	}
 	switch(m_primitiveType)
 	{
 	case PRIM_POINT:
@@ -663,6 +1202,108 @@ void CGSH_Vulkan::VertexKick(uint8 registerId, uint64 data)
 
 	if(!m_drawEnabled) drawingKick = false;
 
+	//Fast path for triangle strips: unpack each incoming vertex once instead of 3x per triangle.
+	if(m_primitiveType == PRIM_TRIANGLESTRIP)
+	{
+		if(m_stripFastActive && !m_renderContextDirty)
+		{
+			//m_primitiveMode is already current; skip PRMODECONT/PRIM checks on every strip vertex.
+		}
+		else
+		{
+			uint64 curPrimMode = ((m_nReg[GS_REG_PRMODECONT] & 1) != 0) ? m_nReg[GS_REG_PRIM] : m_nReg[GS_REG_PRMODE];
+			auto nextMode = make_convertible<PRMODE>(curPrimMode);
+			//Enter the fast strip path on vertex 0 even when render context is dirty (e.g. texture switch before strip)
+			//as long as UV mode isn't active (UV needs m_invTexWidth/Height from SetRenderingContext).
+			if(!m_stripFastActive && ((m_vtxCount != 3) || (nextMode.nTexture && nextMode.nUseUV && (m_renderContextDirty || (curPrimMode != m_lastPrimitiveMode)))))
+			{
+				goto slowVertexKick;
+			}
+			m_primitiveMode = nextMode;
+			if(drawingKick && (m_renderContextDirty || (curPrimMode != m_lastPrimitiveMode)))
+			{
+				SetRenderingContext(m_primitiveMode);
+			}
+			else if(m_renderContextDirty || (curPrimMode != m_lastPrimitiveMode))
+			{
+				auto offset = make_convertible<XYOFFSET>(m_nReg[GS_REG_XYOFFSET_1 + m_primitiveMode.nContext]);
+				m_primOfsX = offset.GetX();
+				m_primOfsY = offset.GetY();
+			}
+			m_stripFastActive = true;
+		}
+		{
+			static constexpr float inv16 = 1.0f / 16.0f;
+			static constexpr float inv255 = 1.0f / 255.0f;
+			uint64 pos = fog ? (data & 0x00FFFFFFFFFFFFFFULL) : data;
+			uint64 rgbaq = m_nReg[GS_REG_RGBAQ];
+			float vx = static_cast<float>(static_cast<uint32>(pos & 0xFFFF)) * inv16 - m_primOfsX;
+			float vy = static_cast<float>(static_cast<uint32>((pos >> 16) & 0xFFFF)) * inv16 - m_primOfsY;
+			uint32 vz = static_cast<uint32>(pos >> 32);
+			uint32 vcolor = static_cast<uint32>(rgbaq);
+			float vf = 0.0f;
+			if(m_primitiveMode.nFog)
+			{
+				uint8 fogByte = fog ? static_cast<uint8>(data >> 56) : static_cast<uint8>(m_nReg[GS_REG_FOG] >> 56);
+				vf = static_cast<float>(0xFF - fogByte) * inv255;
+			}
+			float vs = 0.0f, vt = 0.0f, vq = 1.0f;
+			if(m_primitiveMode.nTexture)
+			{
+				if(m_primitiveMode.nUseUV)
+				{
+					uint64 u = m_nReg[GS_REG_UV];
+					vs = static_cast<float>(static_cast<uint32>(u & 0x3FFF)) * (inv16 * m_invTexWidth);
+					vt = static_cast<float>(static_cast<uint32>((u >> 16) & 0x3FFF)) * (inv16 * m_invTexHeight);
+				}
+				else
+				{
+					uint64 st = m_nReg[GS_REG_ST];
+					uint32 sb = static_cast<uint32>(st);
+					uint32 tb = static_cast<uint32>(st >> 32);
+					uint32 qb = static_cast<uint32>(rgbaq >> 32);
+					memcpy(&vs, &sb, sizeof(float));
+					memcpy(&vt, &tb, sizeof(float));
+					memcpy(&vq, &qb, sizeof(float));
+				}
+			}
+
+			CDraw::PRIM_VERTEX v = {vx, vy, vz, vcolor, vs, vt, vq, vf};
+			if(m_stripHaveVerts < 2)
+			{
+				m_stripVerts[m_stripHaveVerts++] = v;
+				m_vtxCount--;
+				return;
+			}
+			if(drawingKick)
+			{
+				const auto& v0 = m_stripVerts[0];
+				const auto& v1 = m_stripVerts[1];
+				float minX = v0.x < v1.x ? (v0.x < vx ? v0.x : vx) : (v1.x < vx ? v1.x : vx);
+				float minY = v0.y < v1.y ? (v0.y < vy ? v0.y : vy) : (v1.y < vy ? v1.y : vy);
+				float maxX = v0.x > v1.x ? (v0.x > vx ? v0.x : vx) : (v1.x > vx ? v1.x : vx);
+				float maxY = v0.y > v1.y ? (v0.y > vy ? v0.y : vy) : (v1.y > vy ? v1.y : vy);
+				m_draw->UpdateDrawBounds(minX, minY);
+				m_draw->UpdateDrawBounds(maxX, maxY);
+				auto* dst = m_draw->ReserveVertices(3);
+				dst[0] = v0;
+				dst[1] = v1;
+				dst[2] = v;
+				if(m_primitiveMode.nShading == 0)
+				{
+					dst[0].color = vcolor;
+					dst[1].color = vcolor;
+				}
+			}
+			m_stripVerts[0] = m_stripVerts[1];
+			m_stripVerts[1] = v;
+			m_vtxCount = 1;
+			return;
+		}
+	}
+
+slowVertexKick:
+
 	if(fog)
 	{
 		m_vtxBuffer[m_vtxCount - 1].position = data & 0x00FFFFFFFFFFFFFFULL;
@@ -693,7 +1334,7 @@ void CGSH_Vulkan::VertexKick(uint8 registerId, uint64 data)
 			m_primitiveMode <<= m_nReg[GS_REG_PRMODE];
 		}
 
-		if(drawingKick)
+		if(drawingKick && (m_renderContextDirty || (static_cast<uint64>(m_primitiveMode) != m_lastPrimitiveMode)))
 		{
 			SetRenderingContext(m_primitiveMode);
 		}
@@ -710,7 +1351,7 @@ void CGSH_Vulkan::VertexKick(uint8 registerId, uint64 data)
 			break;
 		case PRIM_LINESTRIP:
 			if(drawingKick) Prim_Line();
-			memcpy(&m_vtxBuffer[1], &m_vtxBuffer[0], sizeof(VERTEX));
+			m_vtxBuffer[1] = m_vtxBuffer[0];
 			m_vtxCount = 1;
 			break;
 		case PRIM_TRIANGLE:
@@ -719,13 +1360,50 @@ void CGSH_Vulkan::VertexKick(uint8 registerId, uint64 data)
 			break;
 		case PRIM_TRIANGLESTRIP:
 			if(drawingKick) Prim_Triangle();
-			memcpy(&m_vtxBuffer[2], &m_vtxBuffer[1], sizeof(VERTEX));
-			memcpy(&m_vtxBuffer[1], &m_vtxBuffer[0], sizeof(VERTEX));
+			m_vtxBuffer[2] = m_vtxBuffer[1];
+			m_vtxBuffer[1] = m_vtxBuffer[0];
 			m_vtxCount = 1;
+			if(drawingKick && !m_renderContextDirty)
+			{
+				static constexpr float inv16 = 1.0f / 16.0f;
+				static constexpr float inv255 = 1.0f / 255.0f;
+				const float scaleU = inv16 * m_invTexWidth;
+				const float scaleV = inv16 * m_invTexHeight;
+				auto unpackBuf = [&](const VERTEX& src) -> CDraw::PRIM_VERTEX {
+					float vx = static_cast<float>(static_cast<uint32>(src.position & 0xFFFFU)) * inv16 - m_primOfsX;
+					float vy = static_cast<float>(static_cast<uint32>((src.position >> 16) & 0xFFFFU)) * inv16 - m_primOfsY;
+					uint32 vz = static_cast<uint32>(src.position >> 32);
+					uint32 vcolor = static_cast<uint32>(src.rgbaq);
+					float vf = m_primitiveMode.nFog ? (static_cast<float>(0xFF - src.fog) * inv255) : 0.0f;
+					float vs = 0.0f, vt = 0.0f, vq = 1.0f;
+					if(m_primitiveMode.nTexture)
+					{
+						if(m_primitiveMode.nUseUV)
+						{
+							vs = static_cast<float>(static_cast<uint32>(src.uv & 0x3FFFU)) * scaleU;
+							vt = static_cast<float>(static_cast<uint32>((src.uv >> 16) & 0x3FFFU)) * scaleV;
+						}
+						else
+						{
+							uint32 sb = static_cast<uint32>(src.st);
+							uint32 tb = static_cast<uint32>(src.st >> 32);
+							uint32 qb = static_cast<uint32>(src.rgbaq >> 32);
+							memcpy(&vs, &sb, sizeof(float));
+							memcpy(&vt, &tb, sizeof(float));
+							memcpy(&vq, &qb, sizeof(float));
+						}
+					}
+					return {vx, vy, vz, vcolor, vs, vt, vq, vf};
+				};
+				m_stripVerts[0] = unpackBuf(m_vtxBuffer[2]);
+				m_stripVerts[1] = unpackBuf(m_vtxBuffer[1]);
+				m_stripHaveVerts = 2;
+				m_stripFastActive = true;
+			}
 			break;
 		case PRIM_TRIANGLEFAN:
 			if(drawingKick) Prim_Triangle();
-			memcpy(&m_vtxBuffer[1], &m_vtxBuffer[0], sizeof(VERTEX));
+			m_vtxBuffer[1] = m_vtxBuffer[0];
 			m_vtxCount = 1;
 			break;
 		case PRIM_SPRITE:
@@ -786,20 +1464,35 @@ void CGSH_Vulkan::SetRenderingContext(uint64 primReg)
 	{
 		pipelineCaps.hasTexture = 1;
 		pipelineCaps.textureHasAlpha = tex0.nColorComp;
-		pipelineCaps.textureBlackIsTransparent = texA.nAEM;
 		pipelineCaps.textureFunction = tex0.nFunction;
 		pipelineCaps.texClampU = clamp.nWMS;
 		pipelineCaps.texClampV = clamp.nWMT;
 		pipelineCaps.textureFormat = tex0.nPsm;
-		pipelineCaps.clutFormat = tex0.nCPSM;
+		bool isIdtex = CGsPixelFormats::IsPsmIDTEX(tex0.nPsm);
+		pipelineCaps.clutFormat = isIdtex ? tex0.nCPSM : 0;
+		bool usesTexAlpha = false;
+		if(tex0.nColorComp)
+		{
+			if(isIdtex)
+			{
+				usesTexAlpha = (tex0.nCPSM == CGSHandler::PSMCT16) || (tex0.nCPSM == CGSHandler::PSMCT16S);
+			}
+			else
+			{
+				usesTexAlpha = (tex0.nPsm == CGSHandler::PSMCT24) || (tex0.nPsm == CGSHandler::PSMCT16) ||
+				               (tex0.nPsm == CGSHandler::PSMCT16S) || (tex0.nPsm == CGSHandler::PSMZ16) ||
+				               (tex0.nPsm == CGSHandler::PSMZ16S);
+			}
+		}
+		pipelineCaps.textureBlackIsTransparent = usesTexAlpha ? texA.nAEM : 0;
 	}
 	pipelineCaps.hasFog = prim.nFog;
 	pipelineCaps.scanMask = scanMask;
 	pipelineCaps.hasAlphaBlending = prim.nAlpha && m_alphaBlendingEnabled;
-	pipelineCaps.colClamp = colClamp;
+	pipelineCaps.colClamp = 0;
 	pipelineCaps.fba = fba;
 	pipelineCaps.hasDstAlphaTest = test.nDestAlphaEnabled;
-	pipelineCaps.dstAlphaTestRef = test.nDestAlphaMode;
+	pipelineCaps.dstAlphaTestRef = test.nDestAlphaEnabled ? test.nDestAlphaMode : 0;
 	pipelineCaps.writeDepth = (zbuf.nMask == 0) && (test.nDepthEnabled != 0); //Depth test disabled -> no writes to depth buffer
 	pipelineCaps.framebufferFormat = frame.nPsm;
 	pipelineCaps.depthbufferFormat = zbuf.nPsm | 0x30;
@@ -890,12 +1583,26 @@ void CGSH_Vulkan::SetRenderingContext(uint64 primReg)
 		pipelineCaps.textureUseLinearFiltering = (minLinear && magLinear);
 	}
 
-	if(prim.nAlpha)
+	if(pipelineCaps.hasAlphaBlending)
 	{
-		pipelineCaps.alphaA = alpha.nA;
-		pipelineCaps.alphaB = alpha.nB;
-		pipelineCaps.alphaC = alpha.nC;
-		pipelineCaps.alphaD = alpha.nD;
+		bool isIdentityBlend =
+		    (((alpha.nA == alpha.nB) || ((alpha.nC == ALPHABLEND_C_FIX) && (alpha.nFix == 0))) && (alpha.nD == ALPHABLEND_ABD_CS)) ||
+		    ((alpha.nA == ALPHABLEND_ABD_CS) && (alpha.nC == ALPHABLEND_C_FIX) && (alpha.nFix == 0x80) &&
+		     (((alpha.nB == ALPHABLEND_ABD_ZERO) && (alpha.nD == ALPHABLEND_ABD_ZERO)) ||
+		      ((alpha.nB == ALPHABLEND_ABD_CD) && (alpha.nD == ALPHABLEND_ABD_CD))));
+		if(isIdentityBlend)
+		{
+			pipelineCaps.hasAlphaBlending = 0;
+			if(m_statsEnabled) m_statsAlphaIdentity++;
+		}
+		else
+		{
+			pipelineCaps.colClamp = colClamp;
+			pipelineCaps.alphaA = alpha.nA;
+			pipelineCaps.alphaB = alpha.nB;
+			pipelineCaps.alphaC = alpha.nC;
+			pipelineCaps.alphaD = alpha.nD;
+		}
 	}
 
 	pipelineCaps.depthTestFunction = test.nDepthMethod;
@@ -935,6 +1642,11 @@ void CGSH_Vulkan::SetRenderingContext(uint64 primReg)
 		pipelineCaps.alphaTestFunction = CGSHandler::ALPHA_TEST_ALWAYS;
 		pipelineCaps.writeDepth = 0;
 		fbWriteMask &= 0x00FFFFFF;
+	}
+
+	if(pipelineCaps.alphaTestFunction == CGSHandler::ALPHA_TEST_ALWAYS)
+	{
+		pipelineCaps.alphaTestFailAction = 0;
 	}
 
 	switch(frame.nPsm)
@@ -997,36 +1709,63 @@ void CGSH_Vulkan::SetRenderingContext(uint64 primReg)
 
 	m_draw->SetPipelineCaps(pipelineCaps);
 	m_draw->SetFramebufferParams(frame.GetBasePtr(), frame.GetWidth(), fbWriteMask);
-	m_draw->SetDepthbufferParams(zbuf.GetBasePtr(), frame.GetWidth());
-	m_draw->SetTextureParams(texBufPtr, texBufWidth, tex0.GetWidth(), tex0.GetHeight(), texMipLevel, tex0.nCSA * 0x10);
-	if(
-	    pipelineCaps.textureUseDynamicMipLOD &&
-	    (!m_regState.isValid ||
-	     (m_regState.tex1 != tex1) ||
-	     (m_regState.miptbp1 != miptbp1) ||
-	     (m_regState.miptbp2 != miptbp2)))
+	if((pipelineCaps.depthTestFunction != CGSHandler::DEPTH_TEST_ALWAYS) || pipelineCaps.writeDepth)
 	{
-		CDraw::MipBufs mipBufs;
-		for(int i = 1; i <= tex1.nMaxMip; i++)
-		{
-			mipBufs[i - 1] = GetMipLevelInfo(i, miptbp1, miptbp2);
-		}
-		for(int i = tex1.nMaxMip + 1; i <= 6; i++)
-		{
-			mipBufs[i - 1] = std::pair<uint32, uint32>(0, 0);
-		}
-		m_draw->SetMipParams(mipBufs, tex1.nMaxMip, tex1.GetK(), tex1.nLODL);
+		m_draw->SetDepthbufferParams(zbuf.GetBasePtr(), frame.GetWidth());
 	}
-	m_draw->SetTextureAlphaParams(texA.nTA0, texA.nTA1);
-	m_draw->SetTextureClampParams(
-	    clamp.GetMinU(), clamp.GetMinV(),
-	    clamp.GetMaxU(), clamp.GetMaxV());
-	m_draw->SetFogParams(
-	    static_cast<float>(fogCol.nFCR) / 255.f,
-	    static_cast<float>(fogCol.nFCG) / 255.f,
-	    static_cast<float>(fogCol.nFCB) / 255.f);
-	m_draw->SetAlphaBlendingParams(alpha.nFix);
-	m_draw->SetAlphaTestParams(test.nAlphaRef);
+	if(pipelineCaps.hasTexture)
+	{
+		uint32 texCsa = CGsPixelFormats::IsPsmIDTEX(tex0.nPsm) ? (tex0.nCSA * 0x10) : 0;
+		m_draw->SetTextureParams(texBufPtr, texBufWidth, tex0.GetWidth(), tex0.GetHeight(), texMipLevel, texCsa);
+		if(
+		    pipelineCaps.textureUseDynamicMipLOD &&
+		    (!m_regState.isValid ||
+		     (m_regState.tex1 != tex1) ||
+		     (m_regState.miptbp1 != miptbp1) ||
+		     (m_regState.miptbp2 != miptbp2)))
+		{
+			CDraw::MipBufs mipBufs;
+			for(int i = 1; i <= tex1.nMaxMip; i++)
+			{
+				mipBufs[i - 1] = GetMipLevelInfo(i, miptbp1, miptbp2);
+			}
+			for(int i = tex1.nMaxMip + 1; i <= 6; i++)
+			{
+				mipBufs[i - 1] = std::pair<uint32, uint32>(0, 0);
+			}
+			m_draw->SetMipParams(mipBufs, tex1.nMaxMip, tex1.GetK(), tex1.nLODL);
+			m_regState.isValid = true;
+			m_regState.tex1 = tex1;
+			m_regState.miptbp1 = miptbp1;
+			m_regState.miptbp2 = miptbp2;
+		}
+		if(pipelineCaps.textureHasAlpha)
+		{
+			m_draw->SetTextureAlphaParams(texA.nTA0, texA.nTA1);
+		}
+		if((clamp.nWMS >= CLAMP_MODE_REGION_CLAMP) || (clamp.nWMT >= CLAMP_MODE_REGION_CLAMP))
+		{
+			m_draw->SetTextureClampParams(
+			    clamp.GetMinU(), clamp.GetMinV(),
+			    clamp.GetMaxU(), clamp.GetMaxV());
+		}
+	}
+	if(pipelineCaps.hasFog)
+	{
+		m_draw->SetFogParams(
+		    static_cast<float>(fogCol.nFCR) / 255.f,
+		    static_cast<float>(fogCol.nFCG) / 255.f,
+		    static_cast<float>(fogCol.nFCB) / 255.f);
+	}
+	if(pipelineCaps.hasAlphaBlending && (pipelineCaps.alphaC == ALPHABLEND_C_FIX))
+	{
+		m_draw->SetAlphaBlendingParams(alpha.nFix);
+	}
+	if((pipelineCaps.alphaTestFunction != CGSHandler::ALPHA_TEST_ALWAYS) &&
+	   (pipelineCaps.alphaTestFunction != CGSHandler::ALPHA_TEST_NEVER))
+	{
+		m_draw->SetAlphaTestParams(test.nAlphaRef);
+	}
 	m_draw->SetScissor(scissor.scax0, scissor.scay0,
 	                   scissor.scax1 - scissor.scax0 + 1,
 	                   scissor.scay1 - scissor.scay0 + 1);
@@ -1038,11 +1777,11 @@ void CGSH_Vulkan::SetRenderingContext(uint64 primReg)
 
 	m_texWidth = tex0.GetWidth();
 	m_texHeight = tex0.GetHeight();
+	m_invTexWidth = 1.0f / static_cast<float>(m_texWidth);
+	m_invTexHeight = 1.0f / static_cast<float>(m_texHeight);
 
-	m_regState.isValid = true;
-	m_regState.tex1 = tex1;
-	m_regState.miptbp1 = miptbp1;
-	m_regState.miptbp2 = miptbp2;
+	m_renderContextDirty = false;
+	m_lastPrimitiveMode = static_cast<uint64>(prim);
 }
 
 void CGSH_Vulkan::Prim_Point()
@@ -1150,106 +1889,97 @@ void CGSH_Vulkan::Prim_Line()
 
 void CGSH_Vulkan::Prim_Triangle()
 {
-	XYZ pos[3];
-	pos[0] <<= m_vtxBuffer[2].position;
-	pos[1] <<= m_vtxBuffer[1].position;
-	pos[2] <<= m_vtxBuffer[0].position;
+	const uint64 p0 = m_vtxBuffer[2].position;
+	const uint64 p1 = m_vtxBuffer[1].position;
+	const uint64 p2 = m_vtxBuffer[0].position;
 
-	float x1 = pos[0].GetX(), x2 = pos[1].GetX(), x3 = pos[2].GetX();
-	float y1 = pos[0].GetY(), y2 = pos[1].GetY(), y3 = pos[2].GetY();
-	uint32 z1 = pos[0].nZ, z2 = pos[1].nZ, z3 = pos[2].nZ;
+	static constexpr float inv16 = 1.0f / 16.0f;
+	const float x1 = static_cast<float>(static_cast<uint32>(p0 & 0xFFFF)) * inv16 - m_primOfsX;
+	const float y1 = static_cast<float>(static_cast<uint32>((p0 >> 16) & 0xFFFF)) * inv16 - m_primOfsY;
+	const uint32 z1 = static_cast<uint32>(p0 >> 32);
 
-	RGBAQ rgbaq[3];
-	rgbaq[0] <<= m_vtxBuffer[2].rgbaq;
-	rgbaq[1] <<= m_vtxBuffer[1].rgbaq;
-	rgbaq[2] <<= m_vtxBuffer[0].rgbaq;
+	const float x2 = static_cast<float>(static_cast<uint32>(p1 & 0xFFFF)) * inv16 - m_primOfsX;
+	const float y2 = static_cast<float>(static_cast<uint32>((p1 >> 16) & 0xFFFF)) * inv16 - m_primOfsY;
+	const uint32 z2 = static_cast<uint32>(p1 >> 32);
 
-	x1 -= m_primOfsX;
-	x2 -= m_primOfsX;
-	x3 -= m_primOfsX;
+	const float x3 = static_cast<float>(static_cast<uint32>(p2 & 0xFFFF)) * inv16 - m_primOfsX;
+	const float y3 = static_cast<float>(static_cast<uint32>((p2 >> 16) & 0xFFFF)) * inv16 - m_primOfsY;
+	const uint32 z3 = static_cast<uint32>(p2 >> 32);
 
-	y1 -= m_primOfsY;
-	y2 -= m_primOfsY;
-	y3 -= m_primOfsY;
-
-	float s[3] = {0, 0, 0};
-	float t[3] = {0, 0, 0};
-	float q[3] = {1, 1, 1};
-
-	float f[3] = {0, 0, 0};
+	float s0 = 0, s1 = 0, s2 = 0;
+	float t0 = 0, t1 = 0, t2 = 0;
+	float q0 = 1, q1 = 1, q2 = 1;
+	float f0 = 0, f1 = 0, f2 = 0;
 
 	if(m_primitiveMode.nFog)
 	{
-		f[0] = static_cast<float>(0xFF - m_vtxBuffer[2].fog) / 255.0f;
-		f[1] = static_cast<float>(0xFF - m_vtxBuffer[1].fog) / 255.0f;
-		f[2] = static_cast<float>(0xFF - m_vtxBuffer[0].fog) / 255.0f;
+		static constexpr float inv255 = 1.0f / 255.0f;
+		f0 = static_cast<float>(0xFF - m_vtxBuffer[2].fog) * inv255;
+		f1 = static_cast<float>(0xFF - m_vtxBuffer[1].fog) * inv255;
+		f2 = static_cast<float>(0xFF - m_vtxBuffer[0].fog) * inv255;
 	}
 
 	if(m_primitiveMode.nTexture)
 	{
 		if(m_primitiveMode.nUseUV)
 		{
-			UV uv[3];
-			uv[0] <<= m_vtxBuffer[2].uv;
-			uv[1] <<= m_vtxBuffer[1].uv;
-			uv[2] <<= m_vtxBuffer[0].uv;
-
-			s[0] = uv[0].GetU() / static_cast<float>(m_texWidth);
-			s[1] = uv[1].GetU() / static_cast<float>(m_texWidth);
-			s[2] = uv[2].GetU() / static_cast<float>(m_texWidth);
-
-			t[0] = uv[0].GetV() / static_cast<float>(m_texHeight);
-			t[1] = uv[1].GetV() / static_cast<float>(m_texHeight);
-			t[2] = uv[2].GetV() / static_cast<float>(m_texHeight);
+			const float scaleU = inv16 * m_invTexWidth;
+			const float scaleV = inv16 * m_invTexHeight;
+			const uint64 u0 = m_vtxBuffer[2].uv;
+			const uint64 u1 = m_vtxBuffer[1].uv;
+			const uint64 u2 = m_vtxBuffer[0].uv;
+			s0 = static_cast<float>(static_cast<uint32>(u0 & 0x3FFF)) * scaleU;
+			t0 = static_cast<float>(static_cast<uint32>((u0 >> 16) & 0x3FFF)) * scaleV;
+			s1 = static_cast<float>(static_cast<uint32>(u1 & 0x3FFF)) * scaleU;
+			t1 = static_cast<float>(static_cast<uint32>((u1 >> 16) & 0x3FFF)) * scaleV;
+			s2 = static_cast<float>(static_cast<uint32>(u2 & 0x3FFF)) * scaleU;
+			t2 = static_cast<float>(static_cast<uint32>((u2 >> 16) & 0x3FFF)) * scaleV;
 		}
 		else
 		{
-			ST st[3];
-			st[0] <<= m_vtxBuffer[2].st;
-			st[1] <<= m_vtxBuffer[1].st;
-			st[2] <<= m_vtxBuffer[0].st;
-
-			s[0] = st[0].nS;
-			s[1] = st[1].nS;
-			s[2] = st[2].nS;
-			t[0] = st[0].nT;
-			t[1] = st[1].nT;
-			t[2] = st[2].nT;
-
-			q[0] = rgbaq[0].nQ;
-			q[1] = rgbaq[1].nQ;
-			q[2] = rgbaq[2].nQ;
+			auto st0 = make_convertible<ST>(m_vtxBuffer[2].st);
+			auto st1 = make_convertible<ST>(m_vtxBuffer[1].st);
+			auto st2 = make_convertible<ST>(m_vtxBuffer[0].st);
+			s0 = st0.nS;
+			t0 = st0.nT;
+			s1 = st1.nS;
+			t1 = st1.nT;
+			s2 = st2.nS;
+			t2 = st2.nT;
+			uint32 qb0 = static_cast<uint32>(m_vtxBuffer[2].rgbaq >> 32);
+			uint32 qb1 = static_cast<uint32>(m_vtxBuffer[1].rgbaq >> 32);
+			uint32 qb2 = static_cast<uint32>(m_vtxBuffer[0].rgbaq >> 32);
+			memcpy(&q0, &qb0, sizeof(float));
+			memcpy(&q1, &qb1, sizeof(float));
+			memcpy(&q2, &qb2, sizeof(float));
 		}
 	}
 
-	auto color1 = MakeColor(
-	    rgbaq[0].nR, rgbaq[0].nG,
-	    rgbaq[0].nB, rgbaq[0].nA);
+	const uint32 color3 = static_cast<uint32>(m_vtxBuffer[0].rgbaq);
+	const uint32 color1 = (m_primitiveMode.nShading == 0) ? color3 : static_cast<uint32>(m_vtxBuffer[2].rgbaq);
+	const uint32 color2 = (m_primitiveMode.nShading == 0) ? color3 : static_cast<uint32>(m_vtxBuffer[1].rgbaq);
 
-	auto color2 = MakeColor(
-	    rgbaq[1].nR, rgbaq[1].nG,
-	    rgbaq[1].nB, rgbaq[1].nA);
-
-	auto color3 = MakeColor(
-	    rgbaq[2].nR, rgbaq[2].nG,
-	    rgbaq[2].nB, rgbaq[2].nA);
-
-	if(m_primitiveMode.nShading == 0)
+	float minX = x1 < x2 ? (x1 < x3 ? x1 : x3) : (x2 < x3 ? x2 : x3);
+	float minY = y1 < y2 ? (y1 < y3 ? y1 : y3) : (y2 < y3 ? y2 : y3);
+	float maxX = x1 > x2 ? (x1 > x3 ? x1 : x3) : (x2 > x3 ? x2 : x3);
+	float maxY = y1 > y2 ? (y1 > y3 ? y1 : y3) : (y2 > y3 ? y2 : y3);
+	m_draw->UpdateDrawBounds(minX, minY);
+	m_draw->UpdateDrawBounds(maxX, maxY);
+	auto* dst = m_draw->ReserveVertices(3);
+	dst[0] = {x1, y1, z1, color1, s0, t0, q0, f0};
+	dst[1] = {x2, y2, z2, color2, s1, t1, q1, f1};
+	dst[2] = {x3, y3, z3, color3, s2, t2, q2, f2};
+	if(m_primitiveType == PRIM_TRIANGLESTRIP)
 	{
-		//Flat shaded triangles use the last color set
-		color1 = color2 = color3;
+		m_stripVerts[0] = dst[1];
+		if(m_primitiveMode.nShading == 0)
+		{
+			m_stripVerts[0].color = static_cast<uint32>(m_vtxBuffer[1].rgbaq);
+		}
+		m_stripVerts[1] = dst[2];
+		m_stripHaveVerts = 2;
+		m_stripFastActive = true;
 	}
-
-	// clang-format off
-	CDraw::PRIM_VERTEX vertices[] =
-	{
-		{	x1, y1, z1, color1, s[0], t[0], q[0], f[0]},
-		{	x2, y2, z2, color2, s[1], t[1], q[1], f[1]},
-		{	x3, y3, z3, color3, s[2], t[2], q[2], f[2]},
-	};
-	// clang-format on
-
-	m_draw->AddVertices(std::begin(vertices), std::end(vertices));
 }
 
 void CGSH_Vulkan::Prim_Sprite()
@@ -1320,34 +2050,81 @@ void CGSH_Vulkan::Prim_Sprite()
 	    rgbaq[1].nR, rgbaq[1].nG,
 	    rgbaq[1].nB, rgbaq[1].nA);
 
-	// clang-format off
-	CDraw::PRIM_VERTEX vertices[] =
 	{
-		{x1, y1, z, color, s[0], t[0], 1, f},
-		{x2, y1, z, color, s[1], t[0], 1, f},
-		{x1, y2, z, color, s[0], t[1], 1, f},
-
-		{x1, y2, z, color, s[0], t[1], 1, f},
-		{x2, y1, z, color, s[1], t[0], 1, f},
-		{x2, y2, z, color, s[1], t[1], 1, f},
-	};
-	// clang-format on
-
-	{
-		const auto topLeftCorner = vertices;
-		const auto bottomRightCorner = vertices + 5;
-		CGsSpriteRect rect(topLeftCorner->x, topLeftCorner->y, bottomRightCorner->x, bottomRightCorner->y);
+		CGsSpriteRect rect(x1, y1, x2, y2);
 		CheckSpriteCachedClutInvalidation(rect);
 	}
 
-	m_draw->AddVertices(std::begin(vertices), std::end(vertices));
+	if(m_draw->IsMemoryCopyActive())
+	{
+		// clang-format off
+		CDraw::PRIM_VERTEX vertices[] =
+		{
+			{x1, y1, z, color, s[0], t[0], 1, f},
+			{x2, y1, z, color, s[1], t[0], 1, f},
+			{x1, y2, z, color, s[0], t[1], 1, f},
+
+			{x1, y2, z, color, s[0], t[1], 1, f},
+			{x2, y1, z, color, s[1], t[0], 1, f},
+			{x2, y2, z, color, s[1], t[1], 1, f},
+		};
+		// clang-format on
+		m_draw->AddVertices(std::begin(vertices), std::end(vertices));
+	}
+	else
+	{
+		m_draw->UpdateDrawBounds(x1, y1);
+		m_draw->UpdateDrawBounds(x2, y2);
+		auto* dst = m_draw->ReserveVertices(6);
+		dst[0] = {x1, y1, z, color, s[0], t[0], 1, f};
+		dst[1] = {x2, y1, z, color, s[1], t[0], 1, f};
+		dst[2] = {x1, y2, z, color, s[0], t[1], 1, f};
+		dst[3] = {x1, y2, z, color, s[0], t[1], 1, f};
+		dst[4] = {x2, y1, z, color, s[1], t[0], 1, f};
+		dst[5] = {x2, y2, z, color, s[1], t[1], 1, f};
+	}
 }
 
 void CGSH_Vulkan::ClearClutCache()
 {
+	if(m_statsEnabled) m_statsClutClears++;
 	memset(&m_clutStates, 0, sizeof(m_clutStates));
 	m_lastClutFillCacheIndex = -1;
 	m_lastClutFillPointer = -1;
+	m_renderContextDirty = true;
+}
+
+void CGSH_Vulkan::InvalidateClutCacheRange(uint32 address, uint32 size)
+{
+	uint64 xferStart = address;
+	uint64 xferEnd = xferStart + size;
+	bool clearedAny = false;
+	for(uint32 i = 0; i < CLUT_CACHE_SIZE; i++)
+	{
+		if(static_cast<uint64>(m_clutStates[i]) == 0) continue;
+		uint64 clutStart = 0;
+		uint64 clutEnd = RAMSIZE;
+		if(m_clutStates[i].csm == 0)
+		{
+			clutStart = (m_clutStates[i].cbp * 256) & ~(CGsPixelFormats::PAGESIZE - 1);
+			clutEnd = clutStart + CGsPixelFormats::PAGESIZE * 2;
+		}
+		if((xferStart < clutEnd) && (clutStart < xferEnd))
+		{
+			m_clutStates[i] <<= 0;
+			if(static_cast<int32>(i) == m_lastClutFillCacheIndex)
+			{
+				m_lastClutFillCacheIndex = -1;
+				m_lastClutFillPointer = -1;
+			}
+			clearedAny = true;
+		}
+	}
+	if(clearedAny)
+	{
+		m_renderContextDirty = true;
+		if(m_statsEnabled) m_statsClutClears++;
+	}
 }
 
 int32 CGSH_Vulkan::FindCachedClut(const CLUTKEY& key) const
@@ -1382,7 +2159,10 @@ void CGSH_Vulkan::CheckSpriteCachedClutInvalidation(const CGsSpriteRect& rect)
 		if(foundClut)
 		{
 			memset(&m_clutStates, 0, sizeof(m_clutStates));
+			m_lastClutFillCacheIndex = -1;
+			m_lastClutFillPointer = -1;
 			m_draw->FlushVertices();
+			m_renderContextDirty = true;
 		}
 	}
 }
@@ -1404,6 +2184,396 @@ CGSH_Vulkan::CLUTKEY CGSH_Vulkan::MakeCachedClutKey(const TEX0& tex0, const TEXC
 /////////////////////////////////////////////////////////////
 // Other Functions
 /////////////////////////////////////////////////////////////
+
+void CGSH_Vulkan::SubmitWriteBufferImpl(const RegisterWrite* writeStart, const RegisterWrite* writeEnd)
+{
+	if(writeStart != writeEnd) m_regsDirty = true;
+	for(auto write = writeStart; write != writeEnd;)
+	{
+		if(m_xferBuffer.empty() && m_primitiveType == PRIM_TRIANGLESTRIP && m_stripFastActive && !m_renderContextDirty && m_drawEnabled && !m_pendingPrim)
+		{
+			const bool hasFog = (m_primitiveMode.nFog != 0);
+			const bool hasTex = (m_primitiveMode.nTexture != 0);
+			const bool useUV = (m_primitiveMode.nUseUV != 0);
+			const bool flatShading = (m_primitiveMode.nShading == 0);
+
+			auto runStripLoop = [&](auto hasTexC, auto useUVC, auto hasFogC, auto flatC) {
+				constexpr bool kHasTex = decltype(hasTexC)::value;
+				constexpr bool kUseUV = decltype(useUVC)::value;
+				constexpr bool kHasFog = decltype(hasFogC)::value;
+				constexpr bool kFlat = decltype(flatC)::value;
+				static constexpr float inv16 = 1.0f / 16.0f;
+				static constexpr float inv255 = 1.0f / 255.0f;
+				const float ofsX = m_primOfsX;
+				const float ofsY = m_primOfsY;
+				const float scaleU = inv16 * m_invTexWidth;
+				const float scaleV = inv16 * m_invTexHeight;
+
+				uint64 curST = m_nReg[GS_REG_ST];
+				uint64 curRGBAQ = m_nReg[GS_REG_RGBAQ];
+				uint64 curUV = m_nReg[GS_REG_UV];
+				uint64 curFog = m_nReg[GS_REG_FOG];
+				GSH_Vulkan::CDraw::PRIM_VERTEX v0 = m_stripVerts[0];
+				GSH_Vulkan::CDraw::PRIM_VERTEX v1 = m_stripVerts[1];
+				uint32 haveVerts = m_stripHaveVerts;
+				uint32 vtxCount = m_vtxCount;
+				float minX = 3.402823466e+38f;
+				float minY = 3.402823466e+38f;
+				float maxX = -3.402823466e+38f;
+				float maxY = -3.402823466e+38f;
+				bool emittedAny = false;
+				bool prevKicked = false;
+
+				GSH_Vulkan::CDraw::PRIM_VERTEX* dstPtr = m_draw->GetCurrentVertexPtr();
+				uint32 availVerts = m_draw->GetRemainingVertices();
+				uint32 emittedVerts = 0;
+
+				while(write != writeEnd)
+				{
+					//Fast-track packed (ST, RGBAQ, XYZ*) 3-register vertex triples in the dominant strip path,
+					//including ADC=1 (XYZF3/XYZ3) restarts and initial strip vertices (haveVerts < 2).
+					if constexpr(kHasTex && !kUseUV && !kFlat)
+					{
+						while((write + 2) < writeEnd && vtxCount != 0 && availVerts >= 3 &&
+						      write[0].first == GS_REG_ST && write[1].first == GS_REG_RGBAQ &&
+						      (write[2].first == GS_REG_XYZF2 || write[2].first == GS_REG_XYZ2 ||
+						       write[2].first == GS_REG_XYZF3 || write[2].first == GS_REG_XYZ3))
+						{
+							curST = write[0].second;
+							curRGBAQ = write[1].second;
+							uint8 r2 = write[2].first;
+							uint64 data = write[2].second;
+							bool drawingKick = (r2 == GS_REG_XYZF2 || r2 == GS_REG_XYZ2);
+							bool fog = (r2 == GS_REG_XYZF2 || r2 == GS_REG_XYZF3);
+							uint64 pos = fog ? (data & 0x00FFFFFFFFFFFFFFULL) : data;
+							float vx = static_cast<float>(static_cast<uint32>(pos & 0xFFFFU)) * inv16 - ofsX;
+							float vy = static_cast<float>(static_cast<uint32>((pos >> 16) & 0xFFFFU)) * inv16 - ofsY;
+							uint32 vz = static_cast<uint32>(pos >> 32);
+							uint32 vcolor = static_cast<uint32>(curRGBAQ);
+							float vf = 0.0f;
+							if constexpr(kHasFog)
+							{
+								uint8 fogByte = fog ? static_cast<uint8>(data >> 56) : static_cast<uint8>(curFog >> 56);
+								vf = static_cast<float>(0xFF - fogByte) * inv255;
+							}
+							uint32 sb = static_cast<uint32>(curST);
+							uint32 tb = static_cast<uint32>(curST >> 32);
+							uint32 qb = static_cast<uint32>(curRGBAQ >> 32);
+							float vs, vt, vq;
+							memcpy(&vs, &sb, sizeof(float));
+							memcpy(&vt, &tb, sizeof(float));
+							memcpy(&vq, &qb, sizeof(float));
+							GSH_Vulkan::CDraw::PRIM_VERTEX v = {vx, vy, vz, vcolor, vs, vt, vq, vf};
+							if(haveVerts < 2)
+							{
+								if(haveVerts == 0) v0 = v;
+								else v1 = v;
+								haveVerts++;
+								vtxCount--;
+								prevKicked = false;
+								write += 3;
+								continue;
+							}
+							if(drawingKick)
+							{
+								if(!prevKicked)
+								{
+									if(v0.x < minX) minX = v0.x;
+									if(v0.y < minY) minY = v0.y;
+									if(v0.x > maxX) maxX = v0.x;
+									if(v0.y > maxY) maxY = v0.y;
+									if(v1.x < minX) minX = v1.x;
+									if(v1.y < minY) minY = v1.y;
+									if(v1.x > maxX) maxX = v1.x;
+									if(v1.y > maxY) maxY = v1.y;
+								}
+								if(vx < minX) minX = vx;
+								if(vy < minY) minY = vy;
+								if(vx > maxX) maxX = vx;
+								if(vy > maxY) maxY = vy;
+								emittedAny = true;
+								prevKicked = true;
+								dstPtr[0] = v0;
+								dstPtr[1] = v1;
+								dstPtr[2] = v;
+								dstPtr += 3;
+								availVerts -= 3;
+								emittedVerts += 3;
+							}
+							else
+							{
+								prevKicked = false;
+							}
+							v0 = v1;
+							v1 = v;
+							vtxCount = 1;
+							write += 3;
+						}
+						if(write == writeEnd) break;
+					}
+					uint8 reg = write->first;
+					uint64 data = write->second;
+					if(reg == GS_REG_ST)
+					{
+						curST = data;
+						write++;
+						continue;
+					}
+					if(reg == GS_REG_RGBAQ)
+					{
+						curRGBAQ = data;
+						write++;
+						continue;
+					}
+					if(reg == GS_REG_XYZ2 || reg == GS_REG_XYZF2 || reg == GS_REG_XYZ3 || reg == GS_REG_XYZF3)
+					{
+						if(vtxCount == 0)
+						{
+							write++;
+							continue;
+						}
+						bool drawingKick = (reg == GS_REG_XYZ2) || (reg == GS_REG_XYZF2);
+						bool fog = (reg == GS_REG_XYZF2) || (reg == GS_REG_XYZF3);
+						uint64 pos = fog ? (data & 0x00FFFFFFFFFFFFFFULL) : data;
+						float vx = static_cast<float>(static_cast<uint32>(pos & 0xFFFFU)) * inv16 - ofsX;
+						float vy = static_cast<float>(static_cast<uint32>((pos >> 16) & 0xFFFFU)) * inv16 - ofsY;
+						uint32 vz = static_cast<uint32>(pos >> 32);
+						uint32 vcolor = static_cast<uint32>(curRGBAQ);
+						float vf = 0.0f;
+						if constexpr(kHasFog)
+						{
+							uint8 fogByte = fog ? static_cast<uint8>(data >> 56) : static_cast<uint8>(curFog >> 56);
+							vf = static_cast<float>(0xFF - fogByte) * inv255;
+						}
+						float vs = 0.0f, vt = 0.0f, vq = 1.0f;
+						if constexpr(kHasTex)
+						{
+							if constexpr(kUseUV)
+							{
+								vs = static_cast<float>(static_cast<uint32>(curUV & 0x3FFFU)) * scaleU;
+								vt = static_cast<float>(static_cast<uint32>((curUV >> 16) & 0x3FFFU)) * scaleV;
+							}
+							else
+							{
+								uint32 sb = static_cast<uint32>(curST);
+								uint32 tb = static_cast<uint32>(curST >> 32);
+								uint32 qb = static_cast<uint32>(curRGBAQ >> 32);
+								memcpy(&vs, &sb, sizeof(float));
+								memcpy(&vt, &tb, sizeof(float));
+								memcpy(&vq, &qb, sizeof(float));
+							}
+						}
+
+						GSH_Vulkan::CDraw::PRIM_VERTEX v = {vx, vy, vz, vcolor, vs, vt, vq, vf};
+						if(haveVerts < 2)
+						{
+							if(haveVerts == 0) v0 = v;
+							else v1 = v;
+							haveVerts++;
+							vtxCount--;
+							prevKicked = false;
+							write++;
+							continue;
+						}
+						if(drawingKick)
+						{
+							GSH_Vulkan::CDraw::PRIM_VERTEX* dst = nullptr;
+							if(availVerts >= 3)
+							{
+								dst = dstPtr;
+								dstPtr += 3;
+								availVerts -= 3;
+								emittedVerts += 3;
+							}
+							else
+							{
+								if(emittedVerts != 0)
+								{
+									m_draw->AdvanceVertices(emittedVerts);
+									emittedVerts = 0;
+								}
+								if(emittedAny)
+								{
+									m_draw->UpdateDrawBounds(minX, minY);
+									m_draw->UpdateDrawBounds(maxX, maxY);
+									minX = minY = 3.402823466e+38f;
+									maxX = maxY = -3.402823466e+38f;
+									emittedAny = false;
+									prevKicked = false;
+								}
+								dst = m_draw->ReserveVertices(3);
+								dstPtr = m_draw->GetCurrentVertexPtr();
+								availVerts = m_draw->GetRemainingVertices();
+							}
+							if(!prevKicked)
+							{
+								if(v0.x < minX) minX = v0.x;
+								if(v0.y < minY) minY = v0.y;
+								if(v0.x > maxX) maxX = v0.x;
+								if(v0.y > maxY) maxY = v0.y;
+								if(v1.x < minX) minX = v1.x;
+								if(v1.y < minY) minY = v1.y;
+								if(v1.x > maxX) maxX = v1.x;
+								if(v1.y > maxY) maxY = v1.y;
+							}
+							if(vx < minX) minX = vx;
+							if(vy < minY) minY = vy;
+							if(vx > maxX) maxX = vx;
+							if(vy > maxY) maxY = vy;
+							emittedAny = true;
+							prevKicked = true;
+
+							if constexpr(kFlat)
+							{
+								GSH_Vulkan::CDraw::PRIM_VERTEX f0 = v0;
+								GSH_Vulkan::CDraw::PRIM_VERTEX f1 = v1;
+								f0.color = vcolor;
+								f1.color = vcolor;
+								dst[0] = f0;
+								dst[1] = f1;
+								dst[2] = v;
+							}
+							else
+							{
+								dst[0] = v0;
+								dst[1] = v1;
+								dst[2] = v;
+							}
+						}
+						else
+						{
+							prevKicked = false;
+						}
+						v0 = v1;
+						v1 = v;
+						vtxCount = 1;
+						write++;
+						continue;
+					}
+					if(reg == GS_REG_PRIM)
+					{
+						uint64 nextMode = ((m_nReg[GS_REG_PRMODECONT] & 1) != 0) ? data : m_nReg[GS_REG_PRMODE];
+						if(((data & 0x07) == PRIM_TRIANGLESTRIP) && (nextMode == m_lastPrimitiveMode))
+						{
+							m_nReg[GS_REG_PRIM] = data;
+							haveVerts = 0;
+							vtxCount = 3;
+							prevKicked = false;
+							write++;
+							continue;
+						}
+					}
+					if(reg == GS_REG_UV)
+					{
+						curUV = data;
+						write++;
+						continue;
+					}
+					if(reg == GS_REG_FOG)
+					{
+						curFog = data;
+						write++;
+						continue;
+					}
+					break;
+				}
+
+				if(emittedVerts != 0)
+				{
+					m_draw->AdvanceVertices(emittedVerts);
+				}
+				m_nReg[GS_REG_ST] = curST;
+				m_nReg[GS_REG_RGBAQ] = curRGBAQ;
+				m_nReg[GS_REG_UV] = curUV;
+				m_nReg[GS_REG_FOG] = curFog;
+				m_stripVerts[0] = v0;
+				m_stripVerts[1] = v1;
+				m_stripHaveVerts = haveVerts;
+				m_vtxCount = vtxCount;
+				if(emittedAny)
+				{
+					m_draw->UpdateDrawBounds(minX, minY);
+					m_draw->UpdateDrawBounds(maxX, maxY);
+				}
+			};
+
+			if(hasTex && !useUV && !flatShading)
+			{
+				if(hasFog)
+					runStripLoop(std::true_type{}, std::false_type{}, std::true_type{}, std::false_type{});
+				else
+					runStripLoop(std::true_type{}, std::false_type{}, std::false_type{}, std::false_type{});
+			}
+			else if(!hasTex && !flatShading)
+			{
+				if(hasFog)
+					runStripLoop(std::false_type{}, std::false_type{}, std::true_type{}, std::false_type{});
+				else
+					runStripLoop(std::false_type{}, std::false_type{}, std::false_type{}, std::false_type{});
+			}
+			else
+			{
+				if(hasTex)
+				{
+					if(useUV)
+					{
+						if(hasFog)
+							flatShading ? runStripLoop(std::true_type{}, std::true_type{}, std::true_type{}, std::true_type{})
+							            : runStripLoop(std::true_type{}, std::true_type{}, std::true_type{}, std::false_type{});
+						else
+							flatShading ? runStripLoop(std::true_type{}, std::true_type{}, std::false_type{}, std::true_type{})
+							            : runStripLoop(std::true_type{}, std::true_type{}, std::false_type{}, std::false_type{});
+					}
+					else
+					{
+						if(hasFog)
+							runStripLoop(std::true_type{}, std::false_type{}, std::true_type{}, std::true_type{});
+						else
+							runStripLoop(std::true_type{}, std::false_type{}, std::false_type{}, std::true_type{});
+					}
+				}
+				else
+				{
+					if(hasFog)
+						runStripLoop(std::false_type{}, std::false_type{}, std::true_type{}, std::true_type{});
+					else
+						runStripLoop(std::false_type{}, std::false_type{}, std::false_type{}, std::true_type{});
+				}
+			}
+			if(write == writeEnd) break;
+		}
+
+		uint8 reg = write->first;
+		uint64 data = write->second;
+		write++;
+		if(m_xferBuffer.empty())
+		{
+			switch(reg)
+			{
+			case GS_REG_ST:
+			case GS_REG_RGBAQ:
+			case GS_REG_UV:
+			case GS_REG_FOG:
+				m_nReg[reg] = data;
+				continue;
+			case GS_REG_XYZ2:
+			case GS_REG_XYZ3:
+			case GS_REG_XYZF2:
+			case GS_REG_XYZF3:
+				m_nReg[reg] = data;
+				VertexKick(reg, data);
+				continue;
+			default:
+				break;
+			}
+		}
+		WriteRegisterImpl(reg, data);
+	}
+#ifdef _DEBUG
+	assert(m_transferCount != 0);
+	m_transferCount--;
+#endif
+}
 
 void CGSH_Vulkan::WriteRegisterImpl(uint8 registerId, uint64 data)
 {
@@ -1445,24 +2615,59 @@ void CGSH_Vulkan::WriteRegisterImpl(uint8 registerId, uint64 data)
 		m_pendingPrimValue = data;
 		break;
 
+	case GS_REG_ST:
+	case GS_REG_RGBAQ:
+	case GS_REG_UV:
+	case GS_REG_FOG:
+		break;
+
 	case GS_REG_XYZ2:
 	case GS_REG_XYZ3:
 	case GS_REG_XYZF2:
 	case GS_REG_XYZF3:
 		VertexKick(registerId, data);
 		break;
+
+	default:
+		m_renderContextDirty = true;
+		break;
 	}
 }
 
 void CGSH_Vulkan::ProcessHostToLocalTransfer()
 {
-	//Flush previous cached info
-	ClearClutCache();
-	m_draw->FlushRenderPass();
+	const uint8* xferData = m_xferDirectData ? m_xferDirectData : m_xferBuffer.data();
+	const uint32 xferSize = m_xferDirectData ? m_xferDirectSize : static_cast<uint32>(m_xferBuffer.size());
+
+	if(m_statsEnabled)
+	{
+		m_statsHostXfers++;
+		m_statsHostXferBytes += xferSize;
+	}
 
 	auto bltBuf = make_convertible<BITBLTBUF>(m_nReg[GS_REG_BITBLTBUF]);
 	auto trxReg = make_convertible<TRXREG>(m_nReg[GS_REG_TRXREG]);
 	auto trxPos = make_convertible<TRXPOS>(m_nReg[GS_REG_TRXPOS]);
+
+	uint32 xferDstAddr = 0;
+	uint32 xferDstSize = RAMSIZE;
+	if((trxReg.nRRW != 0) && (trxReg.nRRH != 0))
+	{
+		auto [dstAddress, dstSize] = GsTransfer::GetDstRange(bltBuf, trxReg, trxPos);
+		xferDstAddr = dstAddress;
+		xferDstSize = dstSize;
+		InvalidateClutCacheRange(dstAddress, dstSize);
+		if(!m_draw->CanHostTransferDuringPass(dstAddress, dstSize))
+		{
+			m_draw->FlushRenderPass();
+		}
+		m_draw->SyncMemoryForWrite(dstAddress, dstSize);
+	}
+	else
+	{
+		ClearClutCache();
+		m_draw->FlushAllResidentMemory();
+	}
 
 	m_transferHost->Params.bufAddress = bltBuf.GetDstPtr();
 	m_transferHost->Params.bufWidth = bltBuf.GetDstWidth();
@@ -1474,8 +2679,10 @@ void CGSH_Vulkan::ProcessHostToLocalTransfer()
 	pipelineCaps.dstFormat = bltBuf.nDstPsm;
 
 	m_transferHost->SetPipelineCaps(pipelineCaps);
-	m_transferHost->DoTransfer(m_xferBuffer);
+	m_transferHost->DoTransfer(xferData, xferSize, xferDstAddr, xferDstSize);
 
+	m_xferDirectData = nullptr;
+	m_xferDirectSize = 0;
 	m_xferBuffer.clear();
 }
 
@@ -1484,7 +2691,9 @@ void CGSH_Vulkan::ProcessLocalToHostTransfer()
 	bool readsEnabled = CAppConfig::GetInstance().GetPreferenceBoolean(PREF_CGSHANDLER_GS_RAM_READS_ENABLED);
 	if(readsEnabled)
 	{
+		if(m_statsEnabled) m_statsReadbacks++;
 		m_draw->FlushRenderPass();
+		m_context->ResetHostXferBatch();
 
 		auto bltBuf = make_convertible<BITBLTBUF>(m_nReg[GS_REG_BITBLTBUF]);
 		auto trxReg = make_convertible<TRXREG>(m_nReg[GS_REG_TRXREG]);
@@ -1507,6 +2716,7 @@ void CGSH_Vulkan::ProcessLocalToHostTransfer()
 		{
 			copySize = RAMSIZE - copyBase;
 		}
+		m_draw->SyncMemoryForRead(copyBase, copySize);
 
 		auto& srcBuffer = m_context->memoryBuffer;
 		auto& dstBuffer = m_context->memoryBufferTransfer;
@@ -1548,9 +2758,10 @@ void CGSH_Vulkan::ProcessLocalToHostTransfer()
 
 void CGSH_Vulkan::ProcessLocalToLocalTransfer()
 {
+	if(m_statsEnabled) m_statsLocalXfers++;
 	//Flush previous cached info
 	ClearClutCache();
-	m_draw->FlushRenderPass();
+	m_draw->FlushAllResidentMemory();
 
 	auto bltBuf = make_convertible<BITBLTBUF>(m_nReg[GS_REG_BITBLTBUF]);
 	auto trxReg = make_convertible<TRXREG>(m_nReg[GS_REG_TRXREG]);
@@ -1612,15 +2823,30 @@ void CGSH_Vulkan::BeginTransferWrite()
 {
 	assert(m_xferBuffer.empty());
 	m_xferBuffer.clear();
+	m_xferDirectData = nullptr;
+	m_xferDirectSize = 0;
 }
 
 void CGSH_Vulkan::TransferWrite(const uint8* imageData, uint32 length)
 {
+	if(!m_xferDirectData && m_xferBuffer.empty() && (m_trxCtx.nSize == length))
+	{
+		m_xferDirectData = imageData;
+		m_xferDirectSize = length;
+		return;
+	}
+	if(m_xferDirectData)
+	{
+		m_xferBuffer.insert(m_xferBuffer.end(), m_xferDirectData, m_xferDirectData + m_xferDirectSize);
+		m_xferDirectData = nullptr;
+		m_xferDirectSize = 0;
+	}
 	m_xferBuffer.insert(m_xferBuffer.end(), imageData, imageData + length);
 }
 
 void CGSH_Vulkan::WriteBackMemoryCache()
 {
+	m_draw->InvalidateAllResidentMemory();
 	m_frameCommandBuffer->Flush();
 	m_context->device.vkQueueWaitIdle(m_context->queue);
 
@@ -1630,6 +2856,7 @@ void CGSH_Vulkan::WriteBackMemoryCache()
 
 void CGSH_Vulkan::SyncMemoryCache()
 {
+	m_draw->FlushAllResidentMemory();
 	m_frameCommandBuffer->Flush();
 	m_context->device.vkQueueWaitIdle(m_context->queue);
 
@@ -1669,8 +2896,11 @@ void CGSH_Vulkan::SyncCLUT(const TEX0& tex0)
 		uint32 clutSize = (tex0.nCSM == 0) ? (CGsPixelFormats::PAGESIZE * 2) : RAMSIZE;
 		if(!m_draw->CanLoadClutDuringPass(clutBufferOffset, clutAddress, clutSize))
 		{
+			if(m_statsEnabled) m_statsClutFlushes++;
 			m_draw->FlushRenderPass();
 		}
+		m_draw->SyncMemoryForRead(clutAddress, clutSize);
+		if(m_statsEnabled) m_statsClutLoads++;
 		m_clutLoad->DoClutLoad(clutBufferOffset, tex0, texClut);
 	}
 
@@ -1714,6 +2944,7 @@ bool CGSH_Vulkan::GetDepthTestingEnabled() const
 void CGSH_Vulkan::SetDepthTestingEnabled(bool depthTestingEnabled)
 {
 	m_depthTestingEnabled = depthTestingEnabled;
+	m_renderContextDirty = true;
 }
 
 bool CGSH_Vulkan::GetAlphaBlendingEnabled() const
@@ -1724,6 +2955,7 @@ bool CGSH_Vulkan::GetAlphaBlendingEnabled() const
 void CGSH_Vulkan::SetAlphaBlendingEnabled(bool alphaBlendingEnabled)
 {
 	m_alphaBlendingEnabled = alphaBlendingEnabled;
+	m_renderContextDirty = true;
 }
 
 bool CGSH_Vulkan::GetAlphaTestingEnabled() const
@@ -1734,6 +2966,7 @@ bool CGSH_Vulkan::GetAlphaTestingEnabled() const
 void CGSH_Vulkan::SetAlphaTestingEnabled(bool alphaTestingEnabled)
 {
 	m_alphaTestingEnabled = alphaTestingEnabled;
+	m_renderContextDirty = true;
 }
 
 Framework::CBitmap CGSH_Vulkan::GetFramebuffer(uint64 frameReg)

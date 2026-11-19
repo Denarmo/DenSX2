@@ -28,6 +28,9 @@ public:
 	//The device the GS needs on this physical device (queue family 0). Swapchain support is
 	//only asked for with a surface.
 	static Framework::Vulkan::CDevice CreateDeviceObject(const Framework::Vulkan::CInstance&, VkPhysicalDevice, bool withSwapchain);
+	static void Query8And16BitStorage(const Framework::Vulkan::CInstance&, VkPhysicalDevice, bool& has8BitStorage, bool& has16BitStorage, bool* hasUniform8 = nullptr, bool* hasUniform16 = nullptr, uint32* diagMask = nullptr);
+	static void SetStatsPath(std::string);
+	static void SetPipelineCachePath(std::string);
 
 	void SetPresentationParams(const CGSHandler::PRESENTATION_PARAMS&) override;
 
@@ -59,6 +62,7 @@ public:
 
 protected:
 	void WriteRegisterImpl(uint8, uint64) override;
+	void SubmitWriteBufferImpl(const RegisterWrite*, const RegisterWrite*) override;
 	void InitializeImpl() override;
 	void ReleaseImpl() override;
 	void ResetImpl() override;
@@ -171,6 +175,7 @@ private:
 
 	int32 FindCachedClut(const CLUTKEY&) const;
 	void ClearClutCache();
+	void InvalidateClutCacheRange(uint32, uint32);
 	void CheckSpriteCachedClutInvalidation(const CGsSpriteRect&);
 	static CLUTKEY MakeCachedClutKey(const TEX0&, const TEXCLUT&);
 
@@ -251,6 +256,9 @@ private:
 	//Draw context
 	VERTEX m_vtxBuffer[3];
 	uint32 m_vtxCount = 0;
+	GSH_Vulkan::CDraw::PRIM_VERTEX m_stripVerts[2] = {};
+	uint32 m_stripHaveVerts = 0;
+	bool m_stripFastActive = false;
 	bool m_pendingPrim = false;
 	uint64 m_pendingPrimValue = 0;
 	uint32 m_primitiveType = 0;
@@ -261,11 +269,15 @@ private:
 	float m_primOfsY = 0;
 	uint32 m_texWidth = 0;
 	uint32 m_texHeight = 0;
+	float m_invTexWidth = 1.0f;
+	float m_invTexHeight = 1.0f;
 	CLUTKEY m_clutStates[CLUT_CACHE_SIZE];
 	uint32 m_nextClutCacheIndex = 0;
 	uint32 m_lastClutFillCacheIndex = -1;
 	uint32 m_lastClutFillPointer = 0;
 	std::vector<uint8> m_xferBuffer;
+	const uint8* m_xferDirectData = nullptr;
+	uint32 m_xferDirectSize = 0;
 	std::map<uint64, LOCAL_TO_HOST_XFER_HISTORY> m_xferHistory;
 
 	//Optimization for Virtua Fighter 2, Sega Rally 95
@@ -286,4 +298,28 @@ private:
 	Framework::Vulkan::CImage m_swizzleTablePSMZ32;
 	Framework::Vulkan::CImage m_swizzleTablePSMZ16;
 	Framework::Vulkan::CImage m_swizzleTablePSMZ16S;
+
+	void SavePipelineCache();
+
+	static std::string m_statsPath;
+	static std::string m_pipelineCachePath;
+	std::string m_devicePipelineCachePath;
+	uint32 m_pipelineCacheSaveFrames = 0;
+	size_t m_pipelineCacheSavedSize = 0;
+	bool m_renderContextDirty = true;
+	uint64 m_lastPrimitiveMode = ~0ULL;
+	bool m_statsEnabled = false;
+	uint32 m_statsFrames = 0;
+	uint64 m_statsWindowStartNs = 0;
+	uint64 m_statsFenceWaitNs = 0;
+	uint32 m_statsHostXfers = 0;
+	uint64 m_statsHostXferBytes = 0;
+	uint32 m_statsLocalXfers = 0;
+	uint32 m_statsReadbacks = 0;
+	uint32 m_statsClutLoads = 0;
+	uint32 m_statsClutFlushes = 0;
+	uint32 m_statsClutClears = 0;
+	uint32 m_statsCmdFlushes = 0;
+	uint32 m_statsAlphaIdentity = 0;
+	GSH_Vulkan::CDraw::STATS m_statsDrawAcc;
 };

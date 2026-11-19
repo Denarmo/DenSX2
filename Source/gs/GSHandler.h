@@ -1,6 +1,8 @@
 #pragma once
 
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <vector>
 #include <functional>
 #include <atomic>
@@ -860,7 +862,17 @@ public:
 	{
 		assert(m_writeBufferSize < REGISTERWRITEBUFFER_SIZE);
 		if(m_writeBufferSize == REGISTERWRITEBUFFER_SIZE) return;
+		if(write.first >= GS_REG_SIGNAL) m_writeBufferHasSpecial = true;
 		m_currentWriteBuffer[m_writeBufferSize++] = write;
+	}
+
+	inline RegisterWrite* ReserveWriteBuffer(uint32 count, bool hasSpecial = false)
+	{
+		if((m_writeBufferSize + count) > REGISTERWRITEBUFFER_SIZE) return nullptr;
+		if(hasSpecial) m_writeBufferHasSpecial = true;
+		RegisterWrite* dst = m_currentWriteBuffer + m_writeBufferSize;
+		m_writeBufferSize += count;
+		return dst;
 	}
 
 	void ProcessWriteBuffer(const CGsPacketMetadata*);
@@ -902,6 +914,16 @@ public:
 
 	void SendGSCall(CMailBox::FunctionType&&);
 	void SendGSCall(const CMailBox::FunctionType&, bool = false, bool = false);
+	template <typename F, typename std::enable_if<
+	                          !std::is_same<typename std::decay<F>::type, CMailBox::FunctionType>::value &&
+	                          std::is_trivially_copyable<typename std::decay<F>::type>::value &&
+	                          (sizeof(typename std::decay<F>::type) <= 48) &&
+	                          (alignof(typename std::decay<F>::type) <= 8),
+	                          int>::type = 0>
+	void SendGSCall(F&& fn)
+	{
+		m_mailBox.SendCall(std::forward<F>(fn));
+	}
 
 	void ProcessSingleFrame();
 	//Runs one queued call, if any, on a GS that is not threaded.
@@ -920,7 +942,7 @@ protected:
 	enum
 	{
 		REGISTERWRITEBUFFER_SIZE = 0x140000,
-		REGISTERWRITEBUFFER_SUBMIT_THRESHOLD = 0x100
+		REGISTERWRITEBUFFER_SUBMIT_THRESHOLD = 0x1000
 	};
 
 	enum LOD_CALC
@@ -1048,7 +1070,7 @@ protected:
 	virtual void WriteRegisterImpl(uint8, uint64);
 	void FeedImageDataImpl(const uint8*, uint32);
 	void ReadImageDataImpl(void*, uint32);
-	void SubmitWriteBufferImpl(const RegisterWrite*, const RegisterWrite*);
+	virtual void SubmitWriteBufferImpl(const RegisterWrite*, const RegisterWrite*);
 
 	void UpdateFrameDumpState();
 
@@ -1122,13 +1144,18 @@ protected:
 	uint32 m_drawCallCount = 0;
 
 	static constexpr int MAX_INFLIGHT_FRAMES = 2;
+	static constexpr uint32 IMAGEBUFFER_SIZE = 6 * 1024 * 1024;
 	RegisterWrite* m_writeBuffers[MAX_INFLIGHT_FRAMES] = {};
+	uint8* m_imageBuffers[MAX_INFLIGHT_FRAMES] = {};
 
 	RegisterWrite* m_currentWriteBuffer = nullptr;
+	uint8* m_currentImageBuffer = nullptr;
+	uint32 m_imageBufferOffset = 0;
 	uint32 m_writeBufferIndex = 0;
 	uint32 m_writeBufferSize = 0;
 	uint32 m_writeBufferProcessIndex = 0;
 	uint32 m_writeBufferSubmitIndex = 0;
+	bool m_writeBufferHasSpecial = false;
 
 	CRT_MODE m_crtMode;
 	std::thread m_thread;
@@ -1137,6 +1164,8 @@ protected:
 	std::atomic<int> m_transferCount;
 #endif
 	std::atomic<int> m_framesInFlight;
+	std::mutex m_frameDoneMutex;
+	std::condition_variable m_frameDoneCond;
 	bool m_threadDone = false;
 	std::unique_ptr<CFrameDump> m_frameDump;
 	FrameDumpCallback m_frameDumpCallback;

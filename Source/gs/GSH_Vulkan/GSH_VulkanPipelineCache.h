@@ -10,6 +10,7 @@ namespace GSH_Vulkan
 		VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
 		VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
 		VkPipeline pipeline = VK_NULL_HANDLE;
+		bool ownsLayouts = true;
 	};
 
 	template <typename KeyType>
@@ -27,8 +28,11 @@ namespace GSH_Vulkan
 			{
 				auto& pipeline = pipelinePair.second;
 				m_device->vkDestroyPipeline(*m_device, pipeline.pipeline, nullptr);
-				m_device->vkDestroyPipelineLayout(*m_device, pipeline.pipelineLayout, nullptr);
-				m_device->vkDestroyDescriptorSetLayout(*m_device, pipeline.descriptorSetLayout, nullptr);
+				if(pipeline.ownsLayouts)
+				{
+					m_device->vkDestroyPipelineLayout(*m_device, pipeline.pipelineLayout, nullptr);
+					m_device->vkDestroyDescriptorSetLayout(*m_device, pipeline.descriptorSetLayout, nullptr);
+				}
 			}
 		}
 

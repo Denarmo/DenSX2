@@ -16,8 +16,6 @@ using namespace GSH_Vulkan;
 #define VERTEX_ATTRIB_LOCATION_TEXCOORD 3
 #define VERTEX_ATTRIB_LOCATION_FOG 4
 
-#define MAX_VERTEX_COUNT 1024 * 512
-
 CDraw::CDraw(const ContextPtr& context, const FrameCommandBufferPtr& frameCommandBuffer)
     : m_context(context)
     , m_frameCommandBuffer(frameCommandBuffer)
@@ -44,6 +42,8 @@ CDraw::CDraw(const ContextPtr& context, const FrameCommandBufferPtr& frameComman
 		CHECKVULKANERROR(result);
 	}
 
+	m_curVertexBufferPtr = m_frames[m_frameCommandBuffer->GetCurrentFrame()].vertexBufferPtr;
+	m_mipParamsCpuCache.resize(MAX_MIPPARAMS_COUNT);
 	m_pipelineCaps <<= 0;
 }
 
@@ -114,22 +114,40 @@ void CDraw::SetTextureParams(uint32 bufAddr, uint32 bufWidth, uint32 width, uint
 void CDraw::SetMipParams(const MipBufs& mipBufs, uint32 maxMip, float lodK, uint32 lodL)
 {
 	assert(m_pipelineCaps.textureUseDynamicMipLOD);
-	//Assume it's always dirty, check for changes should be done by caller
+	if((m_mipParamsIndex > 0 || m_mipParamsSlot0Valid) &&
+	   (m_lastMipParams.maxMip == maxMip) &&
+	   (m_lastMipParams.lodK == lodK) &&
+	   (m_lastMipParams.lodL == lodL) &&
+	   (m_lastMipParams.mipBufs == mipBufs))
+	{
+		return;
+	}
 	FlushVertices();
+	if((m_mipParamsIndex + 1) >= MAX_MIPPARAMS_COUNT)
+	{
+		m_frameCommandBuffer->Flush();
+	}
 	auto& frame = m_frames[m_frameCommandBuffer->GetCurrentFrame()];
 	m_mipParamsIndex++;
 	assert(m_mipParamsIndex < MAX_MIPPARAMS_COUNT);
 	if(m_mipParamsIndex < MAX_MIPPARAMS_COUNT)
 	{
-		auto mipParamsUniforms = frame.mipParamsBufferPtr + m_mipParamsIndex;
-		mipParamsUniforms->mipBufs = mipBufs;
-		mipParamsUniforms->maxMip = maxMip;
-		mipParamsUniforms->lodK = lodK;
-		mipParamsUniforms->lodL = lodL;
+		auto& cached = m_mipParamsCpuCache[m_mipParamsIndex];
+		cached.mipBufs = mipBufs;
+		cached.maxMip = maxMip;
+		cached.lodK = lodK;
+		cached.lodL = lodL;
+		frame.mipParamsBufferPtr[m_mipParamsIndex] = cached;
+		m_lastMipParams = cached;
 	}
 }
 
 bool CDraw::CanLoadClutDuringPass(uint32, uint32, uint32)
+{
+	return false;
+}
+
+bool CDraw::CanHostTransferDuringPass(uint32, uint32)
 {
 	return false;
 }
@@ -256,6 +274,13 @@ void CDraw::AddVertices(const PRIM_VERTEX* vertexBeginPtr, const PRIM_VERTEX* ve
 			m_memoryCopyRegion.Insert(rect);
 		}
 	}
+	for(const PRIM_VERTEX* v = vertexBeginPtr; v != vertexEndPtr; v++)
+	{
+		if(v->x < m_curDrawMinX) m_curDrawMinX = v->x;
+		if(v->y < m_curDrawMinY) m_curDrawMinY = v->y;
+		if(v->x > m_curDrawMaxX) m_curDrawMaxX = v->x;
+		if(v->y > m_curDrawMaxY) m_curDrawMaxY = v->y;
+	}
 	auto& frame = m_frames[m_frameCommandBuffer->GetCurrentFrame()];
 	memcpy(frame.vertexBufferPtr + m_passVertexEnd, vertexBeginPtr, amount * sizeof(PRIM_VERTEX));
 	m_passVertexEnd += amount;
@@ -268,8 +293,13 @@ void CDraw::PreFlushFrameCommandBuffer()
 
 void CDraw::PostFlushFrameCommandBuffer()
 {
+	//EndFrame increments m_currentFrame immediately after PostFlushFrameCommandBuffer().
+	m_curVertexBufferPtr = m_frames[(m_frameCommandBuffer->GetCurrentFrame() + 1) % MAX_FRAMES].vertexBufferPtr;
 	m_passVertexStart = m_passVertexEnd = 0;
+	m_curDrawMinX = m_curDrawMinY = 3.402823466e+38f;
+	m_curDrawMaxX = m_curDrawMaxY = -3.402823466e+38f;
 	m_mipParamsIndex = 0;
+	m_mipParamsSlot0Valid = false;
 }
 
 std::vector<VkVertexInputAttributeDescription> CDraw::GetVertexAttributes()
@@ -342,13 +372,14 @@ Framework::Vulkan::CShaderModule CDraw::CreateVertexShader(const PIPELINE_CAPS& 
 		auto outputFog = CFloat4Lvalue(b.CreateOutput(Nuanceur::SEMANTIC_TEXCOORD, 4));
 
 		auto position = ((inputPosition->xy() + NewFloat2(b, 0.5f, 0.5f)) * NewFloat2(b, 2.f / DRAW_AREA_SIZE, 2.f / DRAW_AREA_SIZE) + NewFloat2(b, -1, -1));
+		auto depth = ToFloat(inputDepth) / NewFloat4(b, DEPTH_MAX, DEPTH_MAX, DEPTH_MAX, DEPTH_MAX);
 
-		outputPosition = NewFloat4(position, NewFloat2(b, 0.f, 1.f));
+		outputPosition = NewFloat4(position, NewFloat2(depth->x(), NewFloat(b, 1.f)));
 		if(caps.primitiveType == PIPELINE_PRIMITIVE_POINT)
 		{
 			outputPointSize = NewFloat(b, 1.0f);
 		}
-		outputDepth = ToFloat(inputDepth) / NewFloat4(b, DEPTH_MAX, DEPTH_MAX, DEPTH_MAX, DEPTH_MAX);
+		outputDepth = depth->xyzw();
 		outputColor = inputColor->xyzw();
 		outputTexCoord = inputTexCoord->xyzw();
 		outputFog = inputFog->xyzw();

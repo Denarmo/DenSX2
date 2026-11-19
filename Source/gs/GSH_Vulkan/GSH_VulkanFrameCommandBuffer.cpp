@@ -1,5 +1,6 @@
 #include "GSH_VulkanFrameCommandBuffer.h"
 #include "vulkan/StructDefs.h"
+#include <chrono>
 
 using namespace GSH_Vulkan;
 
@@ -40,13 +41,15 @@ void CFrameCommandBuffer::BeginFrame()
 
 	auto result = VK_SUCCESS;
 
+	auto waitStart = std::chrono::steady_clock::now();
 	result = m_context->device.vkWaitForFences(m_context->device, 1, &frame.execCompleteFence, VK_TRUE, UINT64_MAX);
 	CHECKVULKANERROR(result);
+	m_fenceWaitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count();
 
 	result = m_context->device.vkResetFences(m_context->device, 1, &frame.execCompleteFence);
 	CHECKVULKANERROR(result);
 
-	result = m_context->device.vkResetCommandBuffer(frame.commandBuffer, VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
+	result = m_context->device.vkResetCommandBuffer(frame.commandBuffer, 0);
 	CHECKVULKANERROR(result);
 
 	auto commandBufferBeginInfo = Framework::Vulkan::CommandBufferBeginInfo();
@@ -101,6 +104,13 @@ uint32 CFrameCommandBuffer::GetFlushCount() const
 void CFrameCommandBuffer::ResetFlushCount()
 {
 	m_flushCount = 0;
+}
+
+uint64 CFrameCommandBuffer::TakeFenceWaitNs()
+{
+	uint64 value = m_fenceWaitNs;
+	m_fenceWaitNs = 0;
+	return value;
 }
 
 VkCommandBuffer CFrameCommandBuffer::GetCommandBuffer()

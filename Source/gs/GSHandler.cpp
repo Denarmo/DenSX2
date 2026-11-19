@@ -12,6 +12,7 @@
 #include "GsPixelFormats.h"
 #include "string_format.h"
 #include "ThreadUtils.h"
+#include "../ThreadAffinity.h"
 
 //Shadow Hearts 2 looks for this specific value
 #define GS_REVISION (7)
@@ -74,6 +75,7 @@ CGSHandler::CGSHandler(bool gsThreaded)
 	for(int i = 0; i < MAX_INFLIGHT_FRAMES; i++)
 	{
 		m_writeBuffers[i] = new RegisterWrite[REGISTERWRITEBUFFER_SIZE];
+		m_imageBuffers[i] = new uint8[IMAGEBUFFER_SIZE];
 	}
 
 	for(int i = 0; i < PSM_MAX; i++)
@@ -122,6 +124,7 @@ CGSHandler::~CGSHandler()
 	for(int i = 0; i < MAX_INFLIGHT_FRAMES; i++)
 	{
 		delete[] m_writeBuffers[i];
+		delete[] m_imageBuffers[i];
 	}
 }
 
@@ -178,8 +181,11 @@ void CGSHandler::ResetBase()
 	m_writeBufferSize = 0;
 	m_writeBufferProcessIndex = 0;
 	m_writeBufferSubmitIndex = 0;
+	m_writeBufferHasSpecial = false;
 	m_writeBufferIndex = 0;
 	m_currentWriteBuffer = m_writeBuffers[m_writeBufferIndex];
+	m_currentImageBuffer = m_imageBuffers[m_writeBufferIndex];
+	m_imageBufferOffset = 0;
 }
 
 void CGSHandler::ResetImpl()
@@ -394,6 +400,11 @@ void CGSHandler::SetDrawEnabled(bool drawEnabled)
 
 void CGSHandler::SetHBlank()
 {
+	//Fast path: HSYNC bit already latched and HSYNC IRQ masked off (common case, avoids 15k mutex locks/sec).
+	if(((m_nCSR & CSR_HSYNC_INT) != 0) && (((~m_nIMR >> 8) & CSR_HSYNC_INT) == 0))
+	{
+		return;
+	}
 	std::lock_guard registerMutexLock(m_registerMutex);
 	m_nCSR |= CSR_HSYNC_INT;
 	NotifyEvent(CSR_HSYNC_INT);
@@ -552,14 +563,39 @@ void CGSHandler::Finish(bool forceWait)
 {
 	FlushWriteBuffer();
 	SendGSCall(std::bind(&CGSHandler::MarkNewFrame, this));
-	bool wait = (++m_framesInFlight == MAX_INFLIGHT_FRAMES);
-	wait |= forceWait;
-	SendGSCall(
-	    [this]() {
-		    assert(m_framesInFlight != 0);
-		    m_framesInFlight--;
-	    },
-	    wait, wait);
+	++m_framesInFlight;
+	if(forceWait)
+	{
+		SendGSCall(
+		    [this]() {
+			    {
+				    std::lock_guard lk(m_frameDoneMutex);
+				    assert(m_framesInFlight != 0);
+				    m_framesInFlight--;
+			    }
+			    m_frameDoneCond.notify_one();
+		    },
+		    true, true);
+	}
+	else
+	{
+		SendGSCall(
+		    [this]() {
+			    {
+				    std::lock_guard lk(m_frameDoneMutex);
+				    assert(m_framesInFlight != 0);
+				    m_framesInFlight--;
+			    }
+			    m_frameDoneCond.notify_one();
+		    });
+		//Wait only until the oldest in-flight frame finishes so its write/image buffer is free
+		//for the next frame, keeping PS2VM Thread and GS Thread fully overlapped.
+		if(m_framesInFlight.load(std::memory_order_acquire) >= MAX_INFLIGHT_FRAMES)
+		{
+			std::unique_lock lk(m_frameDoneMutex);
+			m_frameDoneCond.wait(lk, [this]() { return m_framesInFlight.load(std::memory_order_acquire) < MAX_INFLIGHT_FRAMES; });
+		}
+	}
 }
 
 void CGSHandler::Flip(uint32 flags)
@@ -628,29 +664,77 @@ uint64 CGSHandler::GetBUSDIR() const
 void CGSHandler::FeedImageData(const void* data, uint32 length)
 {
 	assert(m_writeBufferProcessIndex == m_writeBufferSize);
-	SubmitWriteBuffer();
+
+	const RegisterWrite* bufferStart = nullptr;
+	const RegisterWrite* bufferEnd = nullptr;
+	if(m_writeBufferSubmitIndex != m_writeBufferSize)
+	{
+#ifdef _DEBUG
+		m_transferCount++;
+#endif
+		bufferStart = m_currentWriteBuffer + m_writeBufferSubmitIndex;
+		bufferEnd = m_currentWriteBuffer + m_writeBufferSize;
+		m_writeBufferSubmitIndex = m_writeBufferSize;
+	}
 
 #ifdef _DEBUG
 	m_transferCount++;
 #endif
 
+	struct alignas(16) IMAGE_PACKET_HEADER
+	{
+		const RegisterWrite* bufferStart;
+		const RegisterWrite* bufferEnd;
+		uint32 length;
+		uint32 heapAllocated;
+	};
+	static_assert(sizeof(IMAGE_PACKET_HEADER) == 32, "IMAGE_PACKET_HEADER must be 32 bytes.");
+
 	//Allocate 0x10 more bytes to allow transfer handlers
 	//to read beyond the actual length of the buffer (ie.: PSMCT24)
-
-	uint8* imageData = new uint8[length + 0x10];
+	uint32 allocSize = (static_cast<uint32>(sizeof(IMAGE_PACKET_HEADER)) + length + 0x10 + 0xF) & ~0xFU;
+	uint8* rawBuf = nullptr;
+	bool heapAllocated = false;
+	if((allocSize <= IMAGEBUFFER_SIZE) && (m_imageBufferOffset + allocSize <= IMAGEBUFFER_SIZE))
+	{
+		rawBuf = m_currentImageBuffer + m_imageBufferOffset;
+		m_imageBufferOffset += allocSize;
+	}
+	else
+	{
+		rawBuf = new uint8[sizeof(IMAGE_PACKET_HEADER) + length + 0x10];
+		heapAllocated = true;
+	}
+	auto* pkt = reinterpret_cast<IMAGE_PACKET_HEADER*>(rawBuf);
+	pkt->bufferStart = bufferStart;
+	pkt->bufferEnd = bufferEnd;
+	pkt->length = length;
+	pkt->heapAllocated = heapAllocated ? 1U : 0U;
+	uint8* imageData = rawBuf + sizeof(IMAGE_PACKET_HEADER);
 	memcpy(imageData, data, length);
 	memset(imageData + length, 0, 0x10);
 
+	//Keep lambda capture at 16 bytes so std::function uses small-buffer optimization without heap alloc.
 	SendGSCall(
-	    [this, imageData, length]() {
+	    [this, pkt]() {
+		    if(pkt->bufferStart != pkt->bufferEnd)
+		    {
+			    SubmitWriteBufferImpl(pkt->bufferStart, pkt->bufferEnd);
+		    }
+		    const uint8* imgData = reinterpret_cast<const uint8*>(pkt) + sizeof(IMAGE_PACKET_HEADER);
+		    uint32 imgLen = pkt->length;
+		    bool isHeap = (pkt->heapAllocated != 0);
 #ifdef DEBUGGER_INCLUDED
 		    if(m_frameDump)
 		    {
-			    m_frameDump->AddImagePacket(imageData, length);
+			    m_frameDump->AddImagePacket(imgData, imgLen);
 		    }
 #endif
-		    FeedImageDataImpl(imageData, length);
-		    delete[] imageData;
+		    FeedImageDataImpl(imgData, imgLen);
+		    if(isHeap)
+		    {
+			    delete[] reinterpret_cast<uint8*>(pkt);
+		    }
 	    });
 }
 
@@ -680,37 +764,50 @@ void CGSHandler::ProcessWriteBuffer(const CGsPacketMetadata* metadata)
 		    });
 	}
 #endif
-	for(uint32 writeIndex = m_writeBufferProcessIndex; writeIndex < m_writeBufferSize; writeIndex++)
+	if(m_writeBufferHasSpecial)
 	{
-		const auto& write = m_currentWriteBuffer[writeIndex];
-		switch(write.first)
+		for(uint32 writeIndex = m_writeBufferProcessIndex; writeIndex < m_writeBufferSize; writeIndex++)
 		{
-		case GS_REG_SIGNAL:
-		{
-			auto signal = make_convertible<SIGNAL>(write.second);
-			auto siglblid = make_convertible<SIGLBLID>(m_nSIGLBLID);
-			siglblid.sigid &= ~signal.idmsk;
-			siglblid.sigid |= signal.id;
-			m_nSIGLBLID = siglblid;
-			assert((m_nCSR & CSR_SIGNAL_EVENT) == 0);
-			m_nCSR |= CSR_SIGNAL_EVENT;
-			NotifyEvent(CSR_SIGNAL_EVENT);
-		}
-		break;
-		case GS_REG_FINISH:
-			m_nCSR |= CSR_FINISH_EVENT;
-			NotifyEvent(CSR_FINISH_EVENT);
+			const auto& write = m_currentWriteBuffer[writeIndex];
+			switch(write.first)
+			{
+			case GS_REG_SIGNAL:
+			{
+				auto signal = make_convertible<SIGNAL>(write.second);
+				{
+					std::lock_guard registerMutexLock(m_registerMutex);
+					auto siglblid = make_convertible<SIGLBLID>(m_nSIGLBLID);
+					siglblid.sigid &= ~signal.idmsk;
+					siglblid.sigid |= signal.id;
+					m_nSIGLBLID = siglblid;
+					assert((m_nCSR & CSR_SIGNAL_EVENT) == 0);
+					m_nCSR |= CSR_SIGNAL_EVENT;
+				}
+				NotifyEvent(CSR_SIGNAL_EVENT);
+			}
 			break;
-		case GS_REG_LABEL:
-		{
-			auto label = make_convertible<LABEL>(write.second);
-			auto siglblid = make_convertible<SIGLBLID>(m_nSIGLBLID);
-			siglblid.lblid &= ~label.idmsk;
-			siglblid.lblid |= label.id;
-			m_nSIGLBLID = siglblid;
+			case GS_REG_FINISH:
+			{
+				{
+					std::lock_guard registerMutexLock(m_registerMutex);
+					m_nCSR |= CSR_FINISH_EVENT;
+				}
+				NotifyEvent(CSR_FINISH_EVENT);
+			}
+			break;
+			case GS_REG_LABEL:
+			{
+				auto label = make_convertible<LABEL>(write.second);
+				std::lock_guard registerMutexLock(m_registerMutex);
+				auto siglblid = make_convertible<SIGLBLID>(m_nSIGLBLID);
+				siglblid.lblid &= ~label.idmsk;
+				siglblid.lblid |= label.id;
+				m_nSIGLBLID = siglblid;
+			}
+			break;
+			}
 		}
-		break;
-		}
+		m_writeBufferHasSpecial = false;
 	}
 	m_writeBufferProcessIndex = m_writeBufferSize;
 	uint32 submitPending = m_writeBufferProcessIndex - m_writeBufferSubmitIndex;
@@ -729,12 +826,18 @@ void CGSHandler::SubmitWriteBuffer()
 	m_transferCount++;
 #endif
 
-	auto bufferStart = m_currentWriteBuffer + m_writeBufferSubmitIndex;
-	auto bufferEnd = m_currentWriteBuffer + m_writeBufferSize;
+	//Pack (bufIdx, startIdx, count) into 64 bits so [this, packed] is 16 bytes (libc++ std::function SBO, zero heap allocs).
+	uint64 packed = (static_cast<uint64>(m_writeBufferIndex) << 60) |
+	                (static_cast<uint64>(m_writeBufferSubmitIndex) << 30) |
+	                static_cast<uint64>(m_writeBufferSize - m_writeBufferSubmitIndex);
 
 	SendGSCall(
-	    [this, bufferStart, bufferEnd]() {
-		    SubmitWriteBufferImpl(bufferStart, bufferEnd);
+	    [this, packed]() {
+		    uint32 bufIdx = static_cast<uint32>(packed >> 60);
+		    uint32 startIdx = static_cast<uint32>((packed >> 30) & 0x3FFFFFFFU);
+		    uint32 count = static_cast<uint32>(packed & 0x3FFFFFFFU);
+		    const RegisterWrite* bufferStart = m_writeBuffers[bufIdx] + startIdx;
+		    SubmitWriteBufferImpl(bufferStart, bufferStart + count);
 	    });
 
 	m_writeBufferSubmitIndex = m_writeBufferSize;
@@ -749,9 +852,12 @@ void CGSHandler::FlushWriteBuffer()
 	m_writeBufferSize = 0;
 	m_writeBufferProcessIndex = 0;
 	m_writeBufferSubmitIndex = 0;
+	m_writeBufferHasSpecial = false;
 	m_writeBufferIndex++;
 	m_writeBufferIndex %= MAX_INFLIGHT_FRAMES;
 	m_currentWriteBuffer = m_writeBuffers[m_writeBufferIndex];
+	m_currentImageBuffer = m_imageBuffers[m_writeBufferIndex];
+	m_imageBufferOffset = 0;
 	//Nothing should be written to the buffer after that
 }
 
@@ -786,7 +892,7 @@ void CGSHandler::WriteRegisterImpl(uint8 nRegister, uint64 nData)
 				bufAddr = bufAddr + levelSize;
 				bufWidth = std::max(bufWidth >> 1, 1U);
 				width = std::max(width >> 1, 1U);
-				height = std::max(width >> 1, 1U);
+				height = std::max(height >> 1, 1U);
 				uint32 tbp = (bufAddr / 256) & 0x3FFF;
 				uint32 tbw = bufWidth & 0x3F;
 				miptbp[i] = tbp | (tbw << 14);
@@ -2182,13 +2288,11 @@ void CGSHandler::WriteToDelayedRegister(uint32 address, uint32 value, DELAYED_RE
 
 void CGSHandler::ThreadProc()
 {
+	ThreadAffinity::ApplyCurrentThread(ThreadAffinity::Role::GsWorker);
 	while(!m_threadDone)
 	{
 		m_mailBox.WaitForCall();
-		while(m_mailBox.IsPending())
-		{
-			m_mailBox.ReceiveCall();
-		}
+		m_mailBox.ReceiveAllCalls();
 	}
 }
 

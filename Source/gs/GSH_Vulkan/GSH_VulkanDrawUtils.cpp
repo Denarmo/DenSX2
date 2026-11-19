@@ -71,11 +71,7 @@ static Nuanceur::CFloat4Rvalue GetClutColor(Nuanceur::CShaderBuilder& b,
 	case CGSHandler::PSMCT32:
 	case CGSHandler::PSMCT24:
 	{
-		auto clutIndexLo = (clutIndex & NewInt(b, 0xFF));
-		auto clutIndexHi = (clutIndex & NewInt(b, 0xFF)) + NewInt(b, 0x100);
-		auto clutPixelLo = Load(clutBuffer, clutIndexLo);
-		auto clutPixelHi = Load(clutBuffer, clutIndexHi);
-		auto clutPixel = clutPixelLo | (clutPixelHi << NewUint(b, 16));
+		auto clutPixel = Load(clutBuffer, clutIndex & NewInt(b, 0xFF));
 		return CMemoryUtils::PSM32ToVec4(b, clutPixel);
 	}
 	case CGSHandler::PSMCT16:
@@ -100,28 +96,58 @@ Nuanceur::CFloat4Rvalue CDrawUtils::GetTextureColor(Nuanceur::CShaderBuilder& b,
 		assert(false);
 		[[fallthrough]];
 	case CGSHandler::PSMCT32:
-	case CGSHandler::PSMZ32:
 	{
 		auto texAddress = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMCT32>(
 		    b, texSwizzleTable, texBufAddress, texBufWidth, texelPos);
 		auto texPixel = CMemoryUtils::Memory_Read32(b, memoryBuffer, texAddress);
 		return CMemoryUtils::PSM32ToVec4(b, texPixel);
 	}
+	case CGSHandler::PSMZ32:
+	{
+		auto texAddress = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMZ32>(
+		    b, texSwizzleTable, texBufAddress, texBufWidth, texelPos);
+		auto texPixel = CMemoryUtils::Memory_Read32(b, memoryBuffer, texAddress);
+		return CMemoryUtils::PSM32ToVec4(b, texPixel);
+	}
 	case CGSHandler::PSMCT24:
 	case CGSHandler::PSMCT24_UNK:
-	case CGSHandler::PSMZ24:
 	{
 		auto texAddress = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMCT32>(
 		    b, texSwizzleTable, texBufAddress, texBufWidth, texelPos);
 		auto texPixel = CMemoryUtils::Memory_Read24(b, memoryBuffer, texAddress);
 		return CMemoryUtils::PSM32ToVec4(b, texPixel);
 	}
+	case CGSHandler::PSMZ24:
+	{
+		auto texAddress = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMZ32>(
+		    b, texSwizzleTable, texBufAddress, texBufWidth, texelPos);
+		auto texPixel = CMemoryUtils::Memory_Read24(b, memoryBuffer, texAddress);
+		return CMemoryUtils::PSM32ToVec4(b, texPixel);
+	}
 	case CGSHandler::PSMCT16:
-	case CGSHandler::PSMCT16S:
-	case CGSHandler::PSMZ16:
-	case CGSHandler::PSMZ16S:
 	{
 		auto texAddress = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMCT16>(
+		    b, texSwizzleTable, texBufAddress, texBufWidth, texelPos);
+		auto texPixel = CMemoryUtils::Memory_Read16(b, memoryBuffer, texAddress);
+		return CMemoryUtils::PSM16ToVec4(b, texPixel);
+	}
+	case CGSHandler::PSMCT16S:
+	{
+		auto texAddress = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMCT16S>(
+		    b, texSwizzleTable, texBufAddress, texBufWidth, texelPos);
+		auto texPixel = CMemoryUtils::Memory_Read16(b, memoryBuffer, texAddress);
+		return CMemoryUtils::PSM16ToVec4(b, texPixel);
+	}
+	case CGSHandler::PSMZ16:
+	{
+		auto texAddress = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMZ16>(
+		    b, texSwizzleTable, texBufAddress, texBufWidth, texelPos);
+		auto texPixel = CMemoryUtils::Memory_Read16(b, memoryBuffer, texAddress);
+		return CMemoryUtils::PSM16ToVec4(b, texPixel);
+	}
+	case CGSHandler::PSMZ16S:
+	{
+		auto texAddress = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMZ16S>(
 		    b, texSwizzleTable, texBufAddress, texBufWidth, texelPos);
 		auto texPixel = CMemoryUtils::Memory_Read16(b, memoryBuffer, texAddress);
 		return CMemoryUtils::PSM16ToVec4(b, texPixel);
@@ -163,6 +189,171 @@ Nuanceur::CFloat4Rvalue CDrawUtils::GetTextureColor(Nuanceur::CShaderBuilder& b,
 		auto texPixel = CMemoryUtils::Memory_Read4(b, memoryBuffer, texNibAddress);
 		return GetClutColor(b, textureFormat, clutFormat, texPixel, clutBuffer, texCsa);
 	}
+	}
+}
+
+bool CDrawUtils::GetTextureColorQuad(Nuanceur::CShaderBuilder& b, uint32 textureFormat, uint32 clutFormat,
+                                     Nuanceur::CInt2Value pos0, Nuanceur::CInt2Value pos1,
+                                     Nuanceur::CArrayUintValue memoryBuffer, Nuanceur::CArrayUintValue clutBuffer,
+                                     Nuanceur::CIntValue texBufAddress, Nuanceur::CIntValue texBufWidth, Nuanceur::CIntValue texCsa,
+                                     Nuanceur::CFloat4Lvalue& colorA, Nuanceur::CFloat4Lvalue& colorB,
+                                     Nuanceur::CFloat4Lvalue& colorC, Nuanceur::CFloat4Lvalue& colorD)
+{
+	using namespace Nuanceur;
+
+	auto ux0 = ToUint(pos0->x());
+	auto uy0 = ToUint(pos0->y());
+	auto ux1 = ToUint(pos1->x());
+	auto uy1 = ToUint(pos1->y());
+	auto ubw = ToUint(texBufWidth);
+	auto uaddr = ToUint(texBufAddress);
+
+	switch(textureFormat)
+	{
+	case CGSHandler::PSMT4:
+	{
+		auto calcX = [&](CUintValue ux) {
+			return ((ux >> NewUint(b, 7)) << NewUint(b, 14)) +
+			       (((ux & NewUint(b, 24)) >> NewUint(b, 2)) |
+			        ((ux & NewUint(b, 1)) << NewUint(b, 3)) |
+			        ((ux & NewUint(b, 2)) << NewUint(b, 4)) |
+			        ((ux & NewUint(b, 32)) << NewUint(b, 5)) |
+			        ((ux & NewUint(b, 64)) << NewUint(b, 6)));
+		};
+		auto calcY = [&](CUintValue uy) {
+			return (uaddr << NewUint(b, 1)) +
+			       ((((uy >> NewUint(b, 7)) * ubw) >> NewUint(b, 7)) << NewUint(b, 14)) +
+			       (((uy & NewUint(b, 2)) >> NewUint(b, 1)) |
+			        ((uy & NewUint(b, 1)) << NewUint(b, 4)) |
+			        ((uy & NewUint(b, 28)) << NewUint(b, 5)) |
+			        ((uy & NewUint(b, 32)) << NewUint(b, 6)) |
+			        ((uy & NewUint(b, 64)) << NewUint(b, 7)));
+		};
+		auto xt0 = calcX(ux0);
+		auto xt1 = calcX(ux1);
+		auto yt0 = calcY(uy0);
+		auto yt1 = calcY(uy1);
+		auto sx0 = (ux0 >> NewUint(b, 2)) & NewUint(b, 1);
+		auto sx1 = (ux1 >> NewUint(b, 2)) & NewUint(b, 1);
+		auto sy0 = ((uy0 >> NewUint(b, 1)) ^ (uy0 >> NewUint(b, 2))) & NewUint(b, 1);
+		auto sy1 = ((uy1 >> NewUint(b, 1)) ^ (uy1 >> NewUint(b, 2))) & NewUint(b, 1);
+
+		auto pA = CMemoryUtils::Memory_Read4(b, memoryBuffer, ToInt(xt0 + yt0 + ((sx0 ^ sy0) << NewUint(b, 6))));
+		auto pB = CMemoryUtils::Memory_Read4(b, memoryBuffer, ToInt(xt1 + yt0 + ((sx1 ^ sy0) << NewUint(b, 6))));
+		auto pC = CMemoryUtils::Memory_Read4(b, memoryBuffer, ToInt(xt0 + yt1 + ((sx0 ^ sy1) << NewUint(b, 6))));
+		auto pD = CMemoryUtils::Memory_Read4(b, memoryBuffer, ToInt(xt1 + yt1 + ((sx1 ^ sy1) << NewUint(b, 6))));
+		colorA = GetClutColor(b, textureFormat, clutFormat, pA, clutBuffer, texCsa);
+		colorB = GetClutColor(b, textureFormat, clutFormat, pB, clutBuffer, texCsa);
+		colorC = GetClutColor(b, textureFormat, clutFormat, pC, clutBuffer, texCsa);
+		colorD = GetClutColor(b, textureFormat, clutFormat, pD, clutBuffer, texCsa);
+		return true;
+	}
+	case CGSHandler::PSMT8:
+	{
+		auto calcX = [&](CUintValue ux) {
+			return ((ux >> NewUint(b, 7)) << NewUint(b, 13)) +
+			       (((ux & NewUint(b, 8)) >> NewUint(b, 2)) |
+			        ((ux & NewUint(b, 1)) << NewUint(b, 2)) |
+			        ((ux & NewUint(b, 2)) << NewUint(b, 3)) |
+			        ((ux & NewUint(b, 16)) << NewUint(b, 4)) |
+			        ((ux & NewUint(b, 32)) << NewUint(b, 5)) |
+			        ((ux & NewUint(b, 64)) << NewUint(b, 6)));
+		};
+		auto calcY = [&](CUintValue uy) {
+			return uaddr +
+			       ((((uy >> NewUint(b, 6)) * ubw) >> NewUint(b, 7)) << NewUint(b, 13)) +
+			       (((uy & NewUint(b, 2)) >> NewUint(b, 1)) |
+			        ((uy & NewUint(b, 1)) << NewUint(b, 3)) |
+			        ((uy & NewUint(b, 12)) << NewUint(b, 4)) |
+			        ((uy & NewUint(b, 16)) << NewUint(b, 5)) |
+			        ((uy & NewUint(b, 32)) << NewUint(b, 6)));
+		};
+		auto xt0 = calcX(ux0);
+		auto xt1 = calcX(ux1);
+		auto yt0 = calcY(uy0);
+		auto yt1 = calcY(uy1);
+		auto sx0 = (ux0 >> NewUint(b, 2)) & NewUint(b, 1);
+		auto sx1 = (ux1 >> NewUint(b, 2)) & NewUint(b, 1);
+		auto sy0 = ((uy0 >> NewUint(b, 1)) ^ (uy0 >> NewUint(b, 2))) & NewUint(b, 1);
+		auto sy1 = ((uy1 >> NewUint(b, 1)) ^ (uy1 >> NewUint(b, 2))) & NewUint(b, 1);
+
+		auto pA = CMemoryUtils::Memory_Read8(b, memoryBuffer, ToInt(xt0 + yt0 + ((sx0 ^ sy0) << NewUint(b, 5))));
+		auto pB = CMemoryUtils::Memory_Read8(b, memoryBuffer, ToInt(xt1 + yt0 + ((sx1 ^ sy0) << NewUint(b, 5))));
+		auto pC = CMemoryUtils::Memory_Read8(b, memoryBuffer, ToInt(xt0 + yt1 + ((sx0 ^ sy1) << NewUint(b, 5))));
+		auto pD = CMemoryUtils::Memory_Read8(b, memoryBuffer, ToInt(xt1 + yt1 + ((sx1 ^ sy1) << NewUint(b, 5))));
+		colorA = GetClutColor(b, textureFormat, clutFormat, pA, clutBuffer, texCsa);
+		colorB = GetClutColor(b, textureFormat, clutFormat, pB, clutBuffer, texCsa);
+		colorC = GetClutColor(b, textureFormat, clutFormat, pC, clutBuffer, texCsa);
+		colorD = GetClutColor(b, textureFormat, clutFormat, pD, clutBuffer, texCsa);
+		return true;
+	}
+	case CGSHandler::PSMCT32:
+	case CGSHandler::PSMCT24:
+	case CGSHandler::PSMCT24_UNK:
+	{
+		auto calcX = [&](CUintValue ux) {
+			return ((ux >> NewUint(b, 6)) << NewUint(b, 13)) +
+			       (((ux & NewUint(b, 1)) << NewUint(b, 2)) |
+			        ((ux & NewUint(b, 6)) << NewUint(b, 3)) |
+			        ((ux & NewUint(b, 8)) << NewUint(b, 5)) |
+			        ((ux & NewUint(b, 16)) << NewUint(b, 6)) |
+			        ((ux & NewUint(b, 32)) << NewUint(b, 7)));
+		};
+		auto calcY = [&](CUintValue uy) {
+			return uaddr +
+			       ((((uy >> NewUint(b, 5)) * ubw) >> NewUint(b, 6)) << NewUint(b, 13)) +
+			       (((uy & NewUint(b, 1)) << NewUint(b, 3)) |
+			        ((uy & NewUint(b, 6)) << NewUint(b, 5)) |
+			        ((uy & NewUint(b, 8)) << NewUint(b, 6)) |
+			        ((uy & NewUint(b, 16)) << NewUint(b, 7)));
+		};
+		auto xt0 = calcX(ux0);
+		auto xt1 = calcX(ux1);
+		auto yt0 = calcY(uy0);
+		auto yt1 = calcY(uy1);
+		auto readPix = [&](CUintValue addr) {
+			if(textureFormat == CGSHandler::PSMCT32)
+			{
+				return CMemoryUtils::Memory_Read32(b, memoryBuffer, ToInt(addr));
+			}
+			return CMemoryUtils::Memory_Read24(b, memoryBuffer, ToInt(addr));
+		};
+		colorA = CMemoryUtils::PSM32ToVec4(b, readPix(xt0 + yt0));
+		colorB = CMemoryUtils::PSM32ToVec4(b, readPix(xt1 + yt0));
+		colorC = CMemoryUtils::PSM32ToVec4(b, readPix(xt0 + yt1));
+		colorD = CMemoryUtils::PSM32ToVec4(b, readPix(xt1 + yt1));
+		return true;
+	}
+	case CGSHandler::PSMCT16:
+	{
+		auto calcX = [&](CUintValue ux) {
+			return ((ux >> NewUint(b, 6)) << NewUint(b, 13)) +
+			       (((ux & NewUint(b, 8)) >> NewUint(b, 2)) |
+			        ((ux & NewUint(b, 1)) << NewUint(b, 2)) |
+			        ((ux & NewUint(b, 6)) << NewUint(b, 3)) |
+			        ((ux & NewUint(b, 16)) << NewUint(b, 5)) |
+			        ((ux & NewUint(b, 32)) << NewUint(b, 6)));
+		};
+		auto calcY = [&](CUintValue uy) {
+			return uaddr +
+			       ((((uy >> NewUint(b, 6)) * ubw) >> NewUint(b, 6)) << NewUint(b, 13)) +
+			       (((uy & NewUint(b, 1)) << NewUint(b, 3)) |
+			        ((uy & NewUint(b, 14)) << NewUint(b, 5)) |
+			        ((uy & NewUint(b, 16)) << NewUint(b, 6)) |
+			        ((uy & NewUint(b, 32)) << NewUint(b, 7)));
+		};
+		auto xt0 = calcX(ux0);
+		auto xt1 = calcX(ux1);
+		auto yt0 = calcY(uy0);
+		auto yt1 = calcY(uy1);
+		colorA = CMemoryUtils::PSM16ToVec4(b, CMemoryUtils::Memory_Read16(b, memoryBuffer, ToInt(xt0 + yt0)));
+		colorB = CMemoryUtils::PSM16ToVec4(b, CMemoryUtils::Memory_Read16(b, memoryBuffer, ToInt(xt1 + yt0)));
+		colorC = CMemoryUtils::PSM16ToVec4(b, CMemoryUtils::Memory_Read16(b, memoryBuffer, ToInt(xt0 + yt1)));
+		colorD = CMemoryUtils::PSM16ToVec4(b, CMemoryUtils::Memory_Read16(b, memoryBuffer, ToInt(xt1 + yt1)));
+		return true;
+	}
+	default:
+		return false;
 	}
 }
 
@@ -320,10 +511,15 @@ void CDrawUtils::DestinationAlphaTest(Nuanceur::CShaderBuilder& b, uint32 frameb
 	switch(framebufferFormat)
 	{
 	case CGSHandler::PSMCT32:
+	case CGSHandler::PSMCT24:
+	case CGSHandler::PSMZ32:
+	case CGSHandler::PSMZ24:
 		alphaBit = dstPixel & NewUint(b, 0x80000000);
 		break;
 	case CGSHandler::PSMCT16:
 	case CGSHandler::PSMCT16S:
+	case CGSHandler::PSMZ16:
+	case CGSHandler::PSMZ16S:
 		alphaBit = dstPixel & NewUint(b, 0x8000);
 		break;
 	default:
@@ -373,6 +569,7 @@ void CDrawUtils::WriteToFramebuffer(Nuanceur::CShaderBuilder& b, uint32 framebuf
 	break;
 	case CGSHandler::PSMCT16:
 	case CGSHandler::PSMCT16S:
+	case CGSHandler::PSMZ16:
 	case CGSHandler::PSMZ16S:
 	{
 		auto dstPixel = srcPixel & NewUint(b, 0xFFFF);

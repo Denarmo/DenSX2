@@ -24,6 +24,7 @@ namespace GSH_Vulkan
 		struct PIPELINE_CAPS : public convertible<PipelineCapsInt>
 		{
 			uint32 dstFormat : 6;
+			uint32 packed4Bit : 1;
 		};
 
 		struct XFERPARAMS
@@ -45,6 +46,7 @@ namespace GSH_Vulkan
 		void SetPipelineCaps(const PIPELINE_CAPS&);
 
 		void DoTransfer(const XferBuffer&);
+		void DoTransfer(const uint8*, uint32, uint32 dstAddress = 0, uint32 dstSize = CGSHandler::RAMSIZE);
 
 		void PreFlushFrameCommandBuffer() override;
 		void PostFlushFrameCommandBuffer() override;
@@ -90,6 +92,13 @@ namespace GSH_Vulkan
 		FRAMECONTEXT m_frames[MAX_FRAMES];
 
 		uint32 m_xferBufferOffset = 0;
+
+		uint32 m_lastComputeBindGen = ~0U;
+		VkPipeline m_lastBoundPipeline = VK_NULL_HANDLE;
+		VkDescriptorSet m_lastBoundDescSet = VK_NULL_HANDLE;
+
+		const PIPELINE* m_pipelineFast[128] = {};
+		VkDescriptorSet m_descSetFast[MAX_FRAMES][64] = {};
 
 		PIPELINE_CAPS m_pipelineCaps;
 	};

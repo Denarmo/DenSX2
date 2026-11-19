@@ -47,10 +47,16 @@ void CClutLoad::DoClutLoad(uint32 clutBufferOffset, const CGSHandler::TEX0& tex0
 
 	auto descriptorSet = PrepareDescriptorSet(loadPipeline->descriptorSetLayout, tex0.nCPSM);
 	auto commandBuffer = m_frameCommandBuffer->GetCommandBuffer();
+	m_context->ResetHostXferBatch();
 
+#if GSH_VULKAN_USE_ANNOTATIONS
 	m_context->annotations.PushCommandLabel(commandBuffer, string_format("CLUT Load (CBP: 0x%06X)", tex0.GetCLUTPtr()).c_str());
+#endif
 
-	//Add a barrier to ensure writes to GS memory are complete
+	//Ensure prior compute host transfers to GS memory are visible before reading CLUT data.
+	//Consecutive CLUT loads only read memoryBuffer and write disjoint CLUT cache slots, so
+	//they need no compute-to-compute barrier between one another.
+	if(m_context->clutNeedsHostBarrier)
 	{
 		auto memoryBarrier = Framework::Vulkan::MemoryBarrier();
 		memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -58,6 +64,7 @@ void CClutLoad::DoClutLoad(uint32 clutBufferOffset, const CGSHandler::TEX0& tex0
 
 		m_context->device.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		                                       0, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
+		m_context->clutNeedsHostBarrier = false;
 	}
 
 	m_context->device.vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, loadPipeline->pipelineLayout, 0, 1, &descriptorSet, 1, &clutBufferOffset);
@@ -65,7 +72,9 @@ void CClutLoad::DoClutLoad(uint32 clutBufferOffset, const CGSHandler::TEX0& tex0
 	m_context->device.vkCmdPushConstants(commandBuffer, loadPipeline->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(LOAD_PARAMS), &loadParams);
 	m_context->device.vkCmdDispatch(commandBuffer, 1, 1, 1);
 
+#if GSH_VULKAN_USE_ANNOTATIONS
 	m_context->annotations.PopCommandLabel(commandBuffer);
+#endif
 }
 
 VkDescriptorSet CClutLoad::PrepareDescriptorSet(VkDescriptorSetLayout descriptorSetLayout, uint32 cpsm)
@@ -212,9 +221,15 @@ Framework::Vulkan::CShaderModule CClutLoad::CreateLoadShader(const PIPELINE_CAPS
 			}
 			break;
 			case CGSHandler::PSMCT16:
-			case CGSHandler::PSMCT16S:
 			{
 				auto colorAddress = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMCT16>(
+				    b, swizzleTable, clutBufPtr, clutBufWidth, colorPos);
+				colorPixel = CMemoryUtils::Memory_Read16(b, memoryBuffer, colorAddress);
+			}
+			break;
+			case CGSHandler::PSMCT16S:
+			{
+				auto colorAddress = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMCT16S>(
 				    b, swizzleTable, clutBufPtr, clutBufWidth, colorPos);
 				colorPixel = CMemoryUtils::Memory_Read16(b, memoryBuffer, colorAddress);
 			}
@@ -249,12 +264,7 @@ Framework::Vulkan::CShaderModule CClutLoad::CreateLoadShader(const PIPELINE_CAPS
 		case CGSHandler::PSMCT32:
 		case CGSHandler::PSMCT24:
 		{
-			auto colorPixelLo = colorPixel & NewUint(b, 0xFFFF);
-			auto colorPixelHi = (colorPixel >> NewUint(b, 16)) & NewUint(b, 0xFFFF);
-			auto clutIndexLo = clutIndex;
-			auto clutIndexHi = clutIndex + NewInt(b, 0x100);
-			Store(clutBuffer, clutIndexLo, colorPixelLo);
-			Store(clutBuffer, clutIndexHi, colorPixelHi);
+			Store(clutBuffer, clutIndex & NewInt(b, 0xFF), colorPixel);
 		}
 		break;
 		case CGSHandler::PSMCT16:
@@ -347,7 +357,7 @@ PIPELINE CClutLoad::CreateLoadPipeline(const PIPELINE_CAPS& caps)
 		createInfo.stage.module = loadShader;
 		createInfo.layout = loadPipeline.pipelineLayout;
 
-		result = m_context->device.vkCreateComputePipelines(m_context->device, VK_NULL_HANDLE, 1, &createInfo, nullptr, &loadPipeline.pipeline);
+		result = m_context->device.vkCreateComputePipelines(m_context->device, m_context->pipelineCache, 1, &createInfo, nullptr, &loadPipeline.pipeline);
 		CHECKVULKANERROR(result);
 	}
 

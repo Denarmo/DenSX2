@@ -328,7 +328,7 @@ CPresent::PRESENT_COMMANDBUFFER CPresent::PrepareCommandBuffer()
 			result = m_context->device.vkResetFences(m_context->device, 1, &presentCommandBuffer.execCompleteFence);
 			CHECKVULKANERROR(result);
 
-			result = m_context->device.vkResetCommandBuffer(presentCommandBuffer.commandBuffer, VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
+			result = m_context->device.vkResetCommandBuffer(presentCommandBuffer.commandBuffer, 0);
 			CHECKVULKANERROR(result);
 
 			return presentCommandBuffer;
@@ -748,7 +748,7 @@ PIPELINE CPresent::CreateDrawPipeline(const PIPELINE_CAPS& caps)
 	pipelineCreateInfo.renderPass = m_renderPass;
 	pipelineCreateInfo.layout = drawPipeline.pipelineLayout;
 
-	result = m_context->device.vkCreateGraphicsPipelines(m_context->device, VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, &drawPipeline.pipeline);
+	result = m_context->device.vkCreateGraphicsPipelines(m_context->device, m_context->pipelineCache, 1, &pipelineCreateInfo, nullptr, &drawPipeline.pipeline);
 	CHECKVULKANERROR(result);
 
 	return drawPipeline;
@@ -826,9 +826,16 @@ Framework::Vulkan::CShaderModule CPresent::CreateFragmentShader(const PIPELINE_C
 		}
 		break;
 		case CGSHandler::PSMCT16:
-		case CGSHandler::PSMCT16S:
 		{
 			auto address = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMCT16>(
+			    b, swizzleTable, bufAddress, bufWidth, screenPos);
+			auto imageColor = CMemoryUtils::Memory_Read16(b, memoryBuffer, address);
+			outputColor = CMemoryUtils::PSM16ToVec4(b, imageColor);
+		}
+		break;
+		case CGSHandler::PSMCT16S:
+		{
+			auto address = CMemoryUtils::GetPixelAddress<CGsPixelFormats::STORAGEPSMCT16S>(
 			    b, swizzleTable, bufAddress, bufWidth, screenPos);
 			auto imageColor = CMemoryUtils::Memory_Read16(b, memoryBuffer, address);
 			outputColor = CMemoryUtils::PSM16ToVec4(b, imageColor);

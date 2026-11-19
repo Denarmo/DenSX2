@@ -31,6 +31,7 @@ namespace GSH_Vulkan
 
 		uint32 GetFlushCount() const;
 		void ResetFlushCount();
+		uint64 TakeFenceWaitNs();
 
 		VkCommandBuffer GetCommandBuffer();
 		uint32 GetCurrentFrame() const;
@@ -50,6 +51,7 @@ namespace GSH_Vulkan
 		uint32 m_currentFrame = 0;
 
 		uint32 m_flushCount = 0;
+		uint64 m_fenceWaitNs = 0;
 	};
 
 	typedef std::shared_ptr<CFrameCommandBuffer> FrameCommandBufferPtr;
