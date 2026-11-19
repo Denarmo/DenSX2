@@ -3,6 +3,7 @@
 #include "Log.h"
 #include "AppConfig.h"
 #include "PS2VM.h"
+#include "NativeCodeCache.h"
 #include "ui_shared/BootableUtils.h"
 
 #include "PS2VM_Preferences.h"
@@ -888,8 +889,21 @@ void retro_init()
 			std::error_code error;
 			auto cacheDir = fs::path(saveDir) / "play";
 			fs::create_directories(cacheDir, error);
-			if(!error) CGSH_OpenGL::SetProgramCachePath((cacheDir / "gl-programs.bin").string());
+			if(!error)
+			{
+				CGSH_OpenGL::SetProgramCachePath((cacheDir / "gl-programs.bin").string());
+				CNativeCodeCache::SetCacheDir((cacheDir / "aot").string());
+			}
 			if(fs::exists(cacheDir / "frame-stats.on", error)) g_frameStats.path = (cacheDir / "frame-stats.txt").string();
+#ifdef PLAY_LIBRETRO_VULKAN
+			CGSH_Vulkan::SetPipelineCachePath((cacheDir / "vk-pipeline-cache.bin").string());
+			if(fs::exists(cacheDir / "gs-stats.on", error))
+			{
+				auto statsPath = (cacheDir / "gs-stats.txt").string();
+				CGSH_Vulkan::SetStatsPath(statsPath);
+				CPS2VM::SetTimingStatsPath(statsPath);
+			}
+#endif
 		}
 	}
 	CLog::GetInstance().Print(LOG_NAME, "%s\n", __FUNCTION__);

@@ -2,6 +2,8 @@
 //  vmbench <disc image> <save state> <frames> [button to hold]
 //The save state is Play!'s own (an EmuDEN state file is accepted too: its header is skipped). The GS is the
 //null one, sound is discarded, and the pad holds one button (cross by default) with the sticks centred.
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -10,6 +12,8 @@
 #include <iterator>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 #include "AppConfig.h"
 #include "PathUtils.h"
@@ -17,6 +21,7 @@
 #include "PS2VM_Preferences.h"
 #include "PtrStream.h"
 #include "ee/PS2OS.h"
+#include "ee/EeExecutor.h"
 #include "gs/GSH_Null.h"
 #include "PadHandler.h"
 #include "ControllerInfo.h"
@@ -163,12 +168,63 @@ static int Run(int argc, const char** argv)
 	int frameCount = 0;
 	double start = 0;
 	const int warmup = 100;
+	uint64 eeTotalTicks = 0, eeIdleTicks = 0, iopTotalTicks = 0, iopIdleTicks = 0;
+	std::atomic<bool> benchActive{false};
 	auto connection = virtualMachine.OnNewFrame.Connect([&]() {
 		std::lock_guard<std::mutex> lock(mutex);
 		frameCount++;
-		if(frameCount == warmup) start = NowSeconds();
-		if(frameCount == warmup + frames) done.notify_all();
+		if(frameCount == warmup)
+		{
+			start = NowSeconds();
+			if(getenv("VMBENCH_SAMPLE") != nullptr)
+			{
+				auto* eeExec = static_cast<CEeExecutor*>(virtualMachine.m_ee->m_EE.m_executor.get());
+				eeExec->ResetJitStats();
+				eeExec->SetTrackJitStats(true);
+			}
+			benchActive = true;
+		}
+		if(frameCount > warmup && frameCount <= warmup + frames)
+		{
+			auto u = virtualMachine.GetCpuUtilisationInfo();
+			eeTotalTicks += u.eeTotalTicks;
+			eeIdleTicks += u.eeIdleTicks;
+			iopTotalTicks += u.iopTotalTicks;
+			iopIdleTicks += u.iopIdleTicks;
+		}
+		if(frameCount == warmup + frames)
+		{
+			benchActive = false;
+			if(getenv("VMBENCH_SAMPLE") != nullptr)
+			{
+				auto* eeExec = static_cast<CEeExecutor*>(virtualMachine.m_ee->m_EE.m_executor.get());
+				eeExec->SetTrackJitStats(false);
+			}
+			done.notify_all();
+		}
 	});
+
+	bool samplePc = getenv("VMBENCH_SAMPLE") != nullptr;
+	std::unordered_map<uint32, uint32> eePcHist;
+	uint32 vu1RunningSamples = 0, totalSamples = 0;
+	std::atomic<bool> stopSampler{false};
+	std::thread samplerThread;
+	if(samplePc)
+	{
+		samplerThread = std::thread([&]() {
+			while(!stopSampler.load(std::memory_order_relaxed))
+			{
+				if(benchActive.load(std::memory_order_relaxed))
+				{
+					uint32 pc = virtualMachine.m_ee->m_EE.m_State.nPC;
+					eePcHist[pc & ~0x3FU]++;
+					if(virtualMachine.m_ee->m_vpu1->IsVuRunning()) vu1RunningSamples++;
+					totalSamples++;
+				}
+				std::this_thread::sleep_for(std::chrono::microseconds(200));
+			}
+		});
+	}
 
 	Step("run");
 	virtualMachine.Resume();
@@ -176,9 +232,53 @@ static int Run(int argc, const char** argv)
 		std::unique_lock<std::mutex> lock(mutex);
 		done.wait(lock, [&]() { return frameCount >= warmup + frames; });
 	}
+	stopSampler = true;
+	if(samplerThread.joinable()) samplerThread.join();
 	double elapsed = NowSeconds() - start;
 	virtualMachine.Pause();
-	printf("%d frames in %.3f s: %.2f fps, %.3f ms per frame\n", frames, elapsed, frames / elapsed, 1000.0 * elapsed / frames);
+	printf("%d frames in %.3f s: %.2f fps, %.3f ms per frame (exe=%s, eeIdle=%.1f%%, iopIdle=%.1f%%)\n",
+	       frames, elapsed, frames / elapsed, 1000.0 * elapsed / frames,
+	       virtualMachine.m_ee->m_os->GetExecutableName(),
+	       eeTotalTicks ? (100.0 * eeIdleTicks / eeTotalTicks) : 0.0,
+	       iopTotalTicks ? (100.0 * iopIdleTicks / iopTotalTicks) : 0.0);
+	if(samplePc && totalSamples > 0)
+	{
+		std::vector<std::pair<uint32, uint32>> top(eePcHist.begin(), eePcHist.end());
+		std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+		printf("PC samples=%u vu1Running=%.1f%% top EE 64B buckets:\n", totalSamples, 100.0 * vu1RunningSamples / totalSamples);
+		for(size_t i = 0; i < std::min<size_t>(15, top.size()); i++)
+		{
+			uint32 addr = top[i].first;
+			printf("  0x%08X: %.2f%% (%u)", addr, 100.0 * top[i].second / totalSamples, top[i].second);
+			if(addr + 64 <= PS2::EE_RAM_SIZE)
+			{
+				const uint32* words = reinterpret_cast<const uint32*>(virtualMachine.m_ee->m_ram + addr);
+				printf(" words:");
+				for(int k = 0; k < 8; k++) printf(" %08X", words[k]);
+			}
+			printf("\n");
+		}
+		auto* eeExec = static_cast<CEeExecutor*>(virtualMachine.m_ee->m_EE.m_executor.get());
+		const auto& js = eeExec->GetJitStats();
+		printf("EE JIT stats: faults=%llu factory=%llu cacheHits=%llu cacheCopy=%llu compiles=%llu\n",
+		       (unsigned long long)js.accessFaults, (unsigned long long)js.factoryCalls,
+		       (unsigned long long)js.cacheHits, (unsigned long long)js.cacheCopyHits,
+		       (unsigned long long)js.compiles);
+		{
+			std::vector<std::pair<uint32, uint32>> fp(js.faultPages.begin(), js.faultPages.end());
+			std::sort(fp.begin(), fp.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+			printf("Top fault pages:\n");
+			for(size_t i = 0; i < std::min<size_t>(10, fp.size()); i++)
+				printf("  page 0x%08X: %u faults\n", fp[i].first, fp[i].second);
+		}
+		{
+			std::vector<std::pair<uint32, uint32>> ca(js.compileAddrs.begin(), js.compileAddrs.end());
+			std::sort(ca.begin(), ca.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+			printf("Top compiled EE blocks:\n");
+			for(size_t i = 0; i < std::min<size_t>(15, ca.size()); i++)
+				printf("  addr 0x%08X: %u compiles\n", ca[i].first, ca[i].second);
+		}
+	}
 	fflush(stdout);
 
 	connection.reset();

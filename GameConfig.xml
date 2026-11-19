@@ -163,4 +163,7 @@
 	<GameConfig Executable="SLES_511.17;1" Title="Colin McRae Rally 3">
 		<IdleLoopBlock Address="0x00247E40" Description="Return site of a call polled until Timer 1 reaches a value." />
 	</GameConfig>
+	<GameConfig Executable="SLES_538.57;1" Title="Need for Speed: Most Wanted - Black Edition">
+		<IdleLoopBlock Address="0x002083FC" Description="64-NOP busy wait polling frame sync flags." />
+	</GameConfig>
 </GameConfigs>
