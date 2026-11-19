@@ -707,7 +707,8 @@ int32 CSpuBase::ComputeChannelVolume(const CHANNEL_VOLUME& volume, int32 current
 
 void CSpuBase::MixSamples(int32 inputSample, int32 volumeLevel, int16* output)
 {
-	inputSample = (inputSample * volumeLevel) / 0x7FFF;
+	int32 scaled = inputSample * volumeLevel;
+	inputSample = (scaled + (scaled >> 15)) >> 15;
 	int32 resultSample = inputSample + static_cast<int32>(*output);
 	resultSample = std::clamp<int32>(resultSample, SHRT_MIN, SHRT_MAX);
 
@@ -724,66 +725,227 @@ void CSpuBase::Render(int16* samples, unsigned int sampleCount)
 	unsigned int ticks = sampleCount / 2;
 	memset(samples, 0, sizeof(int16) * sampleCount);
 
-	for(unsigned int j = 0; j < ticks; j++)
+	int16 reverbBufStack[512];
+	std::vector<int16> reverbBufHeap;
+	int16* reverbBuf = nullptr;
+	if(updateReverb)
 	{
-		int16 reverbSample[2] = {};
-		//Update channels
-		for(unsigned int i = 0; i < 24; i++)
+		if(sampleCount <= 512)
 		{
-			auto& channel(m_channel[i]);
-			auto& reader(m_reader[i]);
-			if(channel.status == KEY_ON)
+			reverbBuf = reverbBufStack;
+			memset(reverbBuf, 0, sizeof(int16) * sampleCount);
+		}
+		else
+		{
+			reverbBufHeap.assign(sampleCount, 0);
+			reverbBuf = reverbBufHeap.data();
+		}
+	}
+
+	//Channel-outer loop keeps each voice's state hot in registers and skips stopped channels cleanly.
+	for(unsigned int i = 0; i < 24; i++)
+	{
+		auto& channel(m_channel[i]);
+		auto& reader(m_reader[i]);
+
+		if(channel.status == STOPPED && !irqEnabled)
+		{
+			if(!reader.IsDone())
 			{
-				reader.SetParamsRead(channel.address, channel.repeat);
-				reader.ClearEndFlag();
-				channel.status = ATTACK;
+				reader.SetRepeat(channel.repeat);
+				reader.SkipSamples(ticks);
+				if(reader.DidChangeRepeat() && !channel.repeatSet)
+				{
+					channel.repeat = reader.GetRepeat();
+					reader.ClearDidChangeRepeat();
+				}
+				channel.current = reader.GetCurrent();
+			}
+			channel.volumeLeftAbs = ComputeChannelVolume(channel.volumeLeft, channel.volumeLeftAbs);
+			channel.volumeRightAbs = ComputeChannelVolume(channel.volumeRight, channel.volumeRightAbs);
+			continue;
+		}
+
+		const bool chanReverb = updateReverb && ((m_channelReverb.f & (1U << i)) != 0);
+		const bool constVolL = (channel.volumeLeft.volume.mode == 0);
+		const bool constVolR = (channel.volumeRight.volume.mode == 0);
+		int32 volL = 0;
+		int32 volR = 0;
+		if(constVolL)
+		{
+			channel.volumeLeftAbs = ComputeChannelVolume(channel.volumeLeft, channel.volumeLeftAbs);
+			volL = channel.volumeLeftAbs >> 16;
+		}
+		if(constVolR)
+		{
+			channel.volumeRightAbs = ComputeChannelVolume(channel.volumeRight, channel.volumeRightAbs);
+			volR = channel.volumeRightAbs >> 16;
+		}
+
+		if(channel.status == KEY_ON)
+		{
+			reader.SetParamsRead(channel.address, channel.repeat);
+			reader.ClearEndFlag();
+			channel.status = ATTACK;
+			channel.adsrVolume = 0;
+		}
+		else
+		{
+			//Update repeat in case it has been changed externally (needed for FFX)
+			reader.SetRepeat(channel.repeat);
+		}
+
+		const bool steadyAdsr = (channel.status == SUSTAIN) &&
+		                        ((channel.adsrRate.sustainRate == 0x7F) ||
+		                         ((channel.adsrRate.sustainDirection == 0) && (channel.adsrVolume == MAX_ADSR_VOLUME)) ||
+		                         ((channel.adsrRate.sustainDirection != 0) && (channel.adsrVolume == 0)));
+
+		if(steadyAdsr && constVolL && constVolR && !irqEnabled)
+		{
+			const int32 adsrVol = static_cast<int32>(channel.adsrVolume >> 16);
+			bool stopped = false;
+			reader.RenderSteady(samples, chanReverb ? reverbBuf : nullptr, ticks,
+			                    adsrVol, volL, volR, channel.repeatSet, channel.repeat, stopped);
+			if(stopped)
+			{
+				channel.status = STOPPED;
 				channel.adsrVolume = 0;
 			}
-			else
+		}
+		else
+		{
+			for(unsigned int j = 0; j < ticks; j++)
 			{
 				if(reader.IsDone())
 				{
 					channel.status = STOPPED;
 					channel.adsrVolume = 0;
 					reader.ClearIsDone();
+					if(!irqEnabled) break;
 				}
 				if(reader.DidChangeRepeat() && !channel.repeatSet)
 				{
 					channel.repeat = reader.GetRepeat();
 					reader.ClearDidChangeRepeat();
+					reader.SetRepeat(channel.repeat);
 				}
-				//Update repeat in case it has been changed externally (needed for FFX)
-				reader.SetRepeat(channel.repeat);
-			}
 
-			int32 readSample = reader.GetSample();
-			channel.current = reader.GetCurrent();
+				int32 readSample = reader.GetSample();
 
-			UpdateAdsr(channel);
-			channel.volumeLeftAbs = ComputeChannelVolume(channel.volumeLeft, channel.volumeLeftAbs);
-			channel.volumeRightAbs = ComputeChannelVolume(channel.volumeRight, channel.volumeRightAbs);
+				if(!((channel.status == SUSTAIN) &&
+				     ((channel.adsrRate.sustainRate == 0x7F) ||
+				      ((channel.adsrRate.sustainDirection == 0) && (channel.adsrVolume == MAX_ADSR_VOLUME)) ||
+				      ((channel.adsrRate.sustainDirection != 0) && (channel.adsrVolume == 0)))))
+				{
+					UpdateAdsr(channel);
+				}
+				if(!constVolL)
+				{
+					channel.volumeLeftAbs = ComputeChannelVolume(channel.volumeLeft, channel.volumeLeftAbs);
+					volL = channel.volumeLeftAbs >> 16;
+				}
+				if(!constVolR)
+				{
+					channel.volumeRightAbs = ComputeChannelVolume(channel.volumeRight, channel.volumeRightAbs);
+					volR = channel.volumeRightAbs >> 16;
+				}
 
-			if(readSample == 0) continue;
+				if(readSample == 0) continue;
 
-			//Mix in adsrVolume
-			int32 inputSample = (readSample * static_cast<int32>(channel.adsrVolume >> 16)) / static_cast<int32>(MAX_ADSR_VOLUME >> 16);
+				//Mix in adsrVolume
+				int32 adsrScaled = readSample * static_cast<int32>(channel.adsrVolume >> 16);
+				int32 inputSample = (adsrScaled + (adsrScaled >> 15)) >> 15;
 
-			if(inputSample == 0) continue;
+				if(inputSample == 0) continue;
 
-			int32 volumeLeft = channel.volumeLeftAbs >> 16;
-			int32 volumeRight = channel.volumeRightAbs >> 16;
+				int16* dst = samples + (j * 2);
+				MixSamples(inputSample, volL, dst + 0);
+				MixSamples(inputSample, volR, dst + 1);
 
-			MixSamples(inputSample, volumeLeft, samples + 0);
-			MixSamples(inputSample, volumeRight, samples + 1);
-
-			//Mix in reverb if enabled for this channel
-			if(updateReverb && (m_channelReverb.f & (1 << i)))
-			{
-				MixSamples(inputSample, volumeLeft, reverbSample + 0);
-				MixSamples(inputSample, volumeRight, reverbSample + 1);
+				if(chanReverb)
+				{
+					int16* rdst = reverbBuf + (j * 2);
+					MixSamples(inputSample, volL, rdst + 0);
+					MixSamples(inputSample, volR, rdst + 1);
+				}
 			}
 		}
+		channel.current = reader.GetCurrent();
+	}
 
+	//Precompute reverb parameters once per Render() call instead of re-dividing per sample.
+	const uint32 revWorkStart = m_reverbWorkAddrStart;
+	const uint32 revWorkEnd = m_reverbWorkAddrEnd;
+	const uint32 revWorkSize = updateReverb ? (revWorkEnd - revWorkStart) : 0;
+	const float revIirCoef = updateReverb ? GetReverbCoef(IIR_COEF) : 0.0f;
+	const float revInCoefL = updateReverb ? GetReverbCoef(IN_COEF_L) : 0.0f;
+	const float revInCoefR = updateReverb ? GetReverbCoef(IN_COEF_R) : 0.0f;
+	const float revIirAlpha = updateReverb ? GetReverbCoef(IIR_ALPHA) : 0.0f;
+	const float revOneMinusIirAlpha = 1.0f - revIirAlpha;
+	const float revAccCoefA = updateReverb ? GetReverbCoef(ACC_COEF_A) : 0.0f;
+	const float revAccCoefB = updateReverb ? GetReverbCoef(ACC_COEF_B) : 0.0f;
+	const float revAccCoefC = updateReverb ? GetReverbCoef(ACC_COEF_C) : 0.0f;
+	const float revAccCoefD = updateReverb ? GetReverbCoef(ACC_COEF_D) : 0.0f;
+	const float revFbAlpha = updateReverb ? GetReverbCoef(FB_ALPHA) : 0.0f;
+	const float revFbX = updateReverb ? GetReverbCoef(FB_X) : 0.0f;
+	const uint32 revOffIirSrcA0 = updateReverb ? m_reverb[IIR_SRC_A0] : 0;
+	const uint32 revOffIirSrcA1 = updateReverb ? m_reverb[IIR_SRC_A1] : 0;
+	const uint32 revOffIirSrcB0 = updateReverb ? m_reverb[IIR_SRC_B0] : 0;
+	const uint32 revOffIirSrcB1 = updateReverb ? m_reverb[IIR_SRC_B1] : 0;
+	const uint32 revOffIirDstA0 = updateReverb ? m_reverb[IIR_DEST_A0] : 0;
+	const uint32 revOffIirDstA1 = updateReverb ? m_reverb[IIR_DEST_A1] : 0;
+	const uint32 revOffIirDstB0 = updateReverb ? m_reverb[IIR_DEST_B0] : 0;
+	const uint32 revOffIirDstB1 = updateReverb ? m_reverb[IIR_DEST_B1] : 0;
+	const uint32 revOffAccSrcA0 = updateReverb ? m_reverb[ACC_SRC_A0] : 0;
+	const uint32 revOffAccSrcA1 = updateReverb ? m_reverb[ACC_SRC_A1] : 0;
+	const uint32 revOffAccSrcB0 = updateReverb ? m_reverb[ACC_SRC_B0] : 0;
+	const uint32 revOffAccSrcB1 = updateReverb ? m_reverb[ACC_SRC_B1] : 0;
+	const uint32 revOffAccSrcC0 = updateReverb ? m_reverb[ACC_SRC_C0] : 0;
+	const uint32 revOffAccSrcC1 = updateReverb ? m_reverb[ACC_SRC_C1] : 0;
+	const uint32 revOffAccSrcD0 = updateReverb ? m_reverb[ACC_SRC_D0] : 0;
+	const uint32 revOffAccSrcD1 = updateReverb ? m_reverb[ACC_SRC_D1] : 0;
+	const uint32 revOffMixDstA0 = updateReverb ? m_reverb[MIX_DEST_A0] : 0;
+	const uint32 revOffMixDstA1 = updateReverb ? m_reverb[MIX_DEST_A1] : 0;
+	const uint32 revOffMixDstB0 = updateReverb ? m_reverb[MIX_DEST_B0] : 0;
+	const uint32 revOffMixDstB1 = updateReverb ? m_reverb[MIX_DEST_B1] : 0;
+	const uint32 revOffFbA0 = updateReverb ? (revOffMixDstA0 - m_reverb[FB_SRC_A]) : 0;
+	const uint32 revOffFbA1 = updateReverb ? (revOffMixDstA1 - m_reverb[FB_SRC_A]) : 0;
+	const uint32 revOffFbB0 = updateReverb ? (revOffMixDstB0 - m_reverb[FB_SRC_B]) : 0;
+	const uint32 revOffFbB1 = updateReverb ? (revOffMixDstB1 - m_reverb[FB_SRC_B]) : 0;
+
+	uint8* const ramPtr = m_ram;
+	auto readRev = [&](uint32 addr) -> float {
+		uint32 absAddr = m_reverbCurrAddr + addr;
+		if(absAddr >= revWorkEnd)
+		{
+			absAddr -= revWorkSize;
+			if(absAddr >= revWorkEnd)
+			{
+				while(absAddr >= revWorkEnd) absAddr -= revWorkSize;
+			}
+		}
+		return static_cast<float>(*reinterpret_cast<const int16*>(ramPtr + absAddr));
+	};
+	auto writeRev = [&](uint32 addr, float value) {
+		uint32 absAddr = m_reverbCurrAddr + addr;
+		if(absAddr >= revWorkEnd)
+		{
+			absAddr -= revWorkSize;
+			if(absAddr >= revWorkEnd)
+			{
+				while(absAddr >= revWorkEnd) absAddr -= revWorkSize;
+			}
+		}
+		value = std::clamp<float>(value, static_cast<float>(SHRT_MIN), static_cast<float>(SHRT_MAX));
+		*reinterpret_cast<int16*>(ramPtr + absAddr) = static_cast<int16>(value);
+	};
+
+	bool revOutValid = false;
+	int32 cachedRevL = 0;
+	int32 cachedRevR = 0;
+
+	for(unsigned int j = 0; j < ticks; j++)
+	{
 		if(!m_blockReader.CanReadSamples() && (m_blockWritePtr == SOUND_INPUT_DATA_SIZE))
 		{
 			//We're ready to consume some data
@@ -836,7 +998,61 @@ void CSpuBase::Render(int16* samples, unsigned int sampleCount)
 		//Update reverb
 		if(updateReverb)
 		{
-			UpdateReverb(reverbSample, samples);
+			if(m_reverbTicks & 1)
+			{
+				const int16* rs = reverbBuf + (j * 2);
+				float inL = static_cast<float>(rs[0]) * 0.5f * revInCoefL;
+				float inR = static_cast<float>(rs[1]) * 0.5f * revInCoefR;
+
+				float iir_input_a0 = readRev(revOffIirSrcA0) * revIirCoef + inL;
+				float iir_input_a1 = readRev(revOffIirSrcA1) * revIirCoef + inR;
+				float iir_input_b0 = readRev(revOffIirSrcB1) * revIirCoef + inL;
+				float iir_input_b1 = readRev(revOffIirSrcB0) * revIirCoef + inR;
+
+				float iir_a0 = iir_input_a0 * revIirAlpha + readRev(revOffIirDstA0) * revOneMinusIirAlpha;
+				float iir_a1 = iir_input_a1 * revIirAlpha + readRev(revOffIirDstA1) * revOneMinusIirAlpha;
+				float iir_b0 = iir_input_b0 * revIirAlpha + readRev(revOffIirDstB0) * revOneMinusIirAlpha;
+				float iir_b1 = iir_input_b1 * revIirAlpha + readRev(revOffIirDstB1) * revOneMinusIirAlpha;
+
+				writeRev(revOffIirDstA0 + 2, iir_a0);
+				writeRev(revOffIirDstA1 + 2, iir_a1);
+				writeRev(revOffIirDstB0 + 2, iir_b0);
+				writeRev(revOffIirDstB1 + 2, iir_b1);
+
+				float acc0 = readRev(revOffAccSrcA0) * revAccCoefA + readRev(revOffAccSrcB0) * revAccCoefB +
+				             readRev(revOffAccSrcC0) * revAccCoefC + readRev(revOffAccSrcD0) * revAccCoefD;
+				float acc1 = readRev(revOffAccSrcA1) * revAccCoefA + readRev(revOffAccSrcB1) * revAccCoefB +
+				             readRev(revOffAccSrcC1) * revAccCoefC + readRev(revOffAccSrcD1) * revAccCoefD;
+
+				float fb_a0 = readRev(revOffFbA0);
+				float fb_a1 = readRev(revOffFbA1);
+				float fb_b0 = readRev(revOffFbB0);
+				float fb_b1 = readRev(revOffFbB1);
+
+				writeRev(revOffMixDstA0, acc0 - fb_a0 * revFbAlpha);
+				writeRev(revOffMixDstA1, acc1 - fb_a1 * revFbAlpha);
+				writeRev(revOffMixDstB0, (revFbAlpha * acc0) + fb_a0 * revFbAlpha - fb_b0 * revFbX);
+				writeRev(revOffMixDstB1, (revFbAlpha * acc1) + fb_a1 * revFbAlpha - fb_b1 * revFbX);
+
+				m_reverbCurrAddr += 2;
+				if(m_reverbCurrAddr >= revWorkEnd)
+				{
+					m_reverbCurrAddr = revWorkStart;
+				}
+				revOutValid = false;
+			}
+			if(revWorkStart != 0)
+			{
+				if(!revOutValid)
+				{
+					cachedRevL = static_cast<int32>(0.333f * (readRev(revOffMixDstA0) + readRev(revOffMixDstB0)));
+					cachedRevR = static_cast<int32>(0.333f * (readRev(revOffMixDstA1) + readRev(revOffMixDstB1)));
+					revOutValid = true;
+				}
+				samples[0] = static_cast<int16>(std::clamp<int32>(cachedRevL + static_cast<int32>(samples[0]), SHRT_MIN, SHRT_MAX));
+				samples[1] = static_cast<int16>(std::clamp<int32>(cachedRevR + static_cast<int32>(samples[1]), SHRT_MIN, SHRT_MAX));
+			}
+			m_reverbTicks++;
 		}
 
 		samples += 2;
@@ -867,10 +1083,18 @@ uint32 CSpuBase::GetAdsrDelta(unsigned int index) const
 float CSpuBase::GetReverbSample(uint32 address) const
 {
 	uint32 absoluteAddress = m_reverbCurrAddr + address;
-	while(absoluteAddress >= m_reverbWorkAddrEnd)
+	const uint32 workEnd = m_reverbWorkAddrEnd;
+	if(absoluteAddress >= workEnd)
 	{
-		absoluteAddress -= m_reverbWorkAddrEnd;
-		absoluteAddress += m_reverbWorkAddrStart;
+		const uint32 workSize = workEnd - m_reverbWorkAddrStart;
+		absoluteAddress -= workSize;
+		if(absoluteAddress >= workEnd)
+		{
+			while(absoluteAddress >= workEnd)
+			{
+				absoluteAddress -= workSize;
+			}
+		}
 	}
 	return static_cast<float>(*reinterpret_cast<int16*>(m_ram + absoluteAddress));
 }
@@ -878,10 +1102,18 @@ float CSpuBase::GetReverbSample(uint32 address) const
 void CSpuBase::SetReverbSample(uint32 address, float value)
 {
 	uint32 absoluteAddress = m_reverbCurrAddr + address;
-	while(absoluteAddress >= m_reverbWorkAddrEnd)
+	const uint32 workEnd = m_reverbWorkAddrEnd;
+	if(absoluteAddress >= workEnd)
 	{
-		absoluteAddress -= m_reverbWorkAddrEnd;
-		absoluteAddress += m_reverbWorkAddrStart;
+		const uint32 workSize = workEnd - m_reverbWorkAddrStart;
+		absoluteAddress -= workSize;
+		if(absoluteAddress >= workEnd)
+		{
+			while(absoluteAddress >= workEnd)
+			{
+				absoluteAddress -= workSize;
+			}
+		}
 	}
 	value = std::max<float>(value, SHRT_MIN);
 	value = std::min<float>(value, SHRT_MAX);
@@ -1345,12 +1577,12 @@ void CSpuBase::CSampleReader::SetPitch(uint32 baseSamplingRate, uint16 pitch)
 
 int32 CSpuBase::CSampleReader::GetSample()
 {
-	uint32 srcSampleIdx = m_srcSampleIdx / PITCH_BASE;
-	int32 srcSampleAlpha = m_srcSampleIdx % PITCH_BASE;
+	static_assert(PITCH_BASE == 0x1000, "PITCH_BASE must be 4096");
+	uint32 srcSampleIdx = m_srcSampleIdx >> 12;
+	int32 srcSampleAlpha = static_cast<int32>(m_srcSampleIdx & 0xFFFU);
 	int32 currentSample = m_buffer[srcSampleIdx];
 	int32 nextSample = m_buffer[srcSampleIdx + 1];
-	int32 resultSample = (currentSample * (PITCH_BASE - srcSampleAlpha) / PITCH_BASE) +
-	                     (nextSample * srcSampleAlpha / PITCH_BASE);
+	int32 resultSample = (currentSample * (PITCH_BASE - srcSampleAlpha) + nextSample * srcSampleAlpha) >> 12;
 	m_srcSampleIdx += m_sampleStep;
 	if(srcSampleIdx >= BUFFER_SAMPLES)
 	{
@@ -1360,11 +1592,174 @@ int32 CSpuBase::CSampleReader::GetSample()
 	return resultSample;
 }
 
+void CSpuBase::CSampleReader::SkipSamples(unsigned int ticks)
+{
+	constexpr uint32 limit = BUFFER_SAMPLES * PITCH_BASE;
+	const uint32 step = m_sampleStep;
+	uint32 idx = m_srcSampleIdx;
+	unsigned int j = 0;
+	while(j < ticks)
+	{
+		if(idx < limit)
+		{
+			if(step == 0)
+			{
+				j = ticks;
+				break;
+			}
+			uint32 stepsToLimit = ((limit - 1U - idx) / step) + 1U;
+			uint32 chunk = std::min<uint32>(ticks - j, stepsToLimit);
+			idx += chunk * step;
+			j += chunk;
+			continue;
+		}
+		idx += step - limit;
+		m_srcSampleIdx = idx;
+		AdvanceBuffer();
+		j++;
+		if(m_done)
+		{
+			m_done = false;
+			return;
+		}
+	}
+	m_srcSampleIdx = idx;
+}
+
+void CSpuBase::CSampleReader::RenderSteady(int16* __restrict samples, int16* __restrict reverbBuf, unsigned int ticks,
+                                           int32 adsrVol, int32 volL, int32 volR, bool repeatSet,
+                                           uint32& channelRepeat, bool& outStopped)
+{
+	constexpr uint32 limit = BUFFER_SAMPLES * PITCH_BASE;
+	const uint32 step = m_sampleStep;
+	const bool silent = (adsrVol == 0) || (volL == 0 && volR == 0);
+	unsigned int j = 0;
+	while(j < ticks)
+	{
+		if(m_done)
+		{
+			outStopped = true;
+			m_done = false;
+			return;
+		}
+		if(m_didChangeRepeat && !repeatSet)
+		{
+			channelRepeat = m_repeatAddr;
+			m_didChangeRepeat = false;
+		}
+
+		uint32 idx = m_srcSampleIdx;
+		if(silent)
+		{
+			if(idx < limit)
+			{
+				if(step == 0)
+				{
+					return;
+				}
+				uint32 stepsToLimit = ((limit - 1U - idx) / step) + 1U;
+				uint32 chunk = std::min<uint32>(ticks - j, stepsToLimit);
+				m_srcSampleIdx = idx + chunk * step;
+				j += chunk;
+				continue;
+			}
+			m_srcSampleIdx = idx + step - limit;
+			AdvanceBuffer();
+			j++;
+			continue;
+		}
+
+		const int16* __restrict buf = m_buffer;
+		if(!reverbBuf)
+		{
+			while(j < ticks && idx < limit)
+			{
+				uint32 sIdx = idx >> 12;
+				int32 alpha = static_cast<int32>(idx & 0xFFFU);
+				int32 s0 = buf[sIdx];
+				int32 s1 = buf[sIdx + 1];
+				int32 readSample = (s0 * (PITCH_BASE - alpha) + s1 * alpha) >> 12;
+				idx += step;
+				if(readSample != 0)
+				{
+					int32 adsrScaled = readSample * adsrVol;
+					int32 inputSample = (adsrScaled + (adsrScaled >> 15)) >> 15;
+					if(inputSample != 0)
+					{
+						int16* dst = samples + (j * 2);
+						MixSamples(inputSample, volL, dst + 0);
+						MixSamples(inputSample, volR, dst + 1);
+					}
+				}
+				j++;
+			}
+		}
+		else
+		{
+			while(j < ticks && idx < limit)
+			{
+				uint32 sIdx = idx >> 12;
+				int32 alpha = static_cast<int32>(idx & 0xFFFU);
+				int32 s0 = buf[sIdx];
+				int32 s1 = buf[sIdx + 1];
+				int32 readSample = (s0 * (PITCH_BASE - alpha) + s1 * alpha) >> 12;
+				idx += step;
+				if(readSample != 0)
+				{
+					int32 adsrScaled = readSample * adsrVol;
+					int32 inputSample = (adsrScaled + (adsrScaled >> 15)) >> 15;
+					if(inputSample != 0)
+					{
+						int16* dst = samples + (j * 2);
+						MixSamples(inputSample, volL, dst + 0);
+						MixSamples(inputSample, volR, dst + 1);
+						int16* rdst = reverbBuf + (j * 2);
+						MixSamples(inputSample, volL, rdst + 0);
+						MixSamples(inputSample, volR, rdst + 1);
+					}
+				}
+				j++;
+			}
+		}
+		m_srcSampleIdx = idx;
+
+		if(j < ticks)
+		{
+			uint32 sIdx = idx >> 12;
+			int32 alpha = static_cast<int32>(idx & 0xFFFU);
+			int32 s0 = buf[sIdx];
+			int32 s1 = buf[sIdx + 1];
+			int32 readSample = (s0 * (PITCH_BASE - alpha) + s1 * alpha) >> 12;
+			m_srcSampleIdx = idx + step - limit;
+			AdvanceBuffer();
+			if(readSample != 0)
+			{
+				int32 adsrScaled = readSample * adsrVol;
+				int32 inputSample = (adsrScaled + (adsrScaled >> 15)) >> 15;
+				if(inputSample != 0)
+				{
+					int16* dst = samples + (j * 2);
+					MixSamples(inputSample, volL, dst + 0);
+					MixSamples(inputSample, volR, dst + 1);
+					if(reverbBuf)
+					{
+						int16* rdst = reverbBuf + (j * 2);
+						MixSamples(inputSample, volL, rdst + 0);
+						MixSamples(inputSample, volR, rdst + 1);
+					}
+				}
+			}
+			j++;
+		}
+	}
+}
+
 void CSpuBase::CSampleReader::AdvanceBuffer()
 {
 	if(m_nextValid)
 	{
-		memmove(m_buffer, m_buffer + BUFFER_SAMPLES, sizeof(int16) * BUFFER_SAMPLES);
+		//Non-overlapping fixed 56-byte copy; compiler lowers memcpy to inline SIMD moves.
+		memcpy(m_buffer, m_buffer + BUFFER_SAMPLES, sizeof(int16) * BUFFER_SAMPLES);
 		UnpackSamples(m_buffer + BUFFER_SAMPLES);
 	}
 	else
@@ -1382,8 +1777,6 @@ void CSpuBase::CSampleReader::UpdateSampleStep()
 
 void CSpuBase::CSampleReader::UnpackSamples(int16* dst)
 {
-	int32 workBuffer[BUFFER_SAMPLES];
-
 	const uint8* nextSample = m_ram + m_nextSampleAddr;
 
 	m_irqWatcher->CheckIrq(m_nextSampleAddr);
@@ -1394,71 +1787,77 @@ void CSpuBase::CSampleReader::UnpackSamples(int16* dst)
 	uint8 flags = nextSample[1];
 	assert(predictNumber < 5);
 
-	auto cacheKey = CSpuSampleCache::KEY{m_nextSampleAddr, m_s1, m_s2};
+	//Decode ADPCM directly: 28 iterations is much faster than multimap lookup/allocation in CSpuSampleCache.
+	//Table is 16 entries long to prevent reading indeterminate values if predictNumber >= 5.
+	static const int32 predictorTable[16][2] =
+	    {
+	        {0, 0},
+	        {60, 0},
+	        {115, -52},
+	        {98, -55},
+	        {122, -60},
+	    };
+
+	int32 s1 = m_s1;
+	int32 s2 = m_s2;
+
+	const uint32 shiftTotal = 16U + shiftFactor;
 	if(predictNumber == 0)
 	{
-		cacheKey.s1 = 0;
-		cacheKey.s2 = 0;
+		unsigned int outIdx = 0;
+		for(unsigned int i = 2; i < 16; i++)
+		{
+			uint32 sampleByte = nextSample[i];
+			dst[outIdx++] = static_cast<int16>(static_cast<int32>(sampleByte << 28) >> shiftTotal);
+			dst[outIdx++] = static_cast<int16>(static_cast<int32>((sampleByte & 0xF0U) << 24) >> shiftTotal);
+		}
+		s2 = static_cast<int32>(dst[26]) << 6;
+		s1 = static_cast<int32>(dst[27]) << 6;
 	}
-
-	if(auto cacheItem = m_sampleCache->GetItem(cacheKey))
+	else if(predictNumber == 1)
 	{
-		memcpy(dst, cacheItem->samples, sizeof(int16) * BUFFER_SAMPLES);
-		m_s1 = cacheItem->outS1;
-		m_s2 = cacheItem->outS2;
+		unsigned int outIdx = 0;
+		for(unsigned int i = 2; i < 16; i++)
+		{
+			uint32 sampleByte = nextSample[i];
+			int32 firstSample = static_cast<int32>(sampleByte << 28) >> shiftTotal;
+			int32 secondSample = static_cast<int32>((sampleByte & 0xF0U) << 24) >> shiftTotal;
+
+			int32 v0 = (firstSample << 6) + ((s1 * 60) >> 6);
+			s2 = s1;
+			s1 = v0;
+			dst[outIdx++] = static_cast<int16>(std::clamp<int32>((v0 + 32) >> 6, SHRT_MIN, SHRT_MAX));
+
+			int32 v1 = (secondSample << 6) + ((s1 * 60) >> 6);
+			s2 = s1;
+			s1 = v1;
+			dst[outIdx++] = static_cast<int16>(std::clamp<int32>((v1 + 32) >> 6, SHRT_MIN, SHRT_MAX));
+		}
 	}
 	else
 	{
-		//Get intermediate values
+		const int32 pred0 = predictorTable[predictNumber][0];
+		const int32 pred1 = predictorTable[predictNumber][1];
+		unsigned int outIdx = 0;
+		for(unsigned int i = 2; i < 16; i++)
 		{
-			unsigned int workBufferPtr = 0;
-			for(unsigned int i = 2; i < 16; i++)
-			{
-				uint8 sampleByte = nextSample[i];
-				int16 firstSample = ((sampleByte & 0x0F) << 12);
-				int16 secondSample = ((sampleByte & 0xF0) << 8);
-				firstSample >>= shiftFactor;
-				secondSample >>= shiftFactor;
-				workBuffer[workBufferPtr++] = firstSample;
-				workBuffer[workBufferPtr++] = secondSample;
-			}
-		}
+			uint32 sampleByte = nextSample[i];
+			int32 firstSample = static_cast<int32>(sampleByte << 28) >> shiftTotal;
+			int32 secondSample = static_cast<int32>((sampleByte & 0xF0U) << 24) >> shiftTotal;
 
-		//Generate PCM samples
-		{
-			// clang-format off
-			//Table is 16 entries long to prevent reading indeterminate
-			//values if predictNumber is greater or equal to 5.
-			//According to some sources, entries at 5 and beyond contain 0 on real hardware
-			static const int32 predictorTable[16][2] =
-			{
-				{0, 0},
-				{60, 0},
-				{115, -52},
-				{98, -55},
-				{122, -60},
-			};
-			// clang-format on
+			int32 v0 = (firstSample << 6) + ((s1 * pred0) >> 6) + ((s2 * pred1) >> 6);
+			s2 = s1;
+			s1 = v0;
+			dst[outIdx++] = static_cast<int16>(std::clamp<int32>((v0 + 32) >> 6, SHRT_MIN, SHRT_MAX));
 
-			for(unsigned int i = 0; i < BUFFER_SAMPLES; i++)
-			{
-				int32 currentValue = workBuffer[i] * 64;
-				currentValue += (m_s1 * predictorTable[predictNumber][0]) / 64;
-				currentValue += (m_s2 * predictorTable[predictNumber][1]) / 64;
-				m_s2 = m_s1;
-				m_s1 = currentValue;
-				int32 result = (currentValue + 32) / 64;
-				result = std::max<int32>(result, SHRT_MIN);
-				result = std::min<int32>(result, SHRT_MAX);
-				dst[i] = static_cast<int16>(result);
-			}
-
-			auto& cacheItem = m_sampleCache->RegisterItem(cacheKey);
-			memcpy(&cacheItem.samples, dst, sizeof(int16) * BUFFER_SAMPLES);
-			cacheItem.outS1 = m_s1;
-			cacheItem.outS2 = m_s2;
+			int32 v1 = (secondSample << 6) + ((s1 * pred0) >> 6) + ((s2 * pred1) >> 6);
+			s2 = s1;
+			s1 = v1;
+			dst[outIdx++] = static_cast<int16>(std::clamp<int32>((v1 + 32) >> 6, SHRT_MIN, SHRT_MAX));
 		}
 	}
+	m_s1 = s1;
+	m_s2 = s2;
 
 	if(flags & 0x04)
 	{

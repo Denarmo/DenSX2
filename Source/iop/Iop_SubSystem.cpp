@@ -1,5 +1,6 @@
 #include "Iop_SubSystem.h"
 #include "IopBios.h"
+#include "../BasicBlock.h"
 #include "GenericMipsExecutor.h"
 #include "../psx/PsxBios.h"
 #include "../states/MemoryStateFile.h"
@@ -50,7 +51,10 @@ CSubSystem::CSubSystem(bool ps2Mode)
 		m_bios = std::make_shared<CPsxBios>(m_cpu, m_ram, PS2::IOP_BASE_RAM_SIZE);
 	}
 
-	m_cpu.m_executor = std::make_unique<CGenericMipsExecutor<BlockLookupOneWay>>(m_cpu, (IOP_RAM_SIZE * 4), BLOCK_CATEGORY_PS2_IOP);
+	SetupBlockFixedFrame(m_cpu);
+	auto iopExecutor = std::make_unique<CGenericMipsExecutor<BlockLookupTwoWay>>(m_cpu, (IOP_RAM_SIZE * 4), BLOCK_CATEGORY_PS2_IOP);
+	iopExecutor->EnableCodeTable();
+	m_cpu.m_executor = std::move(iopExecutor);
 
 	//Read memory map
 	m_cpu.m_pMemoryMap->InsertReadMap((0 * IOP_RAM_SIZE), (0 * IOP_RAM_SIZE) + IOP_RAM_SIZE - 1, m_ram, 0x01);

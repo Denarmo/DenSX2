@@ -316,6 +316,8 @@ namespace Iop
 			void SetParamsNoRead(uint32, uint32);
 			void SetPitch(uint32, uint16);
 			int32 GetSample();
+			void SkipSamples(unsigned int);
+			void RenderSteady(int16*, int16*, unsigned int, int32, int32, int32, bool, uint32&, bool&);
 			uint32 GetRepeat() const;
 			void SetRepeat(uint32);
 			uint32 GetCurrent() const;

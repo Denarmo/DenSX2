@@ -332,6 +332,7 @@ uint32& CIopBios::ModuleStartRequestFree() const
 
 void CIopBios::PreLoadState()
 {
+	ClearImportCache();
 	//Remove all dynamic modules
 	for(auto modulePairIterator = m_modules.begin();
 	    modulePairIterator != m_modules.end();)
@@ -3301,35 +3302,49 @@ void CIopBios::HandleException()
 	}
 	else
 	{
-		//Search for the import record
-		uint32 instruction = callInstruction;
-		while(instruction != 0x41E00000)
-		{
-			memory--;
-			instruction = memory[0];
-		}
 		uint32 functionId = callInstruction & 0xFFFF;
-		FRAMEWORK_MAYBE_UNUSED uint32 version = memory[2];
-		auto moduleName = ReadModuleName(reinterpret_cast<const uint8*>(memory + 3));
-
-#ifdef _DEBUG
-		if(moduleName == "libsd")
+		auto& cacheEntry = m_importCache[(searchAddress >> 2) & (IMPORT_CACHE_SIZE - 1)];
+		if(cacheEntry.callAddr == searchAddress && cacheEntry.module != nullptr &&
+		   cacheEntry.headerPtr[0] == 0x41E00000 &&
+		   *reinterpret_cast<const uint64*>(cacheEntry.headerPtr + 3) == cacheEntry.nameKey)
 		{
-			Iop::CLibSd::TraceCall(m_cpu, functionId);
-		}
-#endif
-
-		auto module(m_modules.find(moduleName));
-		if(module != m_modules.end())
-		{
-			module->second->Invoke(m_cpu, functionId);
+			cacheEntry.module->Invoke(m_cpu, functionId);
 		}
 		else
 		{
+			//Search for the import record
+			uint32 instruction = callInstruction;
+			while(instruction != 0x41E00000)
+			{
+				memory--;
+				instruction = memory[0];
+			}
+			FRAMEWORK_MAYBE_UNUSED uint32 version = memory[2];
+			auto moduleName = ReadModuleName(reinterpret_cast<const uint8*>(memory + 3));
+
 #ifdef _DEBUG
-			CLog::GetInstance().Warn(LOGNAME, "%08X: Trying to call a function from non-existing module (%s, %d).\r\n",
-			                         m_cpu.m_State.nPC, std::string(moduleName).c_str(), functionId);
+			if(moduleName == "libsd")
+			{
+				Iop::CLibSd::TraceCall(m_cpu, functionId);
+			}
 #endif
+
+			auto module(m_modules.find(moduleName));
+			if(module != m_modules.end())
+			{
+				cacheEntry.callAddr = searchAddress;
+				cacheEntry.headerPtr = memory;
+				cacheEntry.nameKey = *reinterpret_cast<const uint64*>(memory + 3);
+				cacheEntry.module = module->second.get();
+				module->second->Invoke(m_cpu, functionId);
+			}
+			else
+			{
+#ifdef _DEBUG
+				CLog::GetInstance().Warn(LOGNAME, "%08X: Trying to call a function from non-existing module (%s, %d).\r\n",
+				                         m_cpu.m_State.nPC, std::string(moduleName).c_str(), functionId);
+#endif
+			}
 		}
 	}
 
@@ -3402,6 +3417,7 @@ void CIopBios::ReturnFromException()
 
 void CIopBios::DeleteModules()
 {
+	ClearImportCache();
 	m_modules.clear();
 
 #ifdef _IOP_EMULATE_MODULES
@@ -3446,6 +3462,7 @@ void CIopBios::UnloadUserComponents()
 		UnloadModule(loadedModuleIterator);
 	}
 	std::experimental::erase_if(m_modules, [](const auto& modulePair) { return std::dynamic_pointer_cast<Iop::CDynamic>(modulePair.second); });
+	ClearImportCache();
 	m_intrHandlers.FreeAll();
 	m_semaphores.FreeAll();
 	m_sifCmd->ClearServers();
@@ -3531,6 +3548,7 @@ bool CIopBios::RegisterModule(const Iop::ModulePtr& module)
 	bool registered = (m_modules.find(module->GetId()) != std::end(m_modules));
 	if(registered) return false;
 	m_modules[module->GetId()] = module;
+	ClearImportCache();
 	return true;
 }
 
@@ -3539,6 +3557,7 @@ bool CIopBios::ReleaseModule(const std::string& moduleName)
 	auto moduleIterator = m_modules.find(moduleName);
 	if(moduleIterator == std::end(m_modules)) return false;
 	m_modules.erase(moduleIterator);
+	ClearImportCache();
 	return true;
 }
 

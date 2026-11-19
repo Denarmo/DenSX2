@@ -684,6 +684,24 @@ private:
 
 	IopModuleMapType m_modules;
 
+	struct IMPORT_CACHE_ENTRY
+	{
+		uint32 callAddr = ~0U;
+		const uint32* headerPtr = nullptr;
+		uint64 nameKey = 0;
+		Iop::CModule* module = nullptr;
+	};
+	static constexpr uint32 IMPORT_CACHE_SIZE = 64;
+	IMPORT_CACHE_ENTRY m_importCache[IMPORT_CACHE_SIZE] = {};
+	void ClearImportCache()
+	{
+		for(auto& e : m_importCache)
+		{
+			e.callAddr = ~0U;
+			e.module = nullptr;
+		}
+	}
+
 	OsVariableWrapper<uint32> m_currentThreadId;
 
 #ifdef DEBUGGER_INCLUDED
