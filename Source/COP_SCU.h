@@ -70,6 +70,9 @@ public:
 
 	static const char* m_sRegName[];
 
+	static void HandleTLBRead(CMIPS*);
+	static void HandleTLBWrite(CMIPS*);
+
 protected:
 	void SetupReflectionTables();
 
@@ -99,9 +102,6 @@ protected:
 	MIPSReflection::SUBTABLE m_ReflMtPerfTable;
 
 private:
-	static void HandleTLBRead(CMIPS*);
-	static void HandleTLBWrite(CMIPS*);
-
 	typedef void (CCOP_SCU::*InstructionFuncConstant)();
 
 	static InstructionFuncConstant m_pOpGeneral[0x20];

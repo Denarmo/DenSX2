@@ -32,7 +32,7 @@ void CMIPSInstructionFactory::SetupQuickVariables(uint32 nAddress, CMipsJitter* 
 	m_nOpcode = m_pCtx->m_pMemoryMap->GetInstruction(m_nAddress);
 }
 
-static void HandleTLBException(CMIPS*)
+extern "C" void HandleTLBException(CMIPS*)
 {
 	//Will exit CPU execution loop with an exception pending
 }
@@ -169,8 +169,19 @@ void CMIPSInstructionFactory::Branch(Jitter::CONDITION condition)
 {
 	uint16 nImmediate = (uint16)(m_nOpcode & 0xFFFF);
 
-	m_codeGen->PushCst(MIPS_INVALID_PC);
-	m_codeGen->PullRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
+	if(m_codeGen->GetCodeGen()->SupportsCmpSelect())
+	{
+		//Keep the branch and its delay slot in the same Jitter basic block so allocated
+		//registers (and m_ramBase) remain live across the branch and delay slot without spilling.
+		m_codeGen->Cmp(condition);
+		m_codeGen->PushRel(offsetof(CMIPS, m_State.nPC));
+		m_codeGen->PushCst((m_instrPosition + 4) + CMIPS::GetBranch(nImmediate));
+		m_codeGen->Add();
+		m_codeGen->PushRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
+		m_codeGen->Select();
+		m_codeGen->PullRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
+		return;
+	}
 
 	m_codeGen->BeginIf(condition);
 	{
@@ -185,9 +196,6 @@ void CMIPSInstructionFactory::Branch(Jitter::CONDITION condition)
 void CMIPSInstructionFactory::BranchLikely(Jitter::CONDITION condition)
 {
 	uint16 nImmediate = (uint16)(m_nOpcode & 0xFFFF);
-
-	m_codeGen->PushCst(MIPS_INVALID_PC);
-	m_codeGen->PullRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
 
 	m_codeGen->BeginIf(condition);
 	{

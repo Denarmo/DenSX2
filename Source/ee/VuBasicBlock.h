@@ -12,6 +12,7 @@ public:
 
 protected:
 	void CompileRange(CMipsJitter*) override;
+	bool EndsWithDynamicBranch() const override;
 
 private:
 	struct INTEGER_BRANCH_DELAY_INFO

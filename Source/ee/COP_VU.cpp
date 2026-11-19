@@ -80,6 +80,23 @@ void CCOP_VU::LQC2()
 {
 	if(m_nFT == 0) return;
 
+	if((m_pCtx->m_pageLookup != nullptr) && m_codeGen->SupportsPageAccess() && m_codeGen->GetCodeGen()->Has128BitsCallOperands())
+	{
+		bool useDirectRam = (m_pCtx->m_ramBase != nullptr);
+		if(useDirectRam && m_pCtx->m_fixedFrameExit)
+		{
+			m_codeGen->PushCstPtr(0);
+		}
+		else
+		{
+			m_codeGen->PushRelRef(useDirectRam ? offsetof(CMIPS, m_ramBase) : offsetof(CMIPS, m_pageLookup));
+		}
+		ComputeMemAccessAddrNoXlat();
+		m_codeGen->MD_LoadFromPage(reinterpret_cast<void*>(&MemoryUtils_GetQuadProxy), useDirectRam ? static_cast<uint32>(offsetof(CMIPS, m_pageLookup)) : 0);
+		m_codeGen->MD_PullRel(offsetof(CMIPS, m_State.nCOP2[m_nFT]));
+		return;
+	}
+
 	ComputeMemAccessPageRef();
 
 	m_codeGen->PushCst(0);
@@ -114,6 +131,23 @@ void CCOP_VU::LQC2()
 //3E
 void CCOP_VU::SQC2()
 {
+	if((m_pCtx->m_pageLookup != nullptr) && m_codeGen->SupportsPageAccess() && m_codeGen->GetCodeGen()->Has128BitsCallOperands())
+	{
+		bool useDirectRam = (m_pCtx->m_ramBase != nullptr);
+		if(useDirectRam && m_pCtx->m_fixedFrameExit)
+		{
+			m_codeGen->PushCstPtr(0);
+		}
+		else
+		{
+			m_codeGen->PushRelRef(useDirectRam ? offsetof(CMIPS, m_ramBase) : offsetof(CMIPS, m_pageLookup));
+		}
+		ComputeMemAccessAddrNoXlat();
+		m_codeGen->MD_PushRel(offsetof(CMIPS, m_State.nCOP2[m_nFT]));
+		m_codeGen->MD_StoreAtPage(reinterpret_cast<void*>(&MemoryUtils_SetQuadProxy), useDirectRam ? static_cast<uint32>(offsetof(CMIPS, m_pageLookup)) : 0);
+		return;
+	}
+
 	ComputeMemAccessPageRef();
 
 	m_codeGen->PushCst(0);
@@ -154,11 +188,8 @@ void CCOP_VU::QMFC2()
 {
 	if(m_nFT == 0) return;
 
-	for(unsigned int i = 0; i < 4; i++)
-	{
-		m_codeGen->PushRel(offsetof(CMIPS, m_State.nCOP2[m_nFS].nV[i]));
-		m_codeGen->PullRel(offsetof(CMIPS, m_State.nGPR[m_nFT].nV[i]));
-	}
+	m_codeGen->MD_PushRel(offsetof(CMIPS, m_State.nCOP2[m_nFS]));
+	m_codeGen->MD_PullRel(offsetof(CMIPS, m_State.nGPR[m_nFT]));
 }
 
 //02
@@ -223,11 +254,8 @@ void CCOP_VU::QMTC2()
 {
 	if(m_nFS == 0) return;
 
-	for(unsigned int i = 0; i < 4; i++)
-	{
-		m_codeGen->PushRel(offsetof(CMIPS, m_State.nGPR[m_nFT].nV[i]));
-		m_codeGen->PullRel(offsetof(CMIPS, m_State.nCOP2[m_nFS].nV[i]));
-	}
+	m_codeGen->MD_PushRel(offsetof(CMIPS, m_State.nGPR[m_nFT]));
+	m_codeGen->MD_PullRel(offsetof(CMIPS, m_State.nCOP2[m_nFS]));
 }
 
 //06

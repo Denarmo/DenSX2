@@ -7,6 +7,7 @@
 #include "GIF.h"
 #include "SIF.h"
 #include "Vpu.h"
+#include "Vu1GifWorker.h"
 #include "IPU.h"
 #include "INTC.h"
 #include "Timer.h"
@@ -40,6 +41,19 @@ namespace Ee
 
 		void SetVpu0(std::shared_ptr<CVpu>);
 		void SetVpu1(std::shared_ptr<CVpu>);
+
+		void SyncVu1Gif(CVu1GifWorker::SYNC_REASON reason = CVu1GifWorker::SYNC_OTHER)
+		{
+			m_vu1GifWorker.Sync(reason);
+		}
+		bool IsVu1WorkerRunning() const
+		{
+			return m_vu1GifWorker.IsRunning();
+		}
+		CVu1GifWorker::STATS TakeVu1WorkerStats()
+		{
+			return m_vu1GifWorker.TakeStats();
+		}
 
 		uint8* m_ram = nullptr;
 		uint8* m_bios = nullptr;
@@ -92,7 +106,13 @@ namespace Ee
 		uint32 Vu0IoPortWriteHandler(uint32, uint32);
 		void Vu0StateChanged(CVpu::VU_STATE);
 
+		uint32 Vu1MicroMemReadHandler(uint32);
 		uint32 Vu1MicroMemWriteHandler(uint32, uint32);
+		uint32 Vu1MemReadHandler(uint32);
+		uint32 Vu1MemWriteHandler(uint32, uint32);
+
+		uint32 ReceiveDma1(uint32, uint32, uint32, bool);
+		uint32 ReceiveDma2(uint32, uint32, uint32, bool);
 
 		uint32 Vu1IoPortReadHandler(uint32);
 		uint32 Vu1IoPortWriteHandler(uint32, uint32);
@@ -123,5 +143,7 @@ namespace Ee
 		Framework::CSignal<void()>::Connection m_OnRequestInstructionCacheFlushConnection;
 		CVpu::VuStateChangedEvent::Connection m_vu0StateChangedConnection;
 		CVpu::VuInterruptTriggeredEvent::Connection m_vu1InterruptTriggeredConnection;
+
+		CVu1GifWorker m_vu1GifWorker;
 	};
 };

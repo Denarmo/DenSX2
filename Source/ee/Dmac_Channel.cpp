@@ -190,7 +190,7 @@ void CChannel::ExecuteNormal()
 		qwc = std::min<int32>(qwc, (ringBufferSize - ringBufferAddr) / 0x10);
 	}
 
-	uint32 nRecv = m_receive(m_nMADR, qwc, m_CHCR.nDIR, false);
+	uint32 nRecv = CallReceive(m_nMADR, qwc, m_CHCR.nDIR, false);
 
 	m_nMADR += nRecv * 0x10;
 	m_nQWC -= nRecv;
@@ -221,7 +221,7 @@ void CChannel::ExecuteInterleave()
 		//Transfer
 		{
 			uint32 qwc = m_dmac.m_D_SQWC.tqwc;
-			uint32 recv = m_receive(m_nMADR, qwc, CHCR_DIR_FROM, false);
+			uint32 recv = CallReceive(m_nMADR, qwc, CHCR_DIR_FROM, false);
 			assert(recv == qwc);
 
 			m_nMADR += recv * 0x10;
@@ -311,7 +311,7 @@ void CChannel::ExecuteSourceChain()
 		{
 			assert(m_CHCR.nTTE);
 			m_CHCR.nReserved0 = 0;
-			if(m_receive(m_nTADR, 1, CHCR_DIR_FROM, true) != 1)
+			if(CallReceive(m_nTADR, 1, CHCR_DIR_FROM, true) != 1)
 			{
 				//Device didn't receive DmaTag, break for now
 				m_CHCR.nReserved0 = 1;
@@ -360,7 +360,7 @@ void CChannel::ExecuteSourceChain()
 			if(m_CHCR.nTTE == 1)
 			{
 				m_CHCR.nReserved0 = 0;
-				if(m_receive(m_nTADR, 1, CHCR_DIR_FROM, true) != 1)
+				if(CallReceive(m_nTADR, 1, CHCR_DIR_FROM, true) != 1)
 				{
 					//Device didn't receive DmaTag, break for now
 					m_CHCR.nReserved0 = 1;
@@ -495,7 +495,7 @@ void CChannel::ExecuteDestinationChain()
 			m_CHCR.nTAG = static_cast<uint16>(tag >> 16);
 		}
 
-		uint32 recv = m_receive(m_nMADR, m_nQWC, m_CHCR.nDIR, false);
+		uint32 recv = CallReceive(m_nMADR, m_nQWC, m_CHCR.nDIR, false);
 		assert(recv == m_nQWC);
 
 		m_nMADR += recv * 0x10;
@@ -530,7 +530,7 @@ void CChannel::ExecuteSourceChainTransfer(bool isMfifo)
 
 	if(qwc != 0)
 	{
-		uint32 nRecv = m_receive(m_nMADR, qwc, CHCR_DIR_FROM, false);
+		uint32 nRecv = CallReceive(m_nMADR, qwc, CHCR_DIR_FROM, false);
 
 		m_nMADR += nRecv * 0x10;
 		m_nQWC -= nRecv;

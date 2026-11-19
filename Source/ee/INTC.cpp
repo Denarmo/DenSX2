@@ -14,13 +14,13 @@ CINTC::CINTC()
 
 void CINTC::Reset()
 {
-	m_INTC_STAT = 0;
+	m_INTC_STAT.store(0, std::memory_order_relaxed);
 	m_INTC_MASK = 0;
 }
 
 bool CINTC::IsInterruptPending() const
 {
-	return (m_INTC_STAT & m_INTC_MASK) != 0;
+	return (m_INTC_STAT.load(std::memory_order_acquire) & m_INTC_MASK) != 0;
 }
 
 uint32 CINTC::GetRegister(uint32 nAddress)
@@ -28,7 +28,7 @@ uint32 CINTC::GetRegister(uint32 nAddress)
 	switch(nAddress)
 	{
 	case INTC_STAT:
-		return m_INTC_STAT;
+		return m_INTC_STAT.load(std::memory_order_acquire);
 		break;
 	case INTC_MASK:
 		return m_INTC_MASK;
@@ -46,7 +46,7 @@ void CINTC::SetRegister(uint32 nAddress, uint32 nValue)
 	switch(nAddress)
 	{
 	case INTC_STAT:
-		m_INTC_STAT &= ~nValue;
+		m_INTC_STAT.fetch_and(~nValue, std::memory_order_acq_rel);
 		break;
 	case INTC_MASK:
 		m_INTC_MASK ^= nValue;
@@ -59,20 +59,20 @@ void CINTC::SetRegister(uint32 nAddress, uint32 nValue)
 
 void CINTC::AssertLine(uint32 nLine)
 {
-	m_INTC_STAT |= (1 << nLine);
+	m_INTC_STAT.fetch_or(1U << nLine, std::memory_order_release);
 }
 
 void CINTC::LoadState(Framework::CZipArchiveReader& archive)
 {
 	CRegisterStateFile registerFile(*archive.BeginReadFile(STATE_REGS_XML));
-	m_INTC_STAT = registerFile.GetRegister32("INTC_STAT");
+	m_INTC_STAT.store(registerFile.GetRegister32("INTC_STAT"), std::memory_order_relaxed);
 	m_INTC_MASK = registerFile.GetRegister32("INTC_MASK");
 }
 
 void CINTC::SaveState(Framework::CZipArchiveWriter& archive)
 {
 	auto registerFile = std::make_unique<CRegisterStateFile>(STATE_REGS_XML);
-	registerFile->SetRegister32("INTC_STAT", m_INTC_STAT);
+	registerFile->SetRegister32("INTC_STAT", m_INTC_STAT.load(std::memory_order_relaxed));
 	registerFile->SetRegister32("INTC_MASK", m_INTC_MASK);
 	archive.InsertFile(std::move(registerFile));
 }

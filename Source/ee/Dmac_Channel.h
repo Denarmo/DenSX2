@@ -11,6 +11,7 @@ class CDMAC;
 namespace Dmac
 {
 	typedef std::function<uint32(uint32, uint32, uint32, bool)> DmaReceiveHandler;
+	typedef uint32 (*DmaFastReceiveFn)(void*, uint32, uint32, uint32, bool);
 
 	class CChannel
 	{
@@ -79,6 +80,11 @@ namespace Dmac
 		void ExecuteSourceChain();
 		void ExecuteDestinationChain();
 		void SetReceiveHandler(const DmaReceiveHandler&);
+		void SetFastReceiveHandler(DmaFastReceiveFn fn, void* ctx)
+		{
+			m_fastReceive = fn;
+			m_fastReceiveCtx = ctx;
+		}
 
 		CHCR m_CHCR;
 		uint32 m_nMADR;
@@ -96,9 +102,16 @@ namespace Dmac
 		void ExecuteSourceChainTransfer(bool);
 		void ClearSTR();
 
+		inline uint32 CallReceive(uint32 addr, uint32 qwc, uint32 dir, bool tag)
+		{
+			return m_fastReceive ? m_fastReceive(m_fastReceiveCtx, addr, qwc, dir, tag) : m_receive(addr, qwc, dir, tag);
+		}
+
 		CDMAC& m_dmac;
 		unsigned int m_number = 0;
 		DmaReceiveHandler m_receive;
+		DmaFastReceiveFn m_fastReceive = nullptr;
+		void* m_fastReceiveCtx = nullptr;
 		uint32 m_nSCCTRL;
 	};
 };

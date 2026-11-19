@@ -1,4 +1,7 @@
 #include "Ee_SubSystem.h"
+#if defined(__linux__) || defined(__ANDROID__)
+#include <sys/mman.h>
+#endif
 #include "EeExecutor.h"
 #include "VuExecutor.h"
 #include "AppConfig.h"
@@ -27,7 +30,13 @@ using namespace Ee;
 #define FAKE_IOP_RAM_SIZE (0x1000)
 
 CSubSystem::CSubSystem(uint8* iopRam, CIopBios& iopBios)
-    : m_ram(reinterpret_cast<uint8*>(framework_aligned_alloc(PS2::EE_RAM_SIZE, framework_getpagesize())))
+    : m_ram(reinterpret_cast<uint8*>(framework_aligned_alloc(PS2::EE_RAM_SIZE,
+#if defined(__linux__) || defined(__ANDROID__)
+                                                             2 * 1024 * 1024
+#else
+                                                             framework_getpagesize()
+#endif
+                                                             )))
     , m_bios(new uint8[PS2::EE_BIOS_SIZE])
     , m_spr(reinterpret_cast<uint8*>(framework_aligned_alloc(PS2::EE_SPR_SIZE, 0x10)))
     , m_fakeIopRam(new uint8[FAKE_IOP_RAM_SIZE])
@@ -49,6 +58,7 @@ CSubSystem::CSubSystem(uint8* iopRam, CIopBios& iopBios)
     , m_COP_SCU(MIPS_REGSIZE_64)
     , m_COP_FPU(MIPS_REGSIZE_64)
     , m_COP_VU(MIPS_REGSIZE_64)
+    , m_vu1GifWorker(m_vpu1, m_gif)
 {
 	//Some alignment checks, this is needed because of SIMD instructions used in generated code
 	assert((reinterpret_cast<size_t>(&m_EE.m_State) & 0x0F) == 0);
@@ -57,19 +67,29 @@ CSubSystem::CSubSystem(uint8* iopRam, CIopBios& iopBios)
 	assert((reinterpret_cast<size_t>(m_spr) & 0x0F) == 0);
 	assert((reinterpret_cast<size_t>(m_vuMem0) & 0x0F) == 0);
 	assert((reinterpret_cast<size_t>(m_vuMem1) & 0x0F) == 0);
+#if defined(MADV_HUGEPAGE)
+	madvise(m_ram, PS2::EE_RAM_SIZE, MADV_HUGEPAGE);
+#endif
 
 	m_vpu0 = std::make_shared<CVpu>(0, CVpu::VPUINIT(m_microMem0, m_vuMem0, &m_VU0), m_gif, m_intc, m_ram, m_spr);
 	m_vpu1 = std::make_shared<CVpu>(1, CVpu::VPUINIT(m_microMem1, m_vuMem1, &m_VU1), m_gif, m_intc, m_ram, m_spr);
 
-	//Setup link between EE's VU context and VU0's VU context
-	m_vu0StateChangedConnection = m_vpu0->VuStateChanged.Connect([this](CVpu::VU_STATE newState) { Vu0StateChanged(newState); });
+	//Setup link between EE's VU context and VU0's VU context using direct callbacks
+	//(avoiding CSignal mutex + weak_ptr::lock overhead on every VCALLMS/microprogram).
+	m_vpu0->SetStateChangedCallback(
+	    [](void* ctx, CVpu::VU_STATE newState) {
+		    static_cast<CSubSystem*>(ctx)->Vu0StateChanged(newState);
+	    },
+	    this);
 
-	m_vu1InterruptTriggeredConnection = m_vpu1->VuInterruptTriggered.Connect(
-	    [this]() {
-		    uint32 currentState = m_intc.GetRegister(CINTC::INTC_STAT);
+	m_vpu1->SetInterruptCallback(
+	    [](void* ctx) {
+		    auto* self = static_cast<CSubSystem*>(ctx);
+		    uint32 currentState = self->m_intc.GetRegister(CINTC::INTC_STAT);
 		    assert((currentState & (1 << CINTC::INTC_LINE_VU1)) == 0);
-		    m_intc.AssertLine(CINTC::INTC_LINE_VU1);
-	    });
+		    self->m_intc.AssertLine(CINTC::INTC_LINE_VU1);
+	    },
+	    this);
 
 	//EmotionEngine context setup
 	{
@@ -152,8 +172,21 @@ CSubSystem::CSubSystem(uint8* iopRam, CIopBios& iopBios)
 	m_VU1.m_vuMem = m_vuMem1;
 
 	m_dmac.SetChannelTransferFunction(CDMAC::CHANNEL_ID_VIF0, std::bind(&CVif::ReceiveDMA, &m_vpu0->GetVif(), PLACEHOLDER_1, PLACEHOLDER_2, PLACEHOLDER_3, PLACEHOLDER_4));
-	m_dmac.SetChannelTransferFunction(CDMAC::CHANNEL_ID_VIF1, std::bind(&CVif::ReceiveDMA, &m_vpu1->GetVif(), PLACEHOLDER_1, PLACEHOLDER_2, PLACEHOLDER_3, PLACEHOLDER_4));
-	m_dmac.SetChannelTransferFunction(CDMAC::CHANNEL_ID_GIF, std::bind(&CGIF::ReceiveDMA, &m_gif, PLACEHOLDER_1, PLACEHOLDER_2, PLACEHOLDER_3, PLACEHOLDER_4));
+	m_dmac.SetChannelTransferFunction(CDMAC::CHANNEL_ID_VIF1, std::bind(&CSubSystem::ReceiveDma1, this, PLACEHOLDER_1, PLACEHOLDER_2, PLACEHOLDER_3, PLACEHOLDER_4));
+	m_dmac.SetChannelFastTransferFunction(
+	    CDMAC::CHANNEL_ID_VIF1,
+	    [](void* ctx, uint32 addr, uint32 qwc, uint32 dir, bool tag) -> uint32 {
+		    return static_cast<CSubSystem*>(ctx)->ReceiveDma1(addr, qwc, dir, tag);
+	    },
+	    this);
+	m_dmac.SetChannelTransferFunction(CDMAC::CHANNEL_ID_GIF, std::bind(&CSubSystem::ReceiveDma2, this, PLACEHOLDER_1, PLACEHOLDER_2, PLACEHOLDER_3, PLACEHOLDER_4));
+	m_dmac.SetChannelFastTransferFunction(
+	    CDMAC::CHANNEL_ID_GIF,
+	    [](void* ctx, uint32 addr, uint32 qwc, uint32 dir, bool tag) -> uint32 {
+		    return static_cast<CSubSystem*>(ctx)->ReceiveDma2(addr, qwc, dir, tag);
+	    },
+	    this);
+	m_dmac.SetVu1SyncCallback([this]() { SyncVu1Gif(CVu1GifWorker::SYNC_VUMEM); });
 	m_dmac.SetChannelTransferFunction(CDMAC::CHANNEL_ID_TO_IPU, std::bind(&CIPU::ReceiveDMA4, &m_ipu, PLACEHOLDER_1, PLACEHOLDER_2, PLACEHOLDER_4, m_ram, m_spr));
 	m_dmac.SetChannelTransferFunction(CDMAC::CHANNEL_ID_SIF0, std::bind(&CSIF::ReceiveDMA5, &m_sif, PLACEHOLDER_1, PLACEHOLDER_2, PLACEHOLDER_3, PLACEHOLDER_4));
 	m_dmac.SetChannelTransferFunction(CDMAC::CHANNEL_ID_SIF1, std::bind(&CSIF::ReceiveDMA6, &m_sif, PLACEHOLDER_1, PLACEHOLDER_2, PLACEHOLDER_3, PLACEHOLDER_4));
@@ -164,10 +197,17 @@ CSubSystem::CSubSystem(uint8* iopRam, CIopBios& iopBios)
 	m_OnRequestInstructionCacheFlushConnection = m_os->OnRequestInstructionCacheFlush.Connect(std::bind(&CSubSystem::FlushInstructionCache, this));
 
 	SetupEePageTable();
+	m_vu1GifWorker.SetEeRam(m_ram);
+	static_cast<CEeExecutor*>(m_EE.m_executor.get())->SetDmaReadOnlyWriteFaultHandler([this]() {
+		m_vu1GifWorker.WaitIdleLockFree();
+		m_vu1GifWorker.RecordZeroCopyFault();
+	});
+	m_vu1GifWorker.Start();
 }
 
 CSubSystem::~CSubSystem()
 {
+	m_vu1GifWorker.Stop();
 	m_EE.m_executor->Reset();
 	delete m_os;
 	framework_aligned_free(m_ram);
@@ -187,11 +227,14 @@ void CSubSystem::SetVpu0(std::shared_ptr<CVpu> newVpu0)
 
 void CSubSystem::SetVpu1(std::shared_ptr<CVpu> newVpu1)
 {
+	SyncVu1Gif(CVu1GifWorker::SYNC_OTHER);
 	m_vpu1 = newVpu1;
 }
 
 void CSubSystem::Reset(uint32 ramSize)
 {
+	SyncVu1Gif(CVu1GifWorker::SYNC_OTHER);
+	m_vu1GifWorker.ResetDeferred();
 	m_os->Release();
 	m_EE.m_executor->Reset();
 
@@ -310,11 +353,14 @@ void CSubSystem::CountTicks(int ticks)
 	{
 		m_dmac.ResumeDMA0();
 	}
-	if(m_vpu1->IsVuReady() || (m_vpu1->IsVuRunning() && !m_vpu1->GetVif().IsWaitingForProgramEnd()))
+	if(!m_vu1GifWorker.IsRunning())
 	{
-		m_dmac.ResumeDMA1();
+		if(m_vpu1->IsVuReady() || (m_vpu1->IsVuRunning() && !m_vpu1->GetVif().IsWaitingForProgramEnd()))
+		{
+			m_dmac.ResumeDMA1();
+		}
+		m_dmac.ResumeDMA2();
 	}
-	m_dmac.ResumeDMA2();
 	m_dmac.ResumeDMA8();
 	m_dmac.ResumeDMA9();
 	m_gif.CountTicks(ticks);
@@ -369,6 +415,7 @@ void CSubSystem::NotifyVBlankEnd()
 
 void CSubSystem::SaveState(Framework::CZipArchiveWriter& archive)
 {
+	SyncVu1Gif(CVu1GifWorker::SYNC_OTHER);
 	archive.InsertFile(std::make_unique<CMemoryStateFile>(STATE_EE, &m_EE.m_State, sizeof(MIPSSTATE)));
 	archive.InsertFile(std::make_unique<CMemoryStateFile>(STATE_VU0, &m_VU0.m_State, sizeof(MIPSSTATE)));
 	archive.InsertFile(std::make_unique<CMemoryStateFile>(STATE_VU1, &m_VU1.m_State, sizeof(MIPSSTATE)));
@@ -392,7 +439,10 @@ void CSubSystem::SaveState(Framework::CZipArchiveWriter& archive)
 
 void CSubSystem::LoadState(Framework::CZipArchiveReader& archive)
 {
-	m_EE.m_executor->ClearActiveBlocksInRange(0, PS2::EE_RAM_SIZE, false);
+	SyncVu1Gif(CVu1GifWorker::SYNC_OTHER);
+	m_vu1GifWorker.ResetDeferred();
+	auto* eeExec = static_cast<CEeExecutor*>(m_EE.m_executor.get());
+	eeExec->PrepareRamOverwrite();
 	m_vpu0->GetContext().m_executor->ClearActiveBlocksInRange(0, PS2::MICROMEM0SIZE, false);
 	m_vpu1->GetContext().m_executor->ClearActiveBlocksInRange(0, PS2::MICROMEM1SIZE, false);
 
@@ -400,6 +450,9 @@ void CSubSystem::LoadState(Framework::CZipArchiveReader& archive)
 	archive.BeginReadFile(STATE_VU0)->Read(&m_VU0.m_State, sizeof(MIPSSTATE));
 	archive.BeginReadFile(STATE_VU1)->Read(&m_VU1.m_State, sizeof(MIPSSTATE));
 	archive.BeginReadFile(STATE_RAM)->Read(m_ram, PS2::EE_RAM_SIZE);
+	eeExec->FlushInstructionCache();
+	eeExec->WarmPreloadOverlays();
+	eeExec->ReprotectActiveBlockPages();
 	archive.BeginReadFile(STATE_SPR)->Read(m_spr, PS2::EE_SPR_SIZE);
 	archive.BeginReadFile(STATE_VUMEM0)->Read(m_vuMem0, PS2::VUMEM0SIZE);
 	archive.BeginReadFile(STATE_MICROMEM0)->Read(m_microMem0, PS2::MICROMEM0SIZE);
@@ -439,6 +492,7 @@ uint32 CSubSystem::IOPortReadHandler(uint32 nAddress)
 	}
 	else if(nAddress >= CGIF::REGS_START && nAddress < CGIF::REGS_END)
 	{
+		SyncVu1Gif(CVu1GifWorker::SYNC_GIF_REG);
 		nReturn = m_gif.GetRegister(nAddress);
 	}
 	else if(nAddress >= CVif::REGS0_START && nAddress < CVif::REGS0_END)
@@ -447,6 +501,8 @@ uint32 CSubSystem::IOPortReadHandler(uint32 nAddress)
 	}
 	else if(nAddress >= CVif::REGS1_START && nAddress < CVif::REGS1_END)
 	{
+		m_vu1GifWorker.RecordVif1RegSync(nAddress, false);
+		SyncVu1Gif(CVu1GifWorker::SYNC_VIF1_REG);
 		nReturn = m_vpu1->GetVif().GetRegister(nAddress);
 	}
 	else if(nAddress >= 0x10008000 && nAddress <= 0x1000EFFC)
@@ -463,6 +519,7 @@ uint32 CSubSystem::IOPortReadHandler(uint32 nAddress)
 	}
 	else if(nAddress >= CVpu::EE_ADDR_VU1AREA_START && nAddress <= CVpu::EE_ADDR_VU1AREA_END)
 	{
+		SyncVu1Gif(CVu1GifWorker::SYNC_VUMEM);
 		uint32 offset = nAddress - CVpu::EE_ADDR_VU1AREA_START;
 		nReturn = HandleVu1AreaRead(offset);
 	}
@@ -520,6 +577,7 @@ uint32 CSubSystem::IOPortWriteHandler(uint32 nAddress, uint32 nData)
 	}
 	else if(nAddress >= CGIF::REGS_START && nAddress < CGIF::REGS_END)
 	{
+		SyncVu1Gif(CVu1GifWorker::SYNC_GIF_REG);
 		m_gif.SetRegister(nAddress, nData);
 	}
 	else if(nAddress >= CVif::REGS0_START && nAddress < CVif::REGS0_END)
@@ -528,7 +586,13 @@ uint32 CSubSystem::IOPortWriteHandler(uint32 nAddress, uint32 nData)
 	}
 	else if(nAddress >= CVif::REGS1_START && nAddress < CVif::REGS1_END)
 	{
+		m_vu1GifWorker.RecordVif1RegSync(nAddress, true);
+		SyncVu1Gif(CVu1GifWorker::SYNC_VIF1_REG);
 		m_vpu1->GetVif().SetRegister(nAddress, nData);
+		if((nAddress == CVif::VIF1_FBRST) && (nData & 0x08))
+		{
+			m_vu1GifWorker.ReplayStalledVif1();
+		}
 	}
 	else if(nAddress >= CVif::VIF0_FIFO_START && nAddress < CVif::VIF0_FIFO_END)
 	{
@@ -536,11 +600,25 @@ uint32 CSubSystem::IOPortWriteHandler(uint32 nAddress, uint32 nData)
 	}
 	else if(nAddress >= CVif::VIF1_FIFO_START && nAddress < CVif::VIF1_FIFO_END)
 	{
-		m_vpu1->GetVif().SetRegister(nAddress, nData);
+		if(m_vu1GifWorker.IsRunning())
+		{
+			m_vu1GifWorker.EnqueueVif1Fifo(nAddress, nData);
+		}
+		else
+		{
+			m_vpu1->GetVif().SetRegister(nAddress, nData);
+		}
 	}
 	else if(nAddress >= CGIF::GIF_FIFO_START && nAddress < CGIF::GIF_FIFO_END)
 	{
-		m_gif.SetRegister(nAddress, nData);
+		if(m_vu1GifWorker.IsRunning())
+		{
+			m_vu1GifWorker.EnqueueGifFifo(nAddress, nData);
+		}
+		else
+		{
+			m_gif.SetRegister(nAddress, nData);
+		}
 	}
 	else if(nAddress >= 0x10007000 && nAddress <= 0x1000702F)
 	{
@@ -549,7 +627,10 @@ uint32 CSubSystem::IOPortWriteHandler(uint32 nAddress, uint32 nData)
 	}
 	else if(nAddress >= 0x10008000 && nAddress <= 0x1000EFFC)
 	{
+		bool batchVu1Gif = (nAddress >= 0x10009000 && nAddress < 0x1000B000);
+		if(batchVu1Gif) m_vu1GifWorker.BeginDmaBatch();
 		m_dmac.SetRegister(nAddress, nData);
+		if(batchVu1Gif) m_vu1GifWorker.EndDmaBatch();
 		ExecuteIpu();
 	}
 	else if(nAddress >= 0x1000F000 && nAddress <= 0x1000F01C)
@@ -567,15 +648,18 @@ uint32 CSubSystem::IOPortWriteHandler(uint32 nAddress, uint32 nData)
 	}
 	else if(nAddress >= CVpu::EE_ADDR_VU1AREA_START && nAddress <= CVpu::EE_ADDR_VU1AREA_END)
 	{
+		SyncVu1Gif(CVu1GifWorker::SYNC_VUMEM);
 		uint32 offset = nAddress - CVpu::EE_ADDR_VU1AREA_START;
 		HandleVu1AreaWrite(offset, nData);
 	}
 	else if(nAddress == CVpu::EE_ADDR_VU_FBRST)
 	{
+		SyncVu1Gif(CVu1GifWorker::SYNC_VIF1_REG);
 		m_vpu1->SetFbrst((nData >> 8) & 0xF);
 	}
 	else if(nAddress == CVpu::EE_ADDR_VU_CMSAR1)
 	{
+		SyncVu1Gif(CVu1GifWorker::SYNC_VUMEM);
 		bool validAddress = (nData & 0x7) == 0;
 		if(validAddress)
 		{
@@ -586,7 +670,16 @@ uint32 CSubSystem::IOPortWriteHandler(uint32 nAddress, uint32 nData)
 	{
 		if(m_gs != NULL)
 		{
+			bool isCsr = (nAddress == CGSHandler::GS_CSR) || (nAddress == CGSHandler::GS_CSR_ALT);
+			if(isCsr || (nAddress == CGSHandler::GS_BUSDIR))
+			{
+				SyncVu1Gif(CVu1GifWorker::SYNC_GS_PRIV);
+			}
 			m_gs->WritePrivRegister(nAddress, nData);
+			if(isCsr && !(nAddress & 0x04) && (nData & CGSHandler::CSR_SIGNAL_EVENT))
+			{
+				m_vu1GifWorker.ReplayDeferredSignal();
+			}
 		}
 	}
 	else
@@ -667,12 +760,137 @@ void CSubSystem::Vu0StateChanged(CVpu::VU_STATE newState)
 	}
 }
 
+uint32 CSubSystem::Vu1MicroMemReadHandler(uint32 address)
+{
+	SyncVu1Gif(CVu1GifWorker::SYNC_VUMEM);
+	uint32 offset = (address - PS2::MICROMEM1ADDR) & (PS2::MICROMEM1SIZE - 1);
+	return *reinterpret_cast<uint32*>(m_microMem1 + (offset & ~0x03U)) >> ((offset & 0x03U) * 8);
+}
+
 uint32 CSubSystem::Vu1MicroMemWriteHandler(uint32 address, uint32 value)
 {
+	SyncVu1Gif(CVu1GifWorker::SYNC_VUMEM);
 	uint32 baseAddress = (address - PS2::MICROMEM1ADDR) & ~0x03;
 	*reinterpret_cast<uint32*>(m_microMem1 + baseAddress) = value;
 	m_vpu1->InvalidateMicroProgram(baseAddress, baseAddress + 4);
 	return 0;
+}
+
+uint32 CSubSystem::Vu1MemReadHandler(uint32 address)
+{
+	SyncVu1Gif(CVu1GifWorker::SYNC_VUMEM);
+	uint32 offset = (address - PS2::VUMEM1ADDR) & (PS2::VUMEM1SIZE - 1);
+	return *reinterpret_cast<uint32*>(m_vuMem1 + (offset & ~0x03U)) >> ((offset & 0x03U) * 8);
+}
+
+uint32 CSubSystem::Vu1MemWriteHandler(uint32 address, uint32 value)
+{
+	SyncVu1Gif(CVu1GifWorker::SYNC_VUMEM);
+	uint32 baseAddress = (address - PS2::VUMEM1ADDR) & (PS2::VUMEM1SIZE - 1) & ~0x03U;
+	*reinterpret_cast<uint32*>(m_vuMem1 + baseAddress) = value;
+	return 0;
+}
+
+uint32 CSubSystem::ReceiveDma1(uint32 address, uint32 qwc, uint32 direction, bool tagIncluded)
+{
+	if(!m_vu1GifWorker.IsRunning() || (direction == Dmac::CChannel::CHCR_DIR_TO))
+	{
+		if(m_vu1GifWorker.IsRunning()) SyncVu1Gif(CVu1GifWorker::SYNC_OTHER);
+		return m_vpu1->GetVif().ReceiveDMA(address, qwc, direction, tagIncluded);
+	}
+	uint32 size = qwc * 0x10;
+	if(size == 0) return 0;
+	const uint8* src = nullptr;
+	if(address & 0x80000000)
+	{
+		uint32 off = address & (PS2::EE_SPR_SIZE - 1);
+		assert((off + size) <= PS2::EE_SPR_SIZE);
+		src = m_spr + off;
+	}
+	else
+	{
+		uint32 off = address & (PS2::EE_RAM_SIZE - 1);
+		assert((off + size) <= PS2::EE_RAM_SIZE);
+		if(!tagIncluded && size >= 512 &&
+		   static_cast<CEeExecutor*>(m_EE.m_executor.get())->TryPinDmaReadOnlyRange(off, size) &&
+		   m_vu1GifWorker.EnqueueVif1DmaPtr(off, size))
+		{
+			return qwc;
+		}
+		src = m_ram + off;
+	}
+	if(m_vu1GifWorker.EnqueueVif1Dma(src, size, tagIncluded))
+	{
+		return qwc;
+	}
+	return m_vpu1->GetVif().ReceiveDMA(address, qwc, direction, tagIncluded);
+}
+
+uint32 CSubSystem::ReceiveDma2(uint32 address, uint32 qwc, uint32 direction, bool tagIncluded)
+{
+	if(!m_vu1GifWorker.IsRunning())
+	{
+		return m_gif.ReceiveDMA(address, qwc, direction, tagIncluded);
+	}
+	uint32 size = qwc * 0x10;
+	if(size == 0) return 0;
+	const uint8* src = nullptr;
+	if(address & 0x80000000)
+	{
+		uint32 off = address & (PS2::EE_SPR_SIZE - 1);
+		assert((off + size) <= PS2::EE_SPR_SIZE);
+		src = m_spr + off;
+		if(tagIncluded)
+		{
+			if(size <= 0x10) return qwc;
+			src += 0x10;
+			size -= 0x10;
+		}
+	}
+	else
+	{
+		uint32 off = address & (PS2::EE_RAM_SIZE - 1);
+		assert((off + size) <= PS2::EE_RAM_SIZE);
+		if(tagIncluded)
+		{
+			if(size <= 0x10) return qwc;
+			off += 0x10;
+			size -= 0x10;
+		}
+		if(size >= 512)
+		{
+			auto* eeExec = static_cast<CEeExecutor*>(m_EE.m_executor.get());
+			if(eeExec->TryPinDmaReadOnlyRange(off, size) && m_vu1GifWorker.EnqueueGifDmaPtr(off, size))
+			{
+				return qwc;
+			}
+			//If a large transfer straddles a dynamic boundary page, zero-copy the static interior pages.
+			size_t pageSize = eeExec->GetPageSize();
+			if(pageSize >= 4096 && size >= pageSize * 2)
+			{
+				uint32 pageMask = static_cast<uint32>(pageSize - 1);
+				uint32 innerStart = (off + pageMask) & ~pageMask;
+				uint32 innerEnd = (off + size) & ~pageMask;
+				if(innerEnd > innerStart && (innerEnd - innerStart) >= pageSize &&
+				   eeExec->TryPinDmaReadOnlyRange(innerStart, innerEnd - innerStart))
+				{
+					uint32 lead = innerStart - off;
+					uint32 trail = (off + size) - innerEnd;
+					bool ok = true;
+					if(lead != 0) ok = m_vu1GifWorker.EnqueueGifDma(m_ram + off, lead);
+					if(ok) ok = m_vu1GifWorker.EnqueueGifDmaPtr(innerStart, innerEnd - innerStart);
+					if(ok && trail != 0) ok = m_vu1GifWorker.EnqueueGifDma(m_ram + innerEnd, trail);
+					if(ok) return qwc;
+				}
+			}
+		}
+		src = m_ram + off;
+	}
+	if(m_vu1GifWorker.EnqueueGifDma(src, size))
+	{
+		return qwc;
+	}
+	return m_gif.ReceiveDMA(address, qwc, direction, tagIncluded);
 }
 
 uint32 CSubSystem::Vu1IoPortReadHandler(uint32 address)
@@ -826,7 +1044,7 @@ void CSubSystem::CheckPendingInterrupts()
 
 void CSubSystem::FlushInstructionCache()
 {
-	m_EE.m_executor->Reset();
+	m_EE.m_executor->FlushInstructionCache();
 }
 
 void CSubSystem::LoadBIOS()

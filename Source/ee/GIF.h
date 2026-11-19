@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <functional>
 #include "Types.h"
 #include "zip/ZipArchiveWriter.h"
 #include "zip/ZipArchiveReader.h"
@@ -65,6 +67,20 @@ public:
 
 	uint32 GetActivePath() const;
 	void SetPath3Masked(bool);
+	bool IsPath3Masked() const
+	{
+		return m_path3Masked;
+	}
+	bool IsSignalPending() const
+	{
+		return m_signalState != SIGNAL_STATE_NONE;
+	}
+	void SetPath3UnmaskedCallback(std::function<void()> cb)
+	{
+		m_onPath3Unmasked = std::move(cb);
+	}
+	uint32 ProcessPath3Buffer(const uint8*, uint32);
+	uint32 ProcessOneMaskedPath3Packet(const uint8*, uint32);
 
 	void LoadState(Framework::CZipArchiveReader&);
 	void SaveState(Framework::CZipArchiveWriter&);
@@ -113,7 +129,8 @@ private:
 	uint32 m_qtemp;
 	SIGNAL_STATE m_signalState = SIGNAL_STATE_NONE;
 	MASKED_PATH3_XFER_STATE m_maskedPath3XferState = MASKED_PATH3_XFER_NONE;
-	int32 m_path3XferActiveTicks = 0;
+	std::atomic<int32> m_path3XferActiveTicks{0};
+	std::function<void()> m_onPath3Unmasked;
 	uint8 m_fifoBuffer[FIFO_SIZE];
 	uint32 m_fifoIndex = 0;
 	uint8* m_ram;

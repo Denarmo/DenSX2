@@ -82,39 +82,39 @@ void CBasicBlock::Compile()
 #ifndef AOT_USE_CACHE
 
 	Framework::CMemStream stream;
+	m_hasCallLinkSlot = false;
 	{
-		static
-#ifdef AOT_BUILD_CACHE
-		    thread_local
-#endif
-		    CMipsJitter* jitter = nullptr;
-		if(jitter == nullptr)
+		static thread_local std::unique_ptr<CMipsJitter> jitter;
+		if(!jitter)
 		{
 			Jitter::CCodeGen* codeGen = Jitter::CreateCodeGen();
-			jitter = new CMipsJitter(codeGen);
+			jitter = std::make_unique<CMipsJitter>(codeGen);
 		}
 
 		jitter->GetCodeGen()->SetFixedFrameExit(m_context.m_fixedFrameExit);
+		jitter->GetCodeGen()->SetFixedFrameRamBasePinned((m_context.m_fixedFrameExit != nullptr) && (m_context.m_ramBase != nullptr));
 		jitter->GetCodeGen()->SetExternalSymbolReferencedHandler([&](auto symbol, auto offset, auto refType) { this->HandleExternalFunctionReference(symbol, offset, refType); });
 		jitter->SetStream(&stream);
 		jitter->Begin();
-		CompileRange(jitter);
+		CompileRange(jitter.get());
 		jitter->End();
 	}
 
-	m_function = CMemoryFunction(stream.GetBuffer(), stream.GetSize());
-	m_code = reinterpret_cast<CodeFunction>(m_function.GetCode());
 	if(m_context.m_fixedFrameExit)
 	{
 		//Unlinked exits leave the frame instead of calling the trampolines
+		auto* rawCode = reinterpret_cast<uint8*>(stream.GetBuffer());
+		uintptr_t exitAddr = reinterpret_cast<uintptr_t>(m_context.m_fixedFrameExit);
 		for(uint32 i = 0; i < LINK_SLOT_MAX; i++)
 		{
 			if(HasLinkSlot(static_cast<LINK_SLOT>(i)))
 			{
-				UnlinkBlock(static_cast<LINK_SLOT>(i));
+				memcpy(rawCode + m_linkBlockTrampolineOffset[i], &exitAddr, sizeof(uintptr_t));
 			}
 		}
 	}
+	m_function = CMemoryFunction(stream.GetBuffer(), stream.GetSize());
+	m_code = reinterpret_cast<CodeFunction>(m_function.GetCode());
 
 #ifdef VTUNE_ENABLED
 	if(iJIT_IsProfilingActive() == iJIT_SAMPLING_ON)
@@ -201,6 +201,119 @@ void CBasicBlock::Compile()
 		m_aotBlockOutputStream->Write(blockData, blockSizeByte);
 	}
 #endif
+	return;
+}
+
+bool CBasicBlock::CompileForCache(std::vector<uint8>& outCode, std::vector<NATIVE_RELOC>& outRelocs, uint32 outLinkOffsets[LINK_SLOT_MAX])
+{
+	outCode.clear();
+	outRelocs.clear();
+	for(uint32 i = 0; i < LINK_SLOT_MAX; i++)
+	{
+		outLinkOffsets[i] = INVALID_LINK_SLOT;
+		m_linkBlockTrampolineOffset[i] = INVALID_LINK_SLOT;
+	}
+
+#if !defined(AOT_USE_CACHE) && !defined(AOT_BUILD_CACHE) && !defined(__EMSCRIPTEN__)
+	Framework::CMemStream stream;
+	m_recordingRelocs = &outRelocs;
+	m_recordingRelocsValid = true;
+	m_hasCallLinkSlot = false;
+	{
+		static thread_local std::unique_ptr<CMipsJitter> jitter;
+		if(!jitter)
+		{
+			Jitter::CCodeGen* codeGen = Jitter::CreateCodeGen();
+			jitter = std::make_unique<CMipsJitter>(codeGen);
+		}
+
+		jitter->GetCodeGen()->SetFixedFrameExit(m_context.m_fixedFrameExit);
+		jitter->GetCodeGen()->SetFixedFrameRamBasePinned((m_context.m_fixedFrameExit != nullptr) && (m_context.m_ramBase != nullptr));
+		jitter->GetCodeGen()->SetExternalSymbolReferencedHandler([&](auto symbol, auto offset, auto refType) { this->HandleExternalFunctionReference(symbol, offset, refType); });
+		jitter->SetStream(&stream);
+		jitter->Begin();
+		CompileRange(jitter.get());
+		jitter->End();
+	}
+	m_recordingRelocs = nullptr;
+
+	size_t codeSize = stream.GetSize();
+	auto* rawCode = reinterpret_cast<uint8*>(stream.GetBuffer());
+	if(m_recordingRelocsValid && codeSize > 0)
+	{
+		outCode.assign(rawCode, rawCode + codeSize);
+		for(uint32 i = 0; i < LINK_SLOT_MAX; i++)
+		{
+			outLinkOffsets[i] = m_linkBlockTrampolineOffset[i];
+		}
+	}
+
+	if(m_context.m_fixedFrameExit)
+	{
+		uintptr_t exitAddr = reinterpret_cast<uintptr_t>(m_context.m_fixedFrameExit);
+		for(uint32 i = 0; i < LINK_SLOT_MAX; i++)
+		{
+			if(HasLinkSlot(static_cast<LINK_SLOT>(i)))
+			{
+				memcpy(rawCode + m_linkBlockTrampolineOffset[i], &exitAddr, sizeof(uintptr_t));
+			}
+		}
+	}
+	m_function = CMemoryFunction(rawCode, codeSize);
+	m_code = reinterpret_cast<CodeFunction>(m_function.GetCode());
+	return m_recordingRelocsValid && !outCode.empty();
+#else
+	Compile();
+	return false;
+#endif
+}
+
+bool CBasicBlock::LoadFromNativeCache(const CACHED_NATIVE_BLOCK& cached)
+{
+#if !defined(AOT_USE_CACHE) && !defined(AOT_BUILD_CACHE) && !defined(__EMSCRIPTEN__)
+	if(cached.nativeCode.empty()) return false;
+	for(uint32 i = 0; i < LINK_SLOT_MAX; i++)
+	{
+		if(cached.linkOffset[i] != INVALID_LINK_SLOT &&
+		   static_cast<size_t>(cached.linkOffset[i]) + sizeof(uintptr_t) > cached.nativeCode.size())
+		{
+			return false;
+		}
+	}
+
+	std::vector<uint8> patched = cached.nativeCode;
+	if(!CNativeCodeCache::ApplyRelocations(patched.data(), patched.size(), cached.relocs.data(), cached.relocs.size(), m_context))
+	{
+		return false;
+	}
+
+	for(uint32 i = 0; i < LINK_SLOT_MAX; i++)
+	{
+		m_linkBlockTrampolineOffset[i] = cached.linkOffset[i];
+#ifdef _DEBUG
+		m_linkBlock[i] = nullptr;
+#endif
+	}
+
+	if(m_context.m_fixedFrameExit)
+	{
+		uintptr_t exitAddr = reinterpret_cast<uintptr_t>(m_context.m_fixedFrameExit);
+		for(uint32 i = 0; i < LINK_SLOT_MAX; i++)
+		{
+			if(HasLinkSlot(static_cast<LINK_SLOT>(i)))
+			{
+				memcpy(patched.data() + m_linkBlockTrampolineOffset[i], &exitAddr, sizeof(uintptr_t));
+			}
+		}
+	}
+
+	m_hasCallLinkSlot = (cached.flags & NATIVE_BLOCK_FLAG_CALL_LINK) != 0;
+	m_function = CMemoryFunction(patched.data(), patched.size());
+	m_code = reinterpret_cast<CodeFunction>(m_function.GetCode());
+	return true;
+#else
+	return false;
+#endif
 }
 
 void CBasicBlock::AddBlockCompileHints(uint32 compileHints)
@@ -286,28 +399,160 @@ void CBasicBlock::CompileProlog(CMipsJitter* jitter)
 
 void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
 {
+	uint32 blockInstrCount = ((m_end - m_begin) / 4) + 1;
+
+	//Analyze EE block termination statically so fallthrough and unconditional-branch blocks
+	//avoid dynamic nDelayedJumpAddr checks, dead epilog code, and per-block quota branches on short forward blocks.
+	bool hasBranch = true;
+	bool isUnconditionalBranch = false;
+	bool isJalCall = false;
+	bool isJalrCall = false;
+	bool isJrRa = false;
+	bool needsQuotaCheck = true;
+	bool blockCanRaiseException = true;
+	if(m_category == BLOCK_CATEGORY_PS2_EE)
+	{
+		hasBranch = false;
+		needsQuotaCheck = (blockInstrCount >= 48);
+		blockCanRaiseException = false;
+		for(uint32 address = m_begin; address <= m_end; address += 4)
+		{
+			uint32 inst = m_context.m_pMemoryMap->GetInstruction(address);
+			uint32 instOp = (inst >> 26) & 0x3F;
+			if((instOp == 0x10) || (instOp == 0x12) || ((instOp >= 0x1A) && (instOp != 0x1C)))
+			{
+				blockCanRaiseException = true;
+			}
+			else if(instOp == 0x00)
+			{
+				uint32 instFunct = inst & 0x3F;
+				if((instFunct == 0x0C) || (instFunct == 0x0D) || ((instFunct >= 0x30) && (instFunct <= 0x37)))
+				{
+					blockCanRaiseException = true;
+				}
+			}
+			else if(instOp == 0x01)
+			{
+				uint32 instRt = (inst >> 16) & 0x1F;
+				if((instRt >= 0x08) && (instRt <= 0x0F))
+				{
+					blockCanRaiseException = true;
+				}
+			}
+			auto branchType = m_context.m_pArch->IsInstructionBranch(&m_context, address, inst);
+			if(branchType == MIPS_BRANCH_NODELAY)
+			{
+				hasBranch = true;
+				needsQuotaCheck = true;
+				break;
+			}
+			else if(branchType == MIPS_BRANCH_NORMAL)
+			{
+				hasBranch = true;
+				if(address == (m_end - 4))
+				{
+					uint32 delayInst = m_context.m_pMemoryMap->GetInstruction(m_end);
+					bool delayIsBranch = m_context.m_pArch->IsInstructionBranch(&m_context, m_end, delayInst) != MIPS_BRANCH_NONE;
+					if(!delayIsBranch)
+					{
+						uint32 op = (inst >> 26) & 0x3F;
+						uint32 rs = (inst >> 21) & 0x1F;
+						uint32 rt = (inst >> 16) & 0x1F;
+						uint32 rd = (inst >> 11) & 0x1F;
+						uint32 funct = inst & 0x3F;
+						if((op == 0x02) || (op == 0x03) ||
+						   ((op == 0x00) && ((funct == 0x08) || (funct == 0x09))) ||
+						   ((op == 0x04) && (rs == rt)) ||
+						   ((op == 0x01) && (rs == 0) && ((rt == 0x01) || (rt == 0x03) || (rt == 0x11) || (rt == 0x13))) ||
+						   ((op == 0x06) && (rs == 0)))
+						{
+							isUnconditionalBranch = true;
+						}
+						bool isCallOp = (op == 0x03) || ((op == 0x00) && (funct == 0x09) && (rd == CMIPS::RA));
+						if(isCallOp && (m_end < 0x01FFFFFCU))
+						{
+							uint32 dOp = (delayInst >> 26) & 0x3F;
+							uint32 dRd = (delayInst >> 11) & 0x1F;
+							uint32 dRt = (delayInst >> 16) & 0x1F;
+							bool delaySafeForRa =
+							    (delayInst == 0) ||
+							    ((dOp == 0x00) && (dRd != CMIPS::RA)) ||
+							    ((dOp == 0x1C) && (dRd != CMIPS::RA)) || //MMI
+							    ((dOp >= 0x28) && (dOp <= 0x2F)) ||      //SB/SH/SW/SWL/SWR/SD/SDL/SDR
+							    ((dOp >= 0x38) && (dOp <= 0x3F)) ||      //SC/SWC1/SQC2/SD/SQ
+							    ((dOp >= 0x08) && (dOp <= 0x0F) && (dRt != CMIPS::RA)) || //ALU imm
+							    ((dOp >= 0x18) && (dOp <= 0x1B) && (dRt != CMIPS::RA)) || //DADDIU/LDL/LDR
+							    ((dOp >= 0x20) && (dOp <= 0x27) && (dRt != CMIPS::RA)) || //Loads
+							    ((dOp == 0x37) && (dRt != CMIPS::RA));                    //LD
+							if(delaySafeForRa)
+							{
+								if(op == 0x03)
+								{
+									isJalCall = true;
+								}
+								else
+								{
+									isJalrCall = true;
+								}
+							}
+						}
+						else if((op == 0x00) && (funct == 0x08) && (rs == CMIPS::RA))
+						{
+							isJrRa = true;
+						}
+						if((op == 0x00) && ((funct == 0x08) || (funct == 0x09)))
+						{
+							needsQuotaCheck = true;
+						}
+						else
+						{
+							uint32 target = m_context.m_pArch->GetInstructionEffectiveAddress(&m_context, address, inst);
+							if((target == MIPS_INVALID_PC) || (target <= m_end))
+							{
+								needsQuotaCheck = true;
+							}
+						}
+					}
+					else
+					{
+						needsQuotaCheck = true;
+					}
+				}
+				else
+				{
+					needsQuotaCheck = true;
+				}
+				break;
+			}
+		}
+	}
+
 	//Update cycle quota
 	jitter->PushRel(offsetof(CMIPS, m_State.cycleQuota));
-	jitter->PushCst(((m_end - m_begin) / 4) + 1);
+	jitter->PushCst(blockInstrCount);
 	jitter->Sub();
 	jitter->PullRel(offsetof(CMIPS, m_State.cycleQuota));
 
-	jitter->PushRel(offsetof(CMIPS, m_State.cycleQuota));
-	jitter->PushCst(0);
-	jitter->BeginIf(Jitter::CONDITION_LE);
+	if(needsQuotaCheck)
 	{
-		jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
-		jitter->PushCst(MIPS_EXCEPTION_STATUS_QUOTADONE);
-		jitter->Or();
-		jitter->PullRel(offsetof(CMIPS, m_State.nHasException));
+		jitter->PushRel(offsetof(CMIPS, m_State.cycleQuota));
+		jitter->PushCst(0);
+		jitter->BeginIf(Jitter::CONDITION_LE);
+		{
+			jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
+			jitter->PushCst(MIPS_EXCEPTION_STATUS_QUOTADONE);
+			jitter->Or();
+			jitter->PullRel(offsetof(CMIPS, m_State.nHasException));
+		}
+		jitter->EndIf();
 	}
-	jitter->EndIf();
 
-	//We probably don't need to pay for this since we know in advance if there's a branch
-	jitter->PushCst(MIPS_INVALID_PC);
-	jitter->PushRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
-	jitter->BeginIf(Jitter::CONDITION_NE);
-	{
+	bool skipExceptionCheck = (m_category == BLOCK_CATEGORY_PS2_EE) && !needsQuotaCheck && !blockCanRaiseException && !MaySetExceptionInEpilog();
+#ifdef DEBUGGER_INCLUDED
+	if(HasBreakpoint()) skipExceptionCheck = false;
+#endif
+
+	auto emitTakenBranch = [&]() {
 		jitter->PushRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
 		jitter->PullRel(offsetof(CMIPS, m_State.nPC));
 
@@ -327,12 +572,14 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
 		else
 		{
 #if !defined(AOT_BUILD_CACHE) && !defined(__EMSCRIPTEN__)
-			jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
-			jitter->PushCst(0);
-			jitter->BeginIf(Jitter::CONDITION_EQ);
-			{
+			auto emitTakenDispatch = [&]() {
 				if(EndsWithDynamicBranch() && m_context.m_blockCodeLookup && jitter->SupportsExternJmpRef())
 				{
+					if(isJrRa && m_context.m_fixedFrameExit)
+					{
+						jitter->PushRel(offsetof(CMIPS, m_State.nPC));
+						jitter->CheckRasReturn();
+					}
 					//Find the target's code here: each such exit gets its own branch prediction
 					jitter->PushRelRef(offsetof(CMIPS, m_blockCodeLookup));
 					jitter->PushRel(offsetof(CMIPS, m_State.nPC));
@@ -341,39 +588,95 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
 					jitter->Srl(16);
 					jitter->LoadRefFromRefIdx();
 					jitter->PushRel(offsetof(CMIPS, m_State.nPC));
-					jitter->PushCst(0xFFFC);
+					jitter->PushCst(m_context.m_blockCodeLookupMask & 0xFFFCU);
 					jitter->And();
 					jitter->Srl(2);
 					jitter->LoadRefFromRefIdx();
-					jitter->JumpToRef();
+					if(isJalrCall && m_context.m_fixedFrameExit)
+					{
+						jitter->PushRel(offsetof(CMIPS, m_State.nGPR[CMIPS::RA].nV[0]));
+						jitter->CallToRef(reinterpret_cast<void*>(&NextBlockTrampoline));
+					}
+					else
+					{
+						jitter->JumpToRef();
+					}
+				}
+				else if(isJalCall && m_context.m_fixedFrameExit && jitter->SupportsExternJmpRef())
+				{
+					m_hasCallLinkSlot = true;
+					jitter->PushRel(offsetof(CMIPS, m_State.nGPR[CMIPS::RA].nV[0]));
+					jitter->CallToDynamic(reinterpret_cast<void*>(&BranchBlockTrampoline), reinterpret_cast<void*>(&NextBlockTrampoline));
 				}
 				else
 				{
 					jitter->JumpToDynamic(reinterpret_cast<void*>(&BranchBlockTrampoline));
 				}
+			};
+			if(skipExceptionCheck)
+			{
+				emitTakenDispatch();
 			}
-			jitter->EndIf();
+			else
+			{
+				jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
+				jitter->PushCst(0);
+				jitter->BeginIf(Jitter::CONDITION_EQ);
+				{
+					emitTakenDispatch();
+				}
+				jitter->EndIf();
+			}
 #endif
 		}
-	}
-	jitter->Else();
-	{
+	};
+
+	auto emitFallthrough = [&]() {
 		jitter->PushRel(offsetof(CMIPS, m_State.nPC));
 		jitter->PushCst(m_end - m_begin + 4);
 		jitter->Add();
 		jitter->PullRel(offsetof(CMIPS, m_State.nPC));
 
 #if !defined(AOT_BUILD_CACHE) && !defined(__EMSCRIPTEN__)
-		jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
-		jitter->PushCst(0);
-		jitter->BeginIf(Jitter::CONDITION_EQ);
+		if(skipExceptionCheck)
 		{
 			jitter->JumpToDynamic(reinterpret_cast<void*>(&NextBlockTrampoline));
 		}
-		jitter->EndIf();
+		else
+		{
+			jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
+			jitter->PushCst(0);
+			jitter->BeginIf(Jitter::CONDITION_EQ);
+			{
+				jitter->JumpToDynamic(reinterpret_cast<void*>(&NextBlockTrampoline));
+			}
+			jitter->EndIf();
+		}
 #endif
+	};
+
+	if(!hasBranch)
+	{
+		emitFallthrough();
 	}
-	jitter->EndIf();
+	else if(isUnconditionalBranch)
+	{
+		emitTakenBranch();
+	}
+	else
+	{
+		jitter->PushCst(MIPS_INVALID_PC);
+		jitter->PushRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
+		jitter->BeginIf(Jitter::CONDITION_NE);
+		{
+			emitTakenBranch();
+		}
+		jitter->Else();
+		{
+			emitFallthrough();
+		}
+		jitter->EndIf();
+	}
 }
 
 void CBasicBlock::Execute()
@@ -397,41 +700,6 @@ void CBasicBlock::Execute()
 	assert(m_context.m_State.nCOP2[0].nV2 == 0x00000000);
 	assert(m_context.m_State.nCOP2[0].nV3 == 0x3F800000);
 	assert(m_context.m_State.nCOP2VI[0] == 0);
-}
-
-uint32 CBasicBlock::GetBeginAddress() const
-{
-	return m_begin;
-}
-
-uint32 CBasicBlock::GetEndAddress() const
-{
-	return m_end;
-}
-
-bool CBasicBlock::IsCompiled() const
-{
-#ifndef AOT_USE_CACHE
-	return !m_function.IsEmpty();
-#else
-	return (m_function != nullptr);
-#endif
-}
-
-bool CBasicBlock::IsEmpty() const
-{
-	return (m_begin == MIPS_INVALID_PC) &&
-	       (m_end == MIPS_INVALID_PC);
-}
-
-uint32 CBasicBlock::GetRecycleCount() const
-{
-	return m_recycleCount;
-}
-
-void CBasicBlock::SetRecycleCount(uint32 recycleCount)
-{
-	m_recycleCount = recycleCount;
 }
 
 bool CBasicBlock::HasLinkSlot(LINK_SLOT linkSlot) const
@@ -465,6 +733,36 @@ void CBasicBlock::LinkBlock(LINK_SLOT linkSlot, CBasicBlock* otherBlock)
 	auto patchValue = reinterpret_cast<uintptr_t>(otherBlock->m_function.GetCode());
 	auto code = reinterpret_cast<uint8*>(m_function.GetCode());
 	m_function.BeginModify();
+#if defined(__aarch64__) && !defined(__APPLE__)
+	if(m_context.m_fixedFrameExit && (m_linkBlockTrampolineOffset[linkSlot] >= 8))
+	{
+		auto* instrPtr = reinterpret_cast<uint32*>(code + m_linkBlockTrampolineOffset[linkSlot] - 8);
+		intptr_t delta = static_cast<intptr_t>(patchValue) - static_cast<intptr_t>(reinterpret_cast<uintptr_t>(instrPtr));
+		if(((delta & 3) == 0) && (delta >= -0x08000000) && (delta <= 0x07FFFFFC))
+		{
+			//Direct PC-relative B target (0-cycle taken branch, no I-cache literal load or indirect BR)
+			*instrPtr = 0x14000000U | (static_cast<uint32>(delta >> 2) & 0x03FFFFFFU);
+		}
+		else
+		{
+			*instrPtr = 0x58000050U; //ldr x16, [pc, #8]
+		}
+		if(m_hasCallLinkSlot && (linkSlot == LINK_SLOT_BRANCH) && (m_linkBlockTrampolineOffset[linkSlot] >= 28))
+		{
+			auto* blPtr = reinterpret_cast<uint32*>(code + m_linkBlockTrampolineOffset[linkSlot] - 28);
+			intptr_t blDelta = static_cast<intptr_t>(patchValue) - static_cast<intptr_t>(reinterpret_cast<uintptr_t>(blPtr));
+			if(((blDelta & 3) == 0) && (blDelta >= -0x08000000) && (blDelta <= 0x07FFFFFC))
+			{
+				//Direct PC-relative BL target (pushes return_here onto CPU hardware RAS)
+				*blPtr = 0x94000000U | (static_cast<uint32>(blDelta >> 2) & 0x03FFFFFFU);
+			}
+			else
+			{
+				*blPtr = 0x94000005U; //bl +20 (unlinked_branch_stub)
+			}
+		}
+	}
+#endif
 	*reinterpret_cast<uintptr_t*>(code + m_linkBlockTrampolineOffset[linkSlot]) = patchValue;
 	m_function.EndModify();
 #endif //!AOT_ENABLED && !__EMSCRIPTEN__
@@ -486,6 +784,18 @@ void CBasicBlock::UnlinkBlock(LINK_SLOT linkSlot)
 	}
 	auto code = reinterpret_cast<uint8*>(m_function.GetCode());
 	m_function.BeginModify();
+#if defined(__aarch64__) && !defined(__APPLE__)
+	if(m_context.m_fixedFrameExit && (m_linkBlockTrampolineOffset[linkSlot] >= 8))
+	{
+		auto* instrPtr = reinterpret_cast<uint32*>(code + m_linkBlockTrampolineOffset[linkSlot] - 8);
+		*instrPtr = 0x58000050U; //ldr x16, [pc, #8]
+		if(m_hasCallLinkSlot && (linkSlot == LINK_SLOT_BRANCH) && (m_linkBlockTrampolineOffset[linkSlot] >= 28))
+		{
+			auto* blPtr = reinterpret_cast<uint32*>(code + m_linkBlockTrampolineOffset[linkSlot] - 28);
+			*blPtr = 0x94000005U; //bl +20 (unlinked_branch_stub)
+		}
+	}
+#endif
 	*reinterpret_cast<uintptr_t*>(code + m_linkBlockTrampolineOffset[linkSlot]) = patchValue;
 	m_function.EndModify();
 #endif //!AOT_ENABLED && !__EMSCRIPTEN__
@@ -505,6 +815,31 @@ void CBasicBlock::HandleExternalFunctionReference(uintptr_t symbol, uint32 offse
 		assert(m_linkBlockTrampolineOffset[LINK_SLOT_BRANCH] == INVALID_LINK_SLOT);
 		m_linkBlockTrampolineOffset[LINK_SLOT_BRANCH] = offset;
 	}
+
+	if(m_recordingRelocs != nullptr)
+	{
+		if(refType == Jitter::CCodeGen::SYMBOL_REF_TYPE::NATIVE_POINTER ||
+		   refType == Jitter::CCodeGen::SYMBOL_REF_TYPE::ARMV8_MOVZ_MOVK_64)
+		{
+			uint16 symbolId = 0;
+			if(CNativeCodeCache::LookupSymbolId(symbol, m_context, symbolId))
+			{
+				NATIVE_RELOC reloc = {};
+				reloc.offset = offset;
+				reloc.symbolId = symbolId;
+				reloc.refType = static_cast<uint8>(refType);
+				m_recordingRelocs->push_back(reloc);
+			}
+			else
+			{
+				m_recordingRelocsValid = false;
+			}
+		}
+		else
+		{
+			m_recordingRelocsValid = false;
+		}
+	}
 }
 
 void CBasicBlock::CopyFunctionFrom(const std::shared_ptr<CBasicBlock>& other)
@@ -512,6 +847,7 @@ void CBasicBlock::CopyFunctionFrom(const std::shared_ptr<CBasicBlock>& other)
 #ifndef AOT_USE_CACHE
 	m_function = other->m_function.CreateInstance();
 	m_code = reinterpret_cast<CodeFunction>(m_function.GetCode());
+	m_hasCallLinkSlot = other->m_hasCallLinkSlot;
 	std::copy(std::begin(other->m_linkBlockTrampolineOffset), std::end(other->m_linkBlockTrampolineOffset), m_linkBlockTrampolineOffset);
 #ifdef _DEBUG
 	std::copy(std::begin(other->m_linkBlock), std::end(other->m_linkBlock), m_linkBlock);
@@ -566,7 +902,7 @@ bool SetupBlockFixedFrame(CMIPS& context)
 	static const auto frame = []() {
 		Framework::CMemStream stream;
 		uint32 exitOffset = 0;
-		Jitter::CCodeGen_AArch64::GenerateFixedFrame(stream, exitOffset);
+		Jitter::CCodeGen_AArch64::GenerateFixedFrame(stream, exitOffset, static_cast<uint32>(offsetof(CMIPS, m_ramBase)));
 		auto function = new CMemoryFunction(stream.GetBuffer(), stream.GetSize());
 		return std::make_pair(function->GetCode(), reinterpret_cast<uint8*>(function->GetCode()) + exitOffset);
 	}();

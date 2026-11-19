@@ -1,7 +1,9 @@
 #pragma once
 
+#include <vector>
 #include "MIPS.h"
 #include "MemoryFunction.h"
+#include "NativeCodeCache.h"
 #ifdef AOT_BUILD_CACHE
 #include "StdStream.h"
 #include <mutex>
@@ -78,6 +80,8 @@ public:
 	virtual ~CBasicBlock() = default;
 	void Execute();
 	void Compile();
+	bool CompileForCache(std::vector<uint8>& outCode, std::vector<NATIVE_RELOC>& outRelocs, uint32 outLinkOffsets[LINK_SLOT_MAX]);
+	bool LoadFromNativeCache(const CACHED_NATIVE_BLOCK& cached);
 
 	//Entry point of the compiled code, called directly by the executor's dispatch loop
 	typedef void (*CodeFunction)(void*);
@@ -85,18 +89,49 @@ public:
 	{
 		return m_code;
 	}
+	size_t GetCodeSize() const
+	{
+#ifndef AOT_USE_CACHE
+		return m_function.GetSize();
+#else
+		return 0;
+#endif
+	}
 	virtual void CompileRange(CMipsJitter*);
-	bool EndsWithDynamicBranch() const;
+	virtual bool EndsWithDynamicBranch() const;
 
 	void AddBlockCompileHints(uint32);
 
-	uint32 GetBeginAddress() const;
-	uint32 GetEndAddress() const;
-	bool IsCompiled() const;
-	bool IsEmpty() const;
+	uint32 GetBeginAddress() const
+	{
+		return m_begin;
+	}
+	uint32 GetEndAddress() const
+	{
+		return m_end;
+	}
+	bool IsCompiled() const
+	{
+#ifndef AOT_USE_CACHE
+		return !m_function.IsEmpty();
+#else
+		return (m_function != nullptr);
+#endif
+	}
+	bool IsEmpty() const
+	{
+		return (m_begin == MIPS_INVALID_PC) &&
+		       (m_end == MIPS_INVALID_PC);
+	}
 
-	uint32 GetRecycleCount() const;
-	void SetRecycleCount(uint32);
+	uint32 GetRecycleCount() const
+	{
+		return m_recycleCount;
+	}
+	void SetRecycleCount(uint32 recycleCount)
+	{
+		m_recycleCount = recycleCount;
+	}
 
 	bool HasLinkSlot(LINK_SLOT) const;
 	BlockOutLinkPointer GetOutLink(LINK_SLOT) const;
@@ -110,6 +145,9 @@ public:
 #endif
 
 	void CopyFunctionFrom(const std::shared_ptr<CBasicBlock>& basicBlock);
+	bool HasCallLinkSlot() const { return m_hasCallLinkSlot; }
+	uint64 GetCodeHash64() const { return m_codeHash64; }
+	void SetCodeHash64(uint64 hash) { m_codeHash64 = hash; }
 
 protected:
 	uint32 m_begin;
@@ -121,6 +159,7 @@ protected:
 
 	virtual void CompileProlog(CMipsJitter*);
 	virtual void CompileEpilog(CMipsJitter*, bool);
+	virtual bool MaySetExceptionInEpilog() const { return false; }
 
 private:
 	void HandleExternalFunctionReference(uintptr_t, uint32, Jitter::CCodeGen::SYMBOL_REF_TYPE);
@@ -145,6 +184,10 @@ private:
 	uint32 m_recycleCount = 0;
 	BlockOutLinkPointer m_outLinks[LINK_SLOT_MAX];
 	uint32 m_linkBlockTrampolineOffset[LINK_SLOT_MAX];
+	std::vector<NATIVE_RELOC>* m_recordingRelocs = nullptr;
+	bool m_recordingRelocsValid = true;
+	bool m_hasCallLinkSlot = false;
+	uint64 m_codeHash64 = 0;
 #ifdef _DEBUG
 	CBasicBlock* m_linkBlock[LINK_SLOT_MAX];
 #endif

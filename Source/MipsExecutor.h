@@ -7,6 +7,7 @@ class CMipsExecutor
 public:
 	virtual ~CMipsExecutor() = default;
 	virtual void Reset() = 0;
+	virtual void FlushInstructionCache() { Reset(); }
 	virtual int Execute(int) = 0;
 	virtual void ClearActiveBlocksInRange(uint32 start, uint32 end, bool executing) = 0;
 

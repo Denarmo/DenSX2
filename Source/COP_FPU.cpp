@@ -57,23 +57,21 @@ void CCOP_FPU::CompileInstruction(uint32 address, CMipsJitter* codeGen, CMIPS* c
 
 void CCOP_FPU::SetCCBit(bool condition, uint32 mask)
 {
-	m_codeGen->PushCst(0);
+	uint32 bitPos = 0;
+	while(((mask >> bitPos) & 1U) == 0) bitPos++;
 
-	m_codeGen->BeginIf(condition ? Jitter::CONDITION_NE : Jitter::CONDITION_EQ);
+	if(!condition)
 	{
-		m_codeGen->PushRel(offsetof(CMIPS, m_State.nFCSR));
-		m_codeGen->PushCst(mask);
-		m_codeGen->Or();
-		m_codeGen->PullRel(offsetof(CMIPS, m_State.nFCSR));
+		m_codeGen->PushCst(0);
+		m_codeGen->Cmp(Jitter::CONDITION_EQ);
 	}
-	m_codeGen->Else();
-	{
-		m_codeGen->PushRel(offsetof(CMIPS, m_State.nFCSR));
-		m_codeGen->PushCst(~mask);
-		m_codeGen->And();
-		m_codeGen->PullRel(offsetof(CMIPS, m_State.nFCSR));
-	}
-	m_codeGen->EndIf();
+	m_codeGen->Shl(static_cast<uint8>(bitPos));
+
+	m_codeGen->PushRel(offsetof(CMIPS, m_State.nFCSR));
+	m_codeGen->PushCst(~mask);
+	m_codeGen->And();
+	m_codeGen->Or();
+	m_codeGen->PullRel(offsetof(CMIPS, m_State.nFCSR));
 }
 
 void CCOP_FPU::PushCCBit(uint32 mask)
@@ -344,8 +342,8 @@ void CCOP_FPU::ABS_S()
 //06
 void CCOP_FPU::MOV_S()
 {
-	m_codeGen->PushRel(offsetof(CMIPS, m_State.nCOP1[m_fs]));
-	m_codeGen->PullRel(offsetof(CMIPS, m_State.nCOP1[m_fd]));
+	m_codeGen->FP_PushRel32(offsetof(CMIPS, m_State.nCOP1[m_fs]));
+	m_codeGen->FP_PullRel32(offsetof(CMIPS, m_State.nCOP1[m_fd]));
 }
 
 //07
@@ -581,10 +579,18 @@ void CCOP_FPU::LWC1()
 
 	if(usePageLookup && m_codeGen->SupportsPageAccess())
 	{
-		m_codeGen->PushRelRef(offsetof(CMIPS, m_pageLookup));
+		bool useDirectRam = (m_pCtx->m_ramBase != nullptr);
+		if(useDirectRam && m_pCtx->m_fixedFrameExit)
+		{
+			m_codeGen->PushCstPtr(0);
+		}
+		else
+		{
+			m_codeGen->PushRelRef(useDirectRam ? offsetof(CMIPS, m_ramBase) : offsetof(CMIPS, m_pageLookup));
+		}
 		ComputeMemAccessAddrNoXlat();
-		m_codeGen->LoadFromPage(4, reinterpret_cast<void*>(&MemoryUtils_GetWordProxy));
-		m_codeGen->PullRel(offsetof(CMIPS, m_State.nCOP1[m_ft]));
+		m_codeGen->FP_LoadFromPage(reinterpret_cast<void*>(&MemoryUtils_GetWordProxy), useDirectRam ? static_cast<uint32>(offsetof(CMIPS, m_pageLookup)) : 0);
+		m_codeGen->FP_PullRel32(offsetof(CMIPS, m_State.nCOP1[m_ft]));
 		return;
 	}
 
@@ -629,10 +635,18 @@ void CCOP_FPU::SWC1()
 
 	if(usePageLookup && m_codeGen->SupportsPageAccess())
 	{
-		m_codeGen->PushRelRef(offsetof(CMIPS, m_pageLookup));
+		bool useDirectRam = (m_pCtx->m_ramBase != nullptr);
+		if(useDirectRam && m_pCtx->m_fixedFrameExit)
+		{
+			m_codeGen->PushCstPtr(0);
+		}
+		else
+		{
+			m_codeGen->PushRelRef(useDirectRam ? offsetof(CMIPS, m_ramBase) : offsetof(CMIPS, m_pageLookup));
+		}
 		ComputeMemAccessAddrNoXlat();
-		m_codeGen->PushRel(offsetof(CMIPS, m_State.nCOP1[m_ft]));
-		m_codeGen->StoreAtPage(4, reinterpret_cast<void*>(&MemoryUtils_SetWordProxy));
+		m_codeGen->FP_PushRel32(offsetof(CMIPS, m_State.nCOP1[m_ft]));
+		m_codeGen->FP_StoreAtPage(reinterpret_cast<void*>(&MemoryUtils_SetWordProxy), useDirectRam ? static_cast<uint32>(offsetof(CMIPS, m_pageLookup)) : 0);
 		return;
 	}
 

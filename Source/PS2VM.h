@@ -83,6 +83,8 @@ public:
 
 	CPU_UTILISATION_INFO GetCpuUtilisationInfo() const;
 
+	static void SetTimingStatsPath(std::string);
+
 #ifdef DEBUGGER_INCLUDED
 	fs::path MakeDebugTagsPackagePath(const char*);
 	void LoadDebugTags(const char*);
@@ -131,6 +133,8 @@ private:
 	void ReloadExecutable(const char*, const CPS2OS::ArgumentList&);
 	void OnExecutableChange();
 	void OnCrtModeChange();
+	void InitNativeCodeCaches();
+	void SaveNativeCodeCaches();
 
 	void PauseImpl();
 	void DestroyImpl();
@@ -174,7 +178,7 @@ private:
 	int64 m_spuUpdateTicksTotal = 0;
 	int m_eeExecutionTicks = 0;
 	int m_iopExecutionTicks = 0;
-	static const int m_eeTickStep = 4800;
+	static const int m_eeTickStep = 19200;
 	int m_iopTickStep = 0;
 	CFrameLimiter m_frameLimiter;
 
@@ -212,4 +216,13 @@ private:
 	CPS2OS::RequestLoadExecutableEvent::Connection m_OnRequestLoadExecutableConnection;
 	Framework::CSignal<void()>::Connection m_OnExecutableChangeConnection;
 	Framework::CSignal<void()>::Connection m_OnCrtModeChangeConnection;
+
+	static std::string m_timingStatsPath;
+	static bool m_timingStatsEnabled;
+	uint64 m_timingEeNs = 0;
+	uint64 m_timingIopNs = 0;
+	uint64 m_timingSpuNs = 0;
+	uint64 m_timingVblankNs = 0;
+	uint32 m_timingFrames = 0;
+	uint32 m_aotWarmupFrames = 0;
 };

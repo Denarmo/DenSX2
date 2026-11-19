@@ -14,6 +14,18 @@ bool CVuBasicBlock::IsLinkable() const
 	return m_isLinkable;
 }
 
+bool CVuBasicBlock::EndsWithDynamicBranch() const
+{
+	if((m_end - m_begin) < 0xC) return false;
+	uint32 branchInstAddr = m_end - 0xC;
+	uint32 inst = m_context.m_pMemoryMap->GetInstruction(branchInstAddr);
+	if(m_context.m_pArch->IsInstructionBranch(&m_context, branchInstAddr, inst) != MIPS_BRANCH_NORMAL)
+	{
+		return false;
+	}
+	return m_context.m_pArch->GetInstructionEffectiveAddress(&m_context, branchInstAddr, inst) == MIPS_INVALID_PC;
+}
+
 void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
 {
 	CompileProlog(jitter);
@@ -88,6 +100,7 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
 			setStallBits(loOps.readF1, loOps.readElemF1);
 			for(int32 i = extraPipeTimeIndex; i < 3; i++)
 			{
+				int32 activeWords = 0;
 				for(int32 stallIdx = 0; stallIdx < 4; stallIdx++)
 				{
 					if(stallMask.nV[stallIdx] != 0)
@@ -95,21 +108,29 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
 						jitter->PushRel(offsetof(CMIPS, m_State.pipeFmacWrite[i].nV[stallIdx]));
 						jitter->PushCst(stallMask.nV[stallIdx]);
 						jitter->And();
-						jitter->PushCst(0);
-						jitter->BeginIf(Jitter::CONDITION_NE);
+						if(activeWords > 0)
 						{
-							//Clear writes
-							jitter->MD_PushCstExpandW(0U);
-							jitter->MD_PullRel(offsetof(CMIPS, m_State.pipeFmacWrite[i]));
-
-							//Increment pipe time
-							jitter->PushRel(offsetof(CMIPS, m_State.pipeTime));
-							jitter->PushCst(1);
-							jitter->Add();
-							jitter->PullRel(offsetof(CMIPS, m_State.pipeTime));
+							jitter->Or();
 						}
-						jitter->EndIf();
+						activeWords++;
 					}
+				}
+				if(activeWords > 0)
+				{
+					jitter->PushCst(0);
+					jitter->BeginIf(Jitter::CONDITION_NE);
+					{
+						//Clear writes
+						jitter->MD_PushCstExpandW(0U);
+						jitter->MD_PullRel(offsetof(CMIPS, m_State.pipeFmacWrite[i]));
+
+						//Increment pipe time
+						jitter->PushRel(offsetof(CMIPS, m_State.pipeTime));
+						jitter->PushCst(1);
+						jitter->Add();
+						jitter->PullRel(offsetof(CMIPS, m_State.pipeTime));
+					}
+					jitter->EndIf();
 				}
 			}
 

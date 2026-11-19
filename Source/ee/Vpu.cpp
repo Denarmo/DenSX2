@@ -1,4 +1,5 @@
 #include "Vpu.h"
+#include <chrono>
 #include "make_unique.h"
 #include "string_format.h"
 #include "Log.h"
@@ -15,6 +16,11 @@
 
 #define STATE_REGS_VUSTATE ("vuState")
 #define STATE_REGS_FBRST ("fbrst")
+
+bool CVpu::m_timingStatsEnabled = false;
+uint64 CVpu::m_vu1ExecNs = 0;
+uint64 CVpu::m_vu1XgKickNs = 0;
+uint32 CVpu::m_vu1MicroPrograms = 0;
 
 CVpu::CVpu(unsigned int number, const VPUINIT& vpuInit, CGIF& gif, CINTC& intc, uint8* ram, uint8* spr)
     : m_number(number)
@@ -57,7 +63,7 @@ void CVpu::Execute(int32 quota)
 	case MIPS_EXCEPTION_VU_EBIT:
 		//E bit encountered
 		m_vuState = VU_STATE_READY;
-		VuStateChanged(m_vuState);
+		if(m_stateChangedCallback) m_stateChangedCallback(m_stateChangedCtx, m_vuState);
 		break;
 	case MIPS_EXCEPTION_VU_TBIT:
 	case MIPS_EXCEPTION_VU_DBIT:
@@ -69,8 +75,8 @@ void CVpu::Execute(int32 quota)
 			if(mustBreak)
 			{
 				m_vuState = VU_STATE_STOPPED;
-				VuStateChanged(m_vuState);
-				VuInterruptTriggered();
+				if(m_stateChangedCallback) m_stateChangedCallback(m_stateChangedCtx, m_vuState);
+				if(m_interruptCallback) m_interruptCallback(m_interruptCtx);
 			}
 			else
 			{
@@ -207,7 +213,8 @@ void CVpu::ExecuteMicroProgram(uint32 nAddress)
 
 	assert(m_vuState != VU_STATE_RUNNING);
 	m_vuState = VU_STATE_RUNNING;
-	VuStateChanged(m_vuState);
+	if(m_timingStatsEnabled && (m_number == 1)) m_vu1MicroPrograms++;
+	if(m_stateChangedCallback) m_stateChangedCallback(m_stateChangedCtx, m_vuState);
 	for(unsigned int i = 0; i < 100; i++)
 	{
 		Execute(5000);

@@ -115,12 +115,50 @@ static const uint64 g_LDMaskLeft[8] =
 };
 // clang-format on
 
+static inline uint32 FastLoadWord(CMIPS* context, uint32 alignedAddress)
+{
+	if(context->m_ramBase && alignedAddress < 0x02000000U)
+	{
+		return *reinterpret_cast<const uint32*>(context->m_ramBase + alignedAddress);
+	}
+	return MemoryUtils_GetWordProxy(context, alignedAddress);
+}
+
+static inline void FastStoreWord(CMIPS* context, uint32 value, uint32 alignedAddress)
+{
+	if(context->m_ramBase && alignedAddress < 0x02000000U)
+	{
+		*reinterpret_cast<uint32*>(context->m_ramBase + alignedAddress) = value;
+		return;
+	}
+	MemoryUtils_SetWordProxy(context, value, alignedAddress);
+}
+
+static inline uint64 FastLoadDouble(CMIPS* context, uint32 alignedAddress)
+{
+	if(context->m_ramBase && alignedAddress < 0x02000000U)
+	{
+		return *reinterpret_cast<const uint64*>(context->m_ramBase + alignedAddress);
+	}
+	return MemoryUtils_GetDoubleProxy(context, alignedAddress);
+}
+
+static inline void FastStoreDouble(CMIPS* context, uint64 value, uint32 alignedAddress)
+{
+	if(context->m_ramBase && alignedAddress < 0x02000000U)
+	{
+		*reinterpret_cast<uint64*>(context->m_ramBase + alignedAddress) = value;
+		return;
+	}
+	MemoryUtils_SetDoubleProxy(context, value, alignedAddress);
+}
+
 extern "C" uint32 LWL_Proxy(uint32 address, uint32 rt, CMIPS* context)
 {
 	uint32 alignedAddress = address & ~0x03;
 	uint32 byteOffset = address & 0x03;
 	uint32 accessType = 3 - byteOffset;
-	uint32 memory = MemoryUtils_GetWordProxy(context, alignedAddress);
+	uint32 memory = FastLoadWord(context, alignedAddress);
 	memory <<= accessType * 8;
 	rt &= g_LWMaskRight[byteOffset];
 	rt |= memory;
@@ -132,7 +170,7 @@ extern "C" uint32 LWR_Proxy(uint32 address, uint32 rt, CMIPS* context)
 	uint32 alignedAddress = address & ~0x03;
 	uint32 byteOffset = address & 0x03;
 	uint32 accessType = 3 - byteOffset;
-	uint32 memory = MemoryUtils_GetWordProxy(context, alignedAddress);
+	uint32 memory = FastLoadWord(context, alignedAddress);
 	memory >>= byteOffset * 8;
 	rt &= g_LWMaskLeft[accessType];
 	rt |= memory;
@@ -144,7 +182,7 @@ extern "C" uint64 LDL_Proxy(uint32 address, uint64 rt, CMIPS* context)
 	uint32 alignedAddress = address & ~0x07;
 	uint32 byteOffset = address & 0x07;
 	uint32 accessType = 7 - byteOffset;
-	uint64 memory = MemoryUtils_GetDoubleProxy(context, alignedAddress);
+	uint64 memory = FastLoadDouble(context, alignedAddress);
 	memory <<= accessType * 8;
 	rt &= g_LDMaskRight[byteOffset];
 	rt |= memory;
@@ -156,7 +194,7 @@ extern "C" uint64 LDR_Proxy(uint32 address, uint64 rt, CMIPS* context)
 	uint32 alignedAddress = address & ~0x07;
 	uint32 byteOffset = address & 0x07;
 	uint32 accessType = 7 - byteOffset;
-	uint64 memory = MemoryUtils_GetDoubleProxy(context, alignedAddress);
+	uint64 memory = FastLoadDouble(context, alignedAddress);
 	memory >>= byteOffset * 8;
 	rt &= g_LDMaskLeft[accessType];
 	rt |= memory;
@@ -169,10 +207,10 @@ extern "C" void SWL_Proxy(uint32 address, uint32 rt, CMIPS* context)
 	uint32 byteOffset = address & 0x03;
 	uint32 accessType = 3 - byteOffset;
 	rt >>= accessType * 8;
-	uint32 memory = MemoryUtils_GetWordProxy(context, alignedAddress);
+	uint32 memory = FastLoadWord(context, alignedAddress);
 	memory &= g_LWMaskLeft[byteOffset];
 	memory |= rt;
-	MemoryUtils_SetWordProxy(context, memory, alignedAddress);
+	FastStoreWord(context, memory, alignedAddress);
 }
 
 extern "C" void SWR_Proxy(uint32 address, uint32 rt, CMIPS* context)
@@ -181,10 +219,10 @@ extern "C" void SWR_Proxy(uint32 address, uint32 rt, CMIPS* context)
 	uint32 byteOffset = address & 0x03;
 	uint32 accessType = 3 - byteOffset;
 	rt <<= byteOffset * 8;
-	uint32 memory = MemoryUtils_GetWordProxy(context, alignedAddress);
+	uint32 memory = FastLoadWord(context, alignedAddress);
 	memory &= g_LWMaskRight[accessType];
 	memory |= rt;
-	MemoryUtils_SetWordProxy(context, memory, alignedAddress);
+	FastStoreWord(context, memory, alignedAddress);
 }
 
 extern "C" void SDL_Proxy(uint32 address, uint64 rt, CMIPS* context)
@@ -193,10 +231,10 @@ extern "C" void SDL_Proxy(uint32 address, uint64 rt, CMIPS* context)
 	uint32 byteOffset = address & 0x07;
 	uint32 accessType = 7 - byteOffset;
 	rt >>= accessType * 8;
-	uint64 memory = MemoryUtils_GetDoubleProxy(context, alignedAddress);
+	uint64 memory = FastLoadDouble(context, alignedAddress);
 	memory &= g_LDMaskLeft[byteOffset];
 	memory |= rt;
-	MemoryUtils_SetDoubleProxy(context, memory, alignedAddress);
+	FastStoreDouble(context, memory, alignedAddress);
 }
 
 extern "C" void SDR_Proxy(uint32 address, uint64 rt, CMIPS* context)
@@ -205,10 +243,10 @@ extern "C" void SDR_Proxy(uint32 address, uint64 rt, CMIPS* context)
 	uint32 byteOffset = address & 0x07;
 	uint32 accessType = 7 - byteOffset;
 	rt <<= byteOffset * 8;
-	uint64 memory = MemoryUtils_GetDoubleProxy(context, alignedAddress);
+	uint64 memory = FastLoadDouble(context, alignedAddress);
 	memory &= g_LDMaskRight[accessType];
 	memory |= rt;
-	MemoryUtils_SetDoubleProxy(context, memory, alignedAddress);
+	FastStoreDouble(context, memory, alignedAddress);
 }
 
 CMA_MIPSIV::CMA_MIPSIV(MIPS_REGSIZE nRegSize)
@@ -556,6 +594,16 @@ void CMA_MIPSIV::DADDIU()
 	if(!Ensure64BitRegs()) return;
 	if(m_nRT == 0) return;
 
+	if(m_nRS == 0)
+	{
+		int32 imm = static_cast<int16>(m_nImmediate);
+		m_codeGen->PushCst(static_cast<uint32>(imm));
+		m_codeGen->PullRel(offsetof(CMIPS, m_State.nGPR[m_nRT].nV[0]));
+		m_codeGen->PushCst((imm < 0) ? 0xFFFFFFFFU : 0U);
+		m_codeGen->PullRel(offsetof(CMIPS, m_State.nGPR[m_nRT].nV[1]));
+		return;
+	}
+
 	m_codeGen->PushRel64(offsetof(CMIPS, m_State.nGPR[m_nRS].nV[0]));
 	m_codeGen->PushCst64(static_cast<int16>(m_nImmediate));
 	m_codeGen->Add64();
@@ -770,6 +818,23 @@ void CMA_MIPSIV::LD()
 	if(!Ensure64BitRegs()) return;
 	if(m_nRT == 0) return;
 
+	if((m_pCtx->m_pageLookup != nullptr) && m_codeGen->SupportsPageAccess())
+	{
+		bool useDirectRam = (m_pCtx->m_ramBase != nullptr);
+		if(useDirectRam && m_pCtx->m_fixedFrameExit)
+		{
+			m_codeGen->PushCstPtr(0);
+		}
+		else
+		{
+			m_codeGen->PushRelRef(useDirectRam ? offsetof(CMIPS, m_ramBase) : offsetof(CMIPS, m_pageLookup));
+		}
+		ComputeMemAccessAddrNoXlat();
+		m_codeGen->Load64FromPage(reinterpret_cast<void*>(&MemoryUtils_GetDoubleProxy), useDirectRam ? static_cast<uint32>(offsetof(CMIPS, m_pageLookup)) : 0);
+		m_codeGen->PullRel64(offsetof(CMIPS, m_State.nGPR[m_nRT]));
+		return;
+	}
+
 	ComputeMemAccessPageRef();
 
 	m_codeGen->PushCst(0);
@@ -824,6 +889,23 @@ void CMA_MIPSIV::SDC2()
 void CMA_MIPSIV::SD()
 {
 	if(!Ensure64BitRegs()) return;
+
+	if((m_pCtx->m_pageLookup != nullptr) && m_codeGen->SupportsPageAccess())
+	{
+		bool useDirectRam = (m_pCtx->m_ramBase != nullptr);
+		if(useDirectRam && m_pCtx->m_fixedFrameExit)
+		{
+			m_codeGen->PushCstPtr(0);
+		}
+		else
+		{
+			m_codeGen->PushRelRef(useDirectRam ? offsetof(CMIPS, m_ramBase) : offsetof(CMIPS, m_pageLookup));
+		}
+		ComputeMemAccessAddrNoXlat();
+		m_codeGen->PushRel64(offsetof(CMIPS, m_State.nGPR[m_nRT]));
+		m_codeGen->Store64AtPage(reinterpret_cast<void*>(&MemoryUtils_SetDoubleProxy), useDirectRam ? static_cast<uint32>(offsetof(CMIPS, m_pageLookup)) : 0);
+		return;
+	}
 
 	ComputeMemAccessPageRef();
 
@@ -1092,19 +1174,14 @@ void CMA_MIPSIV::AND()
 {
 	if(m_nRD == 0) return;
 
-	if(m_regSize == MIPS_REGSIZE_32)
+	//Use 32-bit half ops (matching OR/XOR) so operands stay unaliased for register allocation
+	unsigned int regCount = (m_regSize == MIPS_REGSIZE_64) ? 2 : 1;
+	for(unsigned int i = 0; i < regCount; i++)
 	{
-		m_codeGen->PushRel(offsetof(CMIPS, m_State.nGPR[m_nRS].nV[0]));
-		m_codeGen->PushRel(offsetof(CMIPS, m_State.nGPR[m_nRT].nV[0]));
+		m_codeGen->PushRel(offsetof(CMIPS, m_State.nGPR[m_nRS].nV[i]));
+		m_codeGen->PushRel(offsetof(CMIPS, m_State.nGPR[m_nRT].nV[i]));
 		m_codeGen->And();
-		m_codeGen->PullRel(offsetof(CMIPS, m_State.nGPR[m_nRD].nV[0]));
-	}
-	else
-	{
-		m_codeGen->PushRel64(offsetof(CMIPS, m_State.nGPR[m_nRS].nV[0]));
-		m_codeGen->PushRel64(offsetof(CMIPS, m_State.nGPR[m_nRT].nV[0]));
-		m_codeGen->And64();
-		m_codeGen->PullRel64(offsetof(CMIPS, m_State.nGPR[m_nRD].nV[0]));
+		m_codeGen->PullRel(offsetof(CMIPS, m_State.nGPR[m_nRD].nV[i]));
 	}
 }
 

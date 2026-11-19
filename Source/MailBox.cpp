@@ -1,8 +1,14 @@
 #include "MailBox.h"
 
+CMailBox::CMailBox()
+{
+	m_calls.reserve(1024);
+	m_dispatchCalls.reserve(1024);
+}
+
 bool CMailBox::IsPending() const
 {
-	return m_calls.size() != 0;
+	return m_readIndex < m_calls.size();
 }
 
 void CMailBox::WaitForCall()
@@ -64,13 +70,10 @@ void CMailBox::SendCall(const FunctionType& function, bool waitForCompletion)
 	}
 }
 
-void CMailBox::SendCall(FunctionType&& function)
+void CMailBox::PushMessage(MESSAGE&& message)
 {
 	bool wake = false;
 	{
-		MESSAGE message;
-		message.function = std::move(function);
-
 		std::lock_guard callLock(m_callMutex);
 		m_calls.push_back(std::move(message));
 		wake = (m_waiters != 0) && !m_wakeSent;
@@ -83,18 +86,67 @@ void CMailBox::SendCall(FunctionType&& function)
 	}
 }
 
+void CMailBox::SendCall(FunctionType&& function)
+{
+	MESSAGE message;
+	message.function = std::move(function);
+	PushMessage(std::move(message));
+}
+
+void CMailBox::DispatchMessage(MESSAGE& message)
+{
+	if(message.smallInvoke)
+	{
+		message.smallInvoke(message.smallStorage);
+	}
+	else
+	{
+		message.function();
+	}
+	if(message.promise)
+	{
+		message.promise->set_value();
+	}
+}
+
 void CMailBox::ReceiveCall()
 {
 	MESSAGE message;
 	{
 		std::lock_guard callLock(m_callMutex);
-		if(!IsPending()) return;
-		message = std::move(m_calls.front());
-		m_calls.pop_front();
+		if(m_readIndex >= m_calls.size()) return;
+		message = std::move(m_calls[m_readIndex++]);
+		if(m_readIndex >= m_calls.size())
+		{
+			m_calls.clear();
+			m_readIndex = 0;
+		}
 	}
-	message.function();
-	if(message.promise)
+	DispatchMessage(message);
+}
+
+void CMailBox::ReceiveAllCalls()
+{
+	while(true)
 	{
-		message.promise->set_value();
+		size_t startIndex = 0;
+		{
+			std::lock_guard callLock(m_callMutex);
+			if(m_readIndex >= m_calls.size())
+			{
+				m_calls.clear();
+				m_readIndex = 0;
+				return;
+			}
+			m_dispatchCalls.clear();
+			m_dispatchCalls.swap(m_calls);
+			startIndex = m_readIndex;
+			m_readIndex = 0;
+		}
+		for(size_t i = startIndex; i < m_dispatchCalls.size(); i++)
+		{
+			DispatchMessage(m_dispatchCalls[i]);
+		}
+		m_dispatchCalls.clear();
 	}
 }

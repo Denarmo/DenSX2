@@ -19,12 +19,26 @@ uint32 MemoryUtils_GetHalfProxy(CMIPS* context, uint32 vAddress)
 
 uint32 MemoryUtils_GetWordProxy(CMIPS* context, uint32 vAddress)
 {
+	if(auto* lookup = context->m_pageLookup)
+	{
+		if(auto* page = reinterpret_cast<const uint8*>(lookup[vAddress >> 12]))
+		{
+			return *reinterpret_cast<const uint32*>(page + (vAddress & 0xFFC));
+		}
+	}
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
 	return context->m_pMemoryMap->GetWord(address);
 }
 
 uint64 MemoryUtils_GetDoubleProxy(CMIPS* context, uint32 vAddress)
 {
+	if(auto* lookup = context->m_pageLookup)
+	{
+		if(auto* page = reinterpret_cast<const uint8*>(lookup[vAddress >> 12]))
+		{
+			return *reinterpret_cast<const uint64*>(page + (vAddress & 0xFF8));
+		}
+	}
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
 	assert((address & 0x07) == 0);
 	auto e = context->m_pMemoryMap->GetReadMap(address);
@@ -55,6 +69,13 @@ uint64 MemoryUtils_GetDoubleProxy(CMIPS* context, uint32 vAddress)
 
 uint128 MemoryUtils_GetQuadProxy(CMIPS* context, uint32 vAddress)
 {
+	if(auto* lookup = context->m_pageLookup)
+	{
+		if(auto* page = reinterpret_cast<const uint8*>(lookup[vAddress >> 12]))
+		{
+			return *reinterpret_cast<const uint128*>(page + (vAddress & 0xFF0));
+		}
+	}
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
 	address &= ~0x0F;
 	auto e = context->m_pMemoryMap->GetReadMap(address);
@@ -97,12 +118,28 @@ void MemoryUtils_SetHalfProxy(CMIPS* context, uint32 value, uint32 vAddress)
 
 void MemoryUtils_SetWordProxy(CMIPS* context, uint32 value, uint32 vAddress)
 {
+	if(auto* lookup = context->m_pageLookup)
+	{
+		if(auto* page = reinterpret_cast<uint8*>(lookup[vAddress >> 12]))
+		{
+			*reinterpret_cast<uint32*>(page + (vAddress & 0xFFC)) = value;
+			return;
+		}
+	}
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
 	context->m_pMemoryMap->SetWord(address, value);
 }
 
 void MemoryUtils_SetDoubleProxy(CMIPS* context, uint64 value64, uint32 vAddress)
 {
+	if(auto* lookup = context->m_pageLookup)
+	{
+		if(auto* page = reinterpret_cast<uint8*>(lookup[vAddress >> 12]))
+		{
+			*reinterpret_cast<uint64*>(page + (vAddress & 0xFF8)) = value64;
+			return;
+		}
+	}
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
 	assert((address & 0x07) == 0);
 	INTEGER64 value;
@@ -133,6 +170,14 @@ void MemoryUtils_SetDoubleProxy(CMIPS* context, uint64 value64, uint32 vAddress)
 
 void MemoryUtils_SetQuadProxy(CMIPS* context, const uint128& value, uint32 vAddress)
 {
+	if(auto* lookup = context->m_pageLookup)
+	{
+		if(auto* page = reinterpret_cast<uint8*>(lookup[vAddress >> 12]))
+		{
+			*reinterpret_cast<uint128*>(page + (vAddress & 0xFF0)) = value;
+			return;
+		}
+	}
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
 	address &= ~0x0F;
 	auto e = context->m_pMemoryMap->GetWriteMap(address);

@@ -13,6 +13,7 @@ public:
 protected:
 	void CompileProlog(CMipsJitter*) override;
 	void CompileEpilog(CMipsJitter*, bool) override;
+	bool MaySetExceptionInEpilog() const override { return m_isIdleLoopBlock; }
 
 private:
 	bool IsCodeIdleLoopBlock() const;

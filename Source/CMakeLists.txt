@@ -144,6 +144,8 @@ endif()
 set(COMMON_SRC_FILES
 	BasicBlock.cpp
 	BasicBlock.h
+	NativeCodeCache.cpp
+	NativeCodeCache.h
 	BiosDebugInfoProvider.h
 	BlockLookupOneWay.h
 	BlockLookupTwoWay.h
@@ -235,6 +237,8 @@ set(COMMON_SRC_FILES
 	ee/Vif1.h
 	ee/Vpu.cpp
 	ee/Vpu.h
+	ee/Vu1GifWorker.cpp
+	ee/Vu1GifWorker.h
 	ee/VuAnalysis.cpp
 	ee/VuAnalysis.h
 	ee/VuBasicBlock.cpp

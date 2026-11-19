@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include "Types.h"
 #include "DMAC.h"
 #include "zip/ZipArchiveWriter.h"
@@ -46,6 +47,6 @@ public:
 	void SaveState(Framework::CZipArchiveWriter&);
 
 private:
-	uint32 m_INTC_STAT;
+	std::atomic<uint32> m_INTC_STAT;
 	uint32 m_INTC_MASK;
 };

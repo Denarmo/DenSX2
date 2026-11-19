@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <chrono>
 #include <exception>
 #include <memory>
 #include <climits>
@@ -7,9 +8,11 @@
 #include "make_unique.h"
 #include "string_format.h"
 #include "PS2VM.h"
+#include "ThreadAffinity.h"
 #include "PS2VM_Preferences.h"
 #include "ee/PS2OS.h"
 #include "ee/EeExecutor.h"
+#include "ee/VuExecutor.h"
 #include "Ps2Const.h"
 #include "iop/Iop_SifManPs2.h"
 #include "iop/UsbBuzzerDevice.h"
@@ -52,6 +55,17 @@
 #define PREF_PS2_MC1_DIRECTORY_DEFAULT ("vfs/mc1")
 #define PREF_PS2_HDD_DIRECTORY_DEFAULT ("vfs/hdd")
 #define PREF_PS2_ARCADEROMS_DIRECTORY_DEFAULT ("arcaderoms")
+
+std::string CPS2VM::m_timingStatsPath;
+bool CPS2VM::m_timingStatsEnabled = false;
+
+void CPS2VM::SetTimingStatsPath(std::string path)
+{
+	m_timingStatsPath = std::move(path);
+	m_timingStatsEnabled = !m_timingStatsPath.empty();
+	CVpu::SetTimingStatsEnabled(m_timingStatsEnabled);
+	Ee::CVu1GifWorker::SetTimingStatsEnabled(m_timingStatsEnabled);
+}
 
 CPS2VM::CPS2VM()
     : m_eeProfilerZone(CProfiler::GetInstance().RegisterZone("EE"))
@@ -680,6 +694,11 @@ void CPS2VM::LoadVmTimingState(Framework::CZipArchiveReader& archive)
 
 void CPS2VM::PauseImpl()
 {
+	if(m_ee)
+	{
+		m_ee->SyncVu1Gif(Ee::CVu1GifWorker::SYNC_OTHER);
+		SaveNativeCodeCaches();
+	}
 	m_nStatus = PAUSED;
 }
 
@@ -695,6 +714,7 @@ void CPS2VM::ResumeImpl()
 
 void CPS2VM::DestroyImpl()
 {
+	SaveNativeCodeCaches();
 	DestroyGsHandlerImpl();
 	DestroyPadHandlerImpl();
 	DestroySoundHandlerImpl();
@@ -703,6 +723,7 @@ void CPS2VM::DestroyImpl()
 
 void CPS2VM::CreateGsHandlerImpl(const CGSHandler::FactoryFunction& factoryFunction)
 {
+	if(m_ee) m_ee->SyncVu1Gif(Ee::CVu1GifWorker::SYNC_OTHER);
 	auto gs = m_ee->m_gs;
 	m_ee->m_gs = factoryFunction();
 	m_ee->m_gs->SetIntc(&m_ee->m_intc);
@@ -720,6 +741,7 @@ void CPS2VM::CreateGsHandlerImpl(const CGSHandler::FactoryFunction& factoryFunct
 
 void CPS2VM::DestroyGsHandlerImpl()
 {
+	if(m_ee) m_ee->SyncVu1Gif(Ee::CVu1GifWorker::SYNC_OTHER);
 	if(m_ee->m_gs == nullptr) return;
 	m_ee->m_gs->Release();
 	delete m_ee->m_gs;
@@ -766,6 +788,7 @@ void CPS2VM::UpdateEe()
 #ifdef PROFILE
 	CProfilerZone profilerZone(m_eeProfilerZone);
 #endif
+	auto t0 = m_timingStatsEnabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
 	while(m_eeExecutionTicks > 0)
 	{
@@ -778,7 +801,10 @@ void CPS2VM::UpdateEe()
 		m_cpuUtilisation.eeTotalTicks += executed;
 
 		m_ee->m_vpu0->Execute(m_singleStepVu0 ? 1 : executed);
-		m_ee->m_vpu1->Execute(m_singleStepVu1 ? 1 : executed);
+		if(!m_ee->IsVu1WorkerRunning() || m_singleStepVu1)
+		{
+			m_ee->m_vpu1->Execute(m_singleStepVu1 ? 1 : executed);
+		}
 
 		m_eeExecutionTicks -= executed;
 		m_spuUpdateTicks -= (static_cast<int64>(executed) << SPU_UPDATE_TICKS_PRECISION);
@@ -791,6 +817,11 @@ void CPS2VM::UpdateEe()
 		if(m_ee->m_EE.m_executor->MustBreak()) break;
 #endif
 	}
+
+	if(m_timingStatsEnabled)
+	{
+		m_timingEeNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+	}
 }
 
 void CPS2VM::UpdateIop()
@@ -798,6 +829,7 @@ void CPS2VM::UpdateIop()
 #ifdef PROFILE
 	CProfilerZone profilerZone(m_iopProfilerZone);
 #endif
+	auto t0 = m_timingStatsEnabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
 	while(m_iopExecutionTicks > 0)
 	{
@@ -817,6 +849,11 @@ void CPS2VM::UpdateIop()
 		if(m_iop->m_cpu.m_executor->MustBreak()) break;
 #endif
 	}
+
+	if(m_timingStatsEnabled)
+	{
+		m_timingIopNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+	}
 }
 
 void CPS2VM::UpdateSpu()
@@ -824,6 +861,7 @@ void CPS2VM::UpdateSpu()
 #ifdef PROFILE
 	CProfilerZone profilerZone(m_spuProfilerZone);
 #endif
+	auto t0 = m_timingStatsEnabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
 	unsigned int blockOffset = (BLOCK_SIZE * m_currentSpuBlock);
 	int16* samplesSpu0 = m_samples + blockOffset;
@@ -835,13 +873,16 @@ void CPS2VM::UpdateSpu()
 		int16 samplesSpu1[BLOCK_SIZE];
 		m_iop->m_spuCore1.Render(samplesSpu1, BLOCK_SIZE);
 
-		for(unsigned int i = 0; i < BLOCK_SIZE; i++)
+		const int32 extVolL = m_iop->m_spuCore1.m_extInputVolL;
+		const int32 extVolR = m_iop->m_spuCore1.m_extInputVolR;
+		for(unsigned int i = 0; i < BLOCK_SIZE; i += 2)
 		{
 			// Core0 output should be mixed with Core1 at volume
 			// corresponding to Core1's AVOL register values
-			int32 volume = (i % 2) ? m_iop->m_spuCore1.m_extInputVolR : m_iop->m_spuCore1.m_extInputVolL;
-			Iop::CSpuBase::MixSamples(samplesSpu0[i], volume, &samplesSpu1[i]);
-			samplesSpu0[i] = samplesSpu1[i];
+			Iop::CSpuBase::MixSamples(samplesSpu0[i + 0], extVolL, &samplesSpu1[i + 0]);
+			Iop::CSpuBase::MixSamples(samplesSpu0[i + 1], extVolR, &samplesSpu1[i + 1]);
+			samplesSpu0[i + 0] = samplesSpu1[i + 0];
+			samplesSpu0[i + 1] = samplesSpu1[i + 1];
 		}
 	}
 
@@ -854,6 +895,11 @@ void CPS2VM::UpdateSpu()
 			m_soundHandler->Write(m_samples, BLOCK_SIZE * m_spuBlockCount, DST_SAMPLE_RATE);
 		}
 		m_currentSpuBlock = 0;
+	}
+
+	if(m_timingStatsEnabled)
+	{
+		m_timingSpuNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
 	}
 }
 
@@ -935,6 +981,97 @@ void CPS2VM::ReloadExecutable(const char* executablePath, const CPS2OS::Argument
 void CPS2VM::OnExecutableChange()
 {
 	CGameConfig::ApplyGameConfig(*this);
+	InitNativeCodeCaches();
+}
+
+void CPS2VM::InitNativeCodeCaches()
+{
+	if(!m_ee || !m_ee->m_os) return;
+	const char* exeName = m_ee->m_os->GetExecutableName();
+	if(!exeName || !*exeName) return;
+
+	auto* eeExec = static_cast<CEeExecutor*>(m_ee->m_EE.m_executor.get());
+	auto* vu0Exec = static_cast<CVuExecutor*>(m_ee->m_VU0.m_executor.get());
+	auto* vu1Exec = static_cast<CVuExecutor*>(m_ee->m_VU1.m_executor.get());
+
+	std::vector<std::pair<uint32, uint32>> execSegments;
+	uint32 entryPoint = 0;
+	if(auto* elf = m_ee->m_os->GetELF())
+	{
+		const auto& header = elf->GetHeader();
+		entryPoint = header.nEntryPoint;
+		for(unsigned int i = 0; i < header.nProgHeaderCount; i++)
+		{
+			auto* p = elf->GetProgram(i);
+			if(p && p->nFileSize > 0 && (p->nFlags & ELF::PF_X) && p->nVAddress < m_eeRamSize)
+			{
+				uint32 end = std::min<uint32>(p->nVAddress + p->nFileSize, m_eeRamSize);
+				execSegments.emplace_back(p->nVAddress, end);
+			}
+		}
+		if(execSegments.empty())
+		{
+			for(unsigned int i = 0; i < header.nProgHeaderCount; i++)
+			{
+				auto* p = elf->GetProgram(i);
+				if(p && p->nFileSize > 0 && p->nVAddress >= 0x100000 && p->nVAddress < m_eeRamSize)
+				{
+					uint32 end = std::min<uint32>(p->nVAddress + p->nFileSize, m_eeRamSize);
+					execSegments.emplace_back(p->nVAddress, end);
+				}
+			}
+		}
+	}
+
+	eeExec->SetTrackJitStats(m_timingStatsEnabled);
+	if(!execSegments.empty())
+	{
+		eeExec->InitAotForElf(exeName, entryPoint, execSegments);
+	}
+	else
+	{
+		eeExec->InitOverlayDiskCache(exeName);
+	}
+	vu0Exec->InitDiskCache(exeName);
+	vu1Exec->InitDiskCache(exeName);
+	m_aotWarmupFrames = 0;
+
+	if(m_timingStatsEnabled)
+	{
+		const auto& es = eeExec->GetAotStats();
+		const auto& vs = vu1Exec->GetCacheStats();
+		if(FILE* out = fopen(m_timingStatsPath.c_str(), "a"))
+		{
+			fprintf(out, "aot: exe=%s arch=%s ee(load=%u comp=%u %.1fms) ovl(load=%u) vu1(load=%u)\n",
+			        exeName, CNativeCodeCache::GetArchTag(),
+			        es.elfBlocksLoaded, es.elfBlocksCompiled, es.initMs,
+			        es.overlayBlocksLoaded, vs.loaded);
+			fclose(out);
+		}
+	}
+}
+
+void CPS2VM::SaveNativeCodeCaches()
+{
+	if(!m_ee) return;
+	m_ee->SyncVu1Gif(Ee::CVu1GifWorker::SYNC_OTHER);
+	auto* eeExec = static_cast<CEeExecutor*>(m_ee->m_EE.m_executor.get());
+	auto* vu0Exec = static_cast<CVuExecutor*>(m_ee->m_VU0.m_executor.get());
+	auto* vu1Exec = static_cast<CVuExecutor*>(m_ee->m_VU1.m_executor.get());
+	eeExec->SaveOverlayDiskCache();
+	vu0Exec->SaveDiskCache();
+	vu1Exec->SaveDiskCache();
+	if(m_timingStatsEnabled)
+	{
+		const auto& es = eeExec->GetAotStats();
+		const auto& vs = vu1Exec->GetCacheStats();
+		if(FILE* out = fopen(m_timingStatsPath.c_str(), "a"))
+		{
+			fprintf(out, "aot-save: ovl(hit=%u comp=%u) vu1(hit=%u comp=%u)\n",
+			        es.overlayHits, es.overlayCompiled, vs.hits, vs.compiled);
+			fclose(out);
+		}
+	}
 }
 
 void CPS2VM::OnCrtModeChange()
@@ -944,6 +1081,7 @@ void CPS2VM::OnCrtModeChange()
 
 void CPS2VM::EmuThread()
 {
+	ThreadAffinity::ApplyCurrentThread(ThreadAffinity::Role::EePrime);
 	CreateVM();
 	fesetround(FE_TOWARDZERO);
 	FpUtils::SetDenormalHandlingMode();
@@ -1001,7 +1139,13 @@ void CPS2VM::EmuThread()
 #ifdef PROFILE
 							CProfilerZone profilerZone(m_gsSyncProfilerZone);
 #endif
+							auto tv0 = m_timingStatsEnabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+							m_ee->SyncVu1Gif(Ee::CVu1GifWorker::SYNC_VBLANK);
 							m_ee->m_gs->SetVBlank();
+							if(m_timingStatsEnabled)
+							{
+								m_timingVblankNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tv0).count();
+							}
 						}
 
 						if(m_pad != NULL)
@@ -1013,9 +1157,115 @@ void CPS2VM::EmuThread()
 						CProfiler::GetInstance().CountCurrentZone();
 #endif
 						OnNewFrame();
+						++m_aotWarmupFrames;
+						if(m_aotWarmupFrames == 150)
+						{
+							SaveNativeCodeCaches();
+						}
+						else if((m_aotWarmupFrames > 150) && ((m_aotWarmupFrames % 120) == 0))
+						{
+							auto* eeExec = static_cast<CEeExecutor*>(m_ee->m_EE.m_executor.get());
+							if(eeExec->GetPendingOverlayCount() >= 256)
+							{
+								eeExec->SaveOverlayDiskCache(true);
+							}
+						}
 #ifdef PROFILE
 						CProfiler::GetInstance().Reset();
 #endif
+						if(m_timingStatsEnabled)
+						{
+							m_timingFrames++;
+							if(m_timingFrames >= 60)
+							{
+								uint64 vu1Ns = CVpu::TakeVu1ExecNs();
+								uint64 xgkNs = CVpu::TakeVu1XgKickNs();
+								uint32 vu1Mp = CVpu::TakeVu1MicroPrograms();
+								auto ws = m_ee->TakeVu1WorkerStats();
+								bool mtvu = m_ee->IsVu1WorkerRunning();
+								auto* eeExec = static_cast<CEeExecutor*>(m_ee->m_EE.m_executor.get());
+								const auto js = eeExec->GetJitStats();
+								eeExec->ResetJitStats();
+								uint64 eeOnlyNs = mtvu ? m_timingEeNs : ((m_timingEeNs > vu1Ns) ? (m_timingEeNs - vu1Ns) : 0);
+								uint64 vu1OnlyNs = (vu1Ns > xgkNs) ? (vu1Ns - xgkNs) : 0;
+								double inv = 1.0 / (static_cast<double>(m_timingFrames) * 1e6);
+								double f = static_cast<double>(m_timingFrames);
+								double totalMs = static_cast<double>(m_timingEeNs + m_timingIopNs + m_timingSpuNs + m_timingVblankNs) * inv;
+								if(FILE* out = fopen(m_timingStatsPath.c_str(), "a"))
+								{
+									fprintf(out, "vm: n=%u tot=%.2f ee=%.2f vu1=%.2f(xgk=%.2f mp=%.0f) iop=%.2f spu=%.2f vb=%.2f ms/f\n",
+									        m_timingFrames, totalMs,
+									        static_cast<double>(eeOnlyNs) * inv,
+									        static_cast<double>(vu1OnlyNs) * inv,
+									        static_cast<double>(xgkNs) * inv,
+									        static_cast<double>(vu1Mp) / f,
+									        static_cast<double>(m_timingIopNs) * inv,
+									        static_cast<double>(m_timingSpuNs) * inv,
+									        static_cast<double>(m_timingVblankNs) * inv);
+									if(js.factoryCalls || js.accessFaults || js.flushes)
+									{
+										uint32 topCAddr = 0, topCCnt = 0, topFAddr = 0, topFCnt = 0;
+										for(const auto& kv : js.compileAddrs)
+											if(kv.second > topCCnt) { topCAddr = kv.first; topCCnt = kv.second; }
+										for(const auto& kv : js.faultPages)
+											if(kv.second > topFCnt) { topFAddr = kv.first; topFCnt = kv.second; }
+										fprintf(out, "jit: fac=%llu cmp=%llu hit=%llu cpy=%llu ovl=%llu flt=%llu flsh=%llu(%llu) topC=0x%08X(%u) topF=0x%08X(%u)\n",
+										        static_cast<unsigned long long>(js.factoryCalls),
+										        static_cast<unsigned long long>(js.compiles),
+										        static_cast<unsigned long long>(js.cacheHits),
+										        static_cast<unsigned long long>(js.cacheCopyHits),
+										        static_cast<unsigned long long>(js.overlayHits),
+										        static_cast<unsigned long long>(js.accessFaults),
+										        static_cast<unsigned long long>(js.flushes),
+										        static_cast<unsigned long long>(js.flushInvalidated),
+										        topCAddr, topCCnt, topFAddr, topFCnt);
+									}
+									if(mtvu)
+									{
+										fprintf(out, "mtvu: work=%.2f syncW=%.2f syncs=%.1f(vb=%.1f,v1r=%.1f,gr=%.1f,vm=%.1f,gs=%.1f,o=%.1f) pkt(v1=%.0f,g=%.0f) zc(v1=%.0fKB,g=%.0fKB,f=%u)",
+										        static_cast<double>(ws.workerBusyNs) * inv,
+										        static_cast<double>(ws.syncWaitNs) * inv,
+										        ws.syncs / f,
+										        ws.syncByReason[0] / f, ws.syncByReason[1] / f, ws.syncByReason[2] / f,
+										        ws.syncByReason[3] / f, ws.syncByReason[4] / f, ws.syncByReason[5] / f,
+										        ws.vif1Packets / f, ws.gifPackets / f,
+										        static_cast<double>(ws.zcVif1Bytes) / (1024.0 * f),
+										        static_cast<double>(ws.zcGifBytes) / (1024.0 * f),
+										        ws.zcFaults);
+										bool anyV1r = false;
+										for(uint32 r = 0; r < 32; r++)
+										{
+											if(ws.vif1RegSyncs[r] > 0)
+											{
+												fprintf(out, "%s%c%02X=%.1f", anyV1r ? "," : " v1r[",
+												        (r & 0x10U) ? 'W' : 'R', (r & 0xFU) << 4, ws.vif1RegSyncs[r] / f);
+												anyV1r = true;
+											}
+										}
+										if(anyV1r) fprintf(out, "]");
+										fprintf(out, " ms/f\n");
+									}
+									fclose(out);
+								}
+								{
+									static size_t s_lastMapBlocks = 0;
+									size_t curBlocks = eeExec->GetActiveBlockCount();
+									if((s_lastMapBlocks == 0) || (curBlocks >= (s_lastMapBlocks + 512)))
+									{
+										s_lastMapBlocks = curBlocks;
+										std::string mapPath = m_timingStatsPath;
+										auto slash = mapPath.find_last_of("/\\");
+										mapPath = (slash != std::string::npos) ? (mapPath.substr(0, slash + 1) + "ee-jit.map") : "ee-jit.map";
+										eeExec->DumpJitMap(mapPath.c_str());
+									}
+								}
+								m_timingEeNs = 0;
+								m_timingIopNs = 0;
+								m_timingSpuNs = 0;
+								m_timingVblankNs = 0;
+								m_timingFrames = 0;
+							}
+						}
 						m_cpuUtilisation = CPU_UTILISATION_INFO();
 					}
 					else

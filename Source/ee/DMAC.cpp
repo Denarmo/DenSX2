@@ -165,6 +165,27 @@ void CDMAC::SetChannelTransferFunction(unsigned int channel, const DmaReceiveHan
 	}
 }
 
+void CDMAC::SetChannelFastTransferFunction(unsigned int channel, Dmac::DmaFastReceiveFn fn, void* ctx)
+{
+	switch(channel)
+	{
+	case 0:
+		m_D0.SetFastReceiveHandler(fn, ctx);
+		break;
+	case 1:
+		m_D1.SetFastReceiveHandler(fn, ctx);
+		break;
+	case 2:
+		m_D2.SetFastReceiveHandler(fn, ctx);
+		break;
+	case 4:
+		m_D4.SetFastReceiveHandler(fn, ctx);
+		break;
+	default:
+		break;
+	}
+}
+
 bool CDMAC::IsInterruptPending() const
 {
 	uint16 mask = static_cast<uint16>((m_D_STAT & 0x63FF0000) >> 16);
@@ -249,30 +270,6 @@ bool CDMAC::IsDMA4Started() const
 	return (m_D4.m_CHCR.nSTR != 0) && ((m_D_ENABLE & CDMAC::ENABLE_CPND) == 0);
 }
 
-uint64 CDMAC::FetchDMATag(uint32 address)
-{
-	if(address & 0x80000000)
-	{
-		return *reinterpret_cast<uint64*>(&m_spr[address & (PS2::EE_SPR_SIZE - 1)]);
-	}
-	else
-	{
-		return *reinterpret_cast<uint64*>(&m_ram[address & (PS2::EE_RAM_SIZE - 1)]);
-	}
-}
-
-bool CDMAC::IsEndSrcTagId(uint32 tag)
-{
-	tag = ((tag >> 12) & 0x07);
-	return ((tag == CChannel::DMATAG_SRC_REFE) || (tag == CChannel::DMATAG_SRC_END));
-}
-
-bool CDMAC::IsEndDstTagId(uint32 tag)
-{
-	tag = ((tag >> 12) & 0x07);
-	return (tag == CChannel::DMATAG_DST_END);
-}
-
 uint32 CDMAC::ReceiveDMA8(uint32 nDstAddress, uint32 nCount, uint32 unused, bool nTagIncluded)
 {
 	assert(nTagIncluded == false);
@@ -321,6 +318,7 @@ uint32 CDMAC::ReceiveDMA9(uint32 nSrcAddress, uint32 nCount, uint32 unused, bool
 	}
 	else if((nSrcAddress >= PS2::VUMEM1ADDR) && (nSrcAddress < (PS2::VUMEM1ADDR + PS2::VUMEM1SIZE)))
 	{
+		if(m_onVu1Sync) m_onVu1Sync();
 		nSrcAddress -= PS2::VUMEM1ADDR;
 		nSrcAddress &= (PS2::VUMEM1SIZE - 1);
 		srcPtr = m_vuMem1;

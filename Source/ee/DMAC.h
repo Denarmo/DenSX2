@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Types.h"
+#include "../Ps2Const.h"
 #include "zip/ZipArchiveWriter.h"
 #include "zip/ZipArchiveReader.h"
 #include "Dmac_Channel.h"
@@ -113,6 +114,11 @@ public:
 	void Reset();
 
 	void SetChannelTransferFunction(unsigned int, const Dmac::DmaReceiveHandler&);
+	void SetChannelFastTransferFunction(unsigned int, Dmac::DmaFastReceiveFn, void*);
+	void SetVu1SyncCallback(std::function<void()> cb)
+	{
+		m_onVu1Sync = std::move(cb);
+	}
 
 	uint32 GetRegister(uint32);
 	void SetRegister(uint32, uint32);
@@ -132,8 +138,16 @@ public:
 	void ResumeDMA8();
 	void ResumeDMA9();
 	bool IsDMA4Started() const;
-	static bool IsEndSrcTagId(uint32);
-	static bool IsEndDstTagId(uint32);
+	static inline bool IsEndSrcTagId(uint32 tag)
+	{
+		tag = ((tag >> 12) & 0x07);
+		return ((tag == Dmac::CChannel::DMATAG_SRC_REFE) || (tag == Dmac::CChannel::DMATAG_SRC_END));
+	}
+	static inline bool IsEndDstTagId(uint32 tag)
+	{
+		tag = ((tag >> 12) & 0x07);
+		return (tag == Dmac::CChannel::DMATAG_DST_END);
+	}
 
 private:
 	enum D_CTRL_STS
@@ -178,7 +192,17 @@ private:
 	};
 	static_assert(sizeof(D_SQWC_REG) == sizeof(uint32), "Size of D_SQWC_REG struct must be 4 bytes.");
 
-	uint64 FetchDMATag(uint32);
+	inline uint64 FetchDMATag(uint32 address)
+	{
+		if(address & 0x80000000)
+		{
+			return *reinterpret_cast<const uint64*>(&m_spr[address & (PS2::EE_SPR_SIZE - 1)]);
+		}
+		else
+		{
+			return *reinterpret_cast<const uint64*>(&m_ram[address & (PS2::EE_RAM_SIZE - 1)]);
+		}
+	}
 
 	uint32 ReceiveDMA8(uint32, uint32, uint32, bool);
 	uint32 ReceiveDMA9(uint32, uint32, uint32, bool);
@@ -229,4 +253,5 @@ private:
 
 	Dmac::DmaReceiveHandler m_receiveDma5;
 	Dmac::DmaReceiveHandler m_receiveDma6;
+	std::function<void()> m_onVu1Sync;
 };

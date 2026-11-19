@@ -105,13 +105,194 @@ void CGIF::SaveState(Framework::CZipArchiveWriter& archive)
 uint32 CGIF::ProcessPacked(const uint8* memory, uint32 address, uint32 end)
 {
 	uint32 start = address;
+	uint32 loops = m_loops;
+	uint32 regs = m_regs;
+	uint32 regsTemp = m_regsTemp;
+	uint64 regList = m_regList;
+	uint32 qtemp = m_qtemp;
 
-	while((m_loops != 0) && (address < end))
+	//Fast paths for the dominant 3D vertex formats and A+D packets when aligned to a loop boundary
+	if((loops != 0) && (regsTemp == regs))
 	{
-		while((m_regsTemp != 0) && (address < end))
+		uint32 availQwords = (end - address) >> 4;
+		if((regs == 3) && ((regList & 0xFFFULL) == 0x412ULL || (regList & 0xFFFULL) == 0x512ULL))
+		{
+			//ST (2), RGBA (1), XYZF2 (4) or XYZ2 (5)
+			uint32 count = std::min(loops, availQwords / 3);
+			if(count != 0)
+			{
+				if(auto* dst = m_gs->ReserveWriteBuffer(count * 3))
+				{
+					const bool isXyzf = ((regList & 0xF00ULL) == 0x400ULL);
+					const uint8* src = memory + address;
+					for(uint32 i = 0; i < count; i++, src += 0x30)
+					{
+						uint128 p0 = *reinterpret_cast<const uint128*>(src + 0x00);
+						uint128 p1 = *reinterpret_cast<const uint128*>(src + 0x10);
+						uint128 p2 = *reinterpret_cast<const uint128*>(src + 0x20);
+						qtemp = p0.nV2;
+						dst[0] = CGSHandler::RegisterWrite(GS_REG_ST, p0.nD0);
+						uint64 rgbaq = (p1.nV[0] & 0xFF) | ((p1.nV[1] & 0xFF) << 8) | ((p1.nV[2] & 0xFF) << 16) | ((p1.nV[3] & 0xFF) << 24) | (static_cast<uint64>(qtemp) << 32);
+						dst[1] = CGSHandler::RegisterWrite(GS_REG_RGBAQ, rgbaq);
+						if(isXyzf)
+						{
+							uint64 xyz = (p2.nV[0] & 0xFFFF) | ((p2.nV[1] & 0xFFFF) << 16) | (static_cast<uint64>(p2.nV[2] & 0x0FFFFFF0) << 28) | (static_cast<uint64>(p2.nV[3] & 0x00000FF0) << 52);
+							dst[2] = CGSHandler::RegisterWrite((p2.nV[3] & 0x8000) ? GS_REG_XYZF3 : GS_REG_XYZF2, xyz);
+						}
+						else
+						{
+							uint64 xyz = (p2.nV[0] & 0xFFFF) | ((p2.nV[1] & 0xFFFF) << 16) | (static_cast<uint64>(p2.nV[2]) << 32);
+							dst[2] = CGSHandler::RegisterWrite((p2.nV[3] & 0x8000) ? GS_REG_XYZ3 : GS_REG_XYZ2, xyz);
+						}
+						dst += 3;
+					}
+					address += count * 0x30;
+					loops -= count;
+				}
+			}
+		}
+		else if((regs == 3) && ((regList & 0xFFFULL) == 0x421ULL || (regList & 0xFFFULL) == 0x521ULL))
+		{
+			//RGBA (1), ST (2), XYZF2 (4) or XYZ2 (5)
+			uint32 count = std::min(loops, availQwords / 3);
+			if(count != 0)
+			{
+				if(auto* dst = m_gs->ReserveWriteBuffer(count * 3))
+				{
+					const bool isXyzf = ((regList & 0xF00ULL) == 0x400ULL);
+					const uint8* src = memory + address;
+					for(uint32 i = 0; i < count; i++, src += 0x30)
+					{
+						uint128 p0 = *reinterpret_cast<const uint128*>(src + 0x00);
+						uint128 p1 = *reinterpret_cast<const uint128*>(src + 0x10);
+						uint128 p2 = *reinterpret_cast<const uint128*>(src + 0x20);
+						uint64 rgbaq = (p0.nV[0] & 0xFF) | ((p0.nV[1] & 0xFF) << 8) | ((p0.nV[2] & 0xFF) << 16) | ((p0.nV[3] & 0xFF) << 24) | (static_cast<uint64>(qtemp) << 32);
+						dst[0] = CGSHandler::RegisterWrite(GS_REG_RGBAQ, rgbaq);
+						qtemp = p1.nV2;
+						dst[1] = CGSHandler::RegisterWrite(GS_REG_ST, p1.nD0);
+						if(isXyzf)
+						{
+							uint64 xyz = (p2.nV[0] & 0xFFFF) | ((p2.nV[1] & 0xFFFF) << 16) | (static_cast<uint64>(p2.nV[2] & 0x0FFFFFF0) << 28) | (static_cast<uint64>(p2.nV[3] & 0x00000FF0) << 52);
+							dst[2] = CGSHandler::RegisterWrite((p2.nV[3] & 0x8000) ? GS_REG_XYZF3 : GS_REG_XYZF2, xyz);
+						}
+						else
+						{
+							uint64 xyz = (p2.nV[0] & 0xFFFF) | ((p2.nV[1] & 0xFFFF) << 16) | (static_cast<uint64>(p2.nV[2]) << 32);
+							dst[2] = CGSHandler::RegisterWrite((p2.nV[3] & 0x8000) ? GS_REG_XYZ3 : GS_REG_XYZ2, xyz);
+						}
+						dst += 3;
+					}
+					address += count * 0x30;
+					loops -= count;
+				}
+			}
+		}
+		else if((regs == 3) && ((regList & 0xFFFULL) == 0x413ULL || (regList & 0xFFFULL) == 0x513ULL))
+		{
+			//UV (3), RGBA (1), XYZF2 (4) or XYZ2 (5)
+			uint32 count = std::min(loops, availQwords / 3);
+			if(count != 0)
+			{
+				if(auto* dst = m_gs->ReserveWriteBuffer(count * 3))
+				{
+					const bool isXyzf = ((regList & 0xF00ULL) == 0x400ULL);
+					const uint8* src = memory + address;
+					const uint64 qHi = static_cast<uint64>(qtemp) << 32;
+					for(uint32 i = 0; i < count; i++, src += 0x30)
+					{
+						uint128 p0 = *reinterpret_cast<const uint128*>(src + 0x00);
+						uint128 p1 = *reinterpret_cast<const uint128*>(src + 0x10);
+						uint128 p2 = *reinterpret_cast<const uint128*>(src + 0x20);
+						uint64 uv = (p0.nV[0] & 0x7FFF) | ((p0.nV[1] & 0x7FFF) << 16);
+						dst[0] = CGSHandler::RegisterWrite(GS_REG_UV, uv);
+						uint64 rgbaq = (p1.nV[0] & 0xFF) | ((p1.nV[1] & 0xFF) << 8) | ((p1.nV[2] & 0xFF) << 16) | ((p1.nV[3] & 0xFF) << 24) | qHi;
+						dst[1] = CGSHandler::RegisterWrite(GS_REG_RGBAQ, rgbaq);
+						if(isXyzf)
+						{
+							uint64 xyz = (p2.nV[0] & 0xFFFF) | ((p2.nV[1] & 0xFFFF) << 16) | (static_cast<uint64>(p2.nV[2] & 0x0FFFFFF0) << 28) | (static_cast<uint64>(p2.nV[3] & 0x00000FF0) << 52);
+							dst[2] = CGSHandler::RegisterWrite((p2.nV[3] & 0x8000) ? GS_REG_XYZF3 : GS_REG_XYZF2, xyz);
+						}
+						else
+						{
+							uint64 xyz = (p2.nV[0] & 0xFFFF) | ((p2.nV[1] & 0xFFFF) << 16) | (static_cast<uint64>(p2.nV[2]) << 32);
+							dst[2] = CGSHandler::RegisterWrite((p2.nV[3] & 0x8000) ? GS_REG_XYZ3 : GS_REG_XYZ2, xyz);
+						}
+						dst += 3;
+					}
+					address += count * 0x30;
+					loops -= count;
+				}
+			}
+		}
+		else if((regs == 2) && ((regList & 0xFFULL) == 0x41ULL || (regList & 0xFFULL) == 0x51ULL))
+		{
+			//RGBA (1), XYZF2 (4) or XYZ2 (5)
+			uint32 count = std::min(loops, availQwords / 2);
+			if(count != 0)
+			{
+				if(auto* dst = m_gs->ReserveWriteBuffer(count * 2))
+				{
+					const bool isXyzf = ((regList & 0xF0ULL) == 0x40ULL);
+					const uint8* src = memory + address;
+					const uint64 qHi = static_cast<uint64>(qtemp) << 32;
+					for(uint32 i = 0; i < count; i++, src += 0x20)
+					{
+						uint128 p1 = *reinterpret_cast<const uint128*>(src + 0x00);
+						uint128 p2 = *reinterpret_cast<const uint128*>(src + 0x10);
+						uint64 rgbaq = (p1.nV[0] & 0xFF) | ((p1.nV[1] & 0xFF) << 8) | ((p1.nV[2] & 0xFF) << 16) | ((p1.nV[3] & 0xFF) << 24) | qHi;
+						dst[0] = CGSHandler::RegisterWrite(GS_REG_RGBAQ, rgbaq);
+						if(isXyzf)
+						{
+							uint64 xyz = (p2.nV[0] & 0xFFFF) | ((p2.nV[1] & 0xFFFF) << 16) | (static_cast<uint64>(p2.nV[2] & 0x0FFFFFF0) << 28) | (static_cast<uint64>(p2.nV[3] & 0x00000FF0) << 52);
+							dst[1] = CGSHandler::RegisterWrite((p2.nV[3] & 0x8000) ? GS_REG_XYZF3 : GS_REG_XYZF2, xyz);
+						}
+						else
+						{
+							uint64 xyz = (p2.nV[0] & 0xFFFF) | ((p2.nV[1] & 0xFFFF) << 16) | (static_cast<uint64>(p2.nV[2]) << 32);
+							dst[1] = CGSHandler::RegisterWrite((p2.nV[3] & 0x8000) ? GS_REG_XYZ3 : GS_REG_XYZ2, xyz);
+						}
+						dst += 2;
+					}
+					address += count * 0x20;
+					loops -= count;
+				}
+			}
+		}
+		else if((regs == 1) && ((regList & 0xFULL) == 0xEULL))
+		{
+			//A + D
+			uint32 count = std::min(loops, availQwords);
+			const uint8* src = memory + address;
+			for(uint32 i = 0; i < count; i++, src += 0x10)
+			{
+				uint128 packet = *reinterpret_cast<const uint128*>(src);
+				uint8 reg = static_cast<uint8>(packet.nD1);
+				if(reg == GS_REG_SIGNAL)
+				{
+					auto csr = m_gs->ReadPrivRegister(CGSHandler::GS_CSR);
+					if((m_signalState == SIGNAL_STATE_ENCOUNTERED) || ((csr & CGSHandler::CSR_SIGNAL_EVENT) != 0))
+					{
+						m_signalState = SIGNAL_STATE_PENDING;
+						m_loops = loops - i;
+						m_regsTemp = regs;
+						m_qtemp = qtemp;
+						return (address + i * 0x10) - start;
+					}
+					m_signalState = SIGNAL_STATE_ENCOUNTERED;
+				}
+				m_gs->WriteRegister(CGSHandler::RegisterWrite(reg, packet.nD0));
+			}
+			address += count * 0x10;
+			loops -= count;
+		}
+	}
+
+	while((loops != 0) && (address < end))
+	{
+		while((regsTemp != 0) && (address < end))
 		{
 			uint64 temp = 0;
-			uint32 regDesc = (uint32)((m_regList >> ((m_regs - m_regsTemp) * 4)) & 0x0F);
+			uint32 regDesc = (uint32)((regList >> ((regs - regsTemp) * 4)) & 0x0F);
 
 			uint128 packet = *reinterpret_cast<const uint128*>(memory + address);
 
@@ -127,12 +308,12 @@ uint32 CGIF::ProcessPacked(const uint8* memory, uint32 address, uint32 end)
 				temp |= (packet.nV[1] & 0xFF) << 8;
 				temp |= (packet.nV[2] & 0xFF) << 16;
 				temp |= (packet.nV[3] & 0xFF) << 24;
-				temp |= ((uint64)m_qtemp << 32);
+				temp |= ((uint64)qtemp << 32);
 				m_gs->WriteRegister(CGSHandler::RegisterWrite(GS_REG_RGBAQ, temp));
 				break;
 			case 0x02:
 				//ST
-				m_qtemp = packet.nV2;
+				qtemp = packet.nV2;
 				m_gs->WriteRegister(CGSHandler::RegisterWrite(GS_REG_ST, packet.nD0));
 				break;
 			case 0x03:
@@ -206,6 +387,9 @@ uint32 CGIF::ProcessPacked(const uint8* memory, uint32 address, uint32 end)
 						{
 							//If there is, we need to wait for previous signal to be cleared
 							m_signalState = SIGNAL_STATE_PENDING;
+							m_loops = loops;
+							m_regsTemp = regsTemp;
+							m_qtemp = qtemp;
 							return address - start;
 						}
 						m_signalState = SIGNAL_STATE_ENCOUNTERED;
@@ -222,16 +406,19 @@ uint32 CGIF::ProcessPacked(const uint8* memory, uint32 address, uint32 end)
 			}
 
 			address += 0x10;
-			m_regsTemp--;
+			regsTemp--;
 		}
 
-		if(m_regsTemp == 0)
+		if(regsTemp == 0)
 		{
-			m_loops--;
-			m_regsTemp = m_regs;
+			loops--;
+			regsTemp = regs;
 		}
 	}
 
+	m_loops = loops;
+	m_regsTemp = regsTemp;
+	m_qtemp = qtemp;
 	return address - start;
 }
 
@@ -271,8 +458,8 @@ uint32 CGIF::ProcessRegList(const uint8* memory, uint32 address, uint32 end)
 
 uint32 CGIF::ProcessImage(const uint8* memory, uint32 memorySize, uint32 address, uint32 end)
 {
-	uint16 totalLoops = static_cast<uint16>((end - address) / 0x10);
-	totalLoops = std::min<uint16>(totalLoops, m_loops);
+	uint32 availLoops = (end - address) / 0x10;
+	uint16 totalLoops = static_cast<uint16>(std::min<uint32>(availLoops, m_loops));
 
 	//Some games like Dark Cloud 2 will execute a huge transfer that goes over the RAM size's limit
 	//In that case, we split the transfer in half
@@ -534,9 +721,49 @@ uint32 CGIF::ReceiveDMA(uint32 address, uint32 qwc, uint32 unused, bool tagInclu
 	return (address - start) / 0x10;
 }
 
+uint32 CGIF::ProcessPath3Buffer(const uint8* data, uint32 size)
+{
+	bool canProcessPath3 = (m_activePath == 0) || (m_activePath == 3);
+	if(canProcessPath3 && (m_fifoIndex != 0))
+	{
+		DrainFifo();
+	}
+	if(m_fifoIndex != 0)
+	{
+		return 0;
+	}
+	if(!canProcessPath3)
+	{
+		if((size + m_fifoIndex) <= FIFO_SIZE)
+		{
+			memcpy(m_fifoBuffer + m_fifoIndex, data, size);
+			m_fifoIndex += size;
+			return size;
+		}
+		return 0;
+	}
+	return ProcessMultiplePackets(data, size, 0, size, CGsPacketMetadata(3));
+}
+
+uint32 CGIF::ProcessOneMaskedPath3Packet(const uint8* data, uint32 size)
+{
+	if(m_activePath != 0)
+	{
+		return 0;
+	}
+	m_maskedPath3XferState = MASKED_PATH3_XFER_PROCESSING;
+	uint32 consumed = ProcessPath3Buffer(data, size);
+	m_maskedPath3XferState = MASKED_PATH3_XFER_NONE;
+	return consumed;
+}
+
 void CGIF::CountTicks(uint32 cycles)
 {
-	m_path3XferActiveTicks = std::max<int32>(m_path3XferActiveTicks - cycles, 0);
+	int32 ticks = m_path3XferActiveTicks.load(std::memory_order_relaxed);
+	if(ticks > 0)
+	{
+		m_path3XferActiveTicks.store(std::max<int32>(ticks - static_cast<int32>(cycles), 0), std::memory_order_relaxed);
+	}
 }
 
 uint32 CGIF::GetRegister(uint32 address)
@@ -613,12 +840,19 @@ void CGIF::SetPath3Masked(bool masked)
 	m_path3Masked = masked;
 	if(unmasking)
 	{
-		assert(m_activePath == 0);
-		assert(m_maskedPath3XferState == MASKED_PATH3_XFER_NONE);
-		m_maskedPath3XferState = MASKED_PATH3_XFER_PROCESSING;
-		m_dmac.ResumeDMA2();
-		assert(m_activePath == 0);
-		m_maskedPath3XferState = MASKED_PATH3_XFER_NONE;
+		if(m_onPath3Unmasked)
+		{
+			m_onPath3Unmasked();
+		}
+		else
+		{
+			assert(m_activePath == 0);
+			assert(m_maskedPath3XferState == MASKED_PATH3_XFER_NONE);
+			m_maskedPath3XferState = MASKED_PATH3_XFER_PROCESSING;
+			m_dmac.ResumeDMA2();
+			assert(m_activePath == 0);
+			m_maskedPath3XferState = MASKED_PATH3_XFER_NONE;
+		}
 	}
 }
 

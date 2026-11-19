@@ -252,14 +252,18 @@ void CVif::SetRegister(uint32 address, uint32 value)
 
 void CVif::CountTicks(uint32 ticks)
 {
-	if(m_interruptDelayTicks != 0)
+	int32 delay = m_interruptDelayTicks.load(std::memory_order_acquire);
+	if(delay != 0)
 	{
-		m_interruptDelayTicks -= ticks;
-		if(m_interruptDelayTicks <= 0)
+		delay -= static_cast<int32>(ticks);
+		if(delay <= 0)
 		{
-			assert(m_STAT.nINT);
 			m_intc.AssertLine(CINTC::INTC_LINE_VIF0 + m_number);
-			m_interruptDelayTicks = 0;
+			m_interruptDelayTicks.store(0, std::memory_order_release);
+		}
+		else
+		{
+			m_interruptDelayTicks.store(delay, std::memory_order_release);
 		}
 	}
 }
@@ -377,6 +381,19 @@ uint32 CVif::ReceiveDMA(uint32 address, uint32 qwc, uint32 unused, bool tagInclu
 	remainingSize /= 0x10;
 
 	return qwc - remainingSize;
+}
+
+uint32 CVif::ProcessBuffer(uint8* data, uint32 size, bool tagIncluded)
+{
+	if(m_STAT.nVEW && !m_vpu.IsVuReady())
+	{
+		return 0;
+	}
+	m_stream.SetBufferParams(data, size, tagIncluded);
+	ProcessPacket(m_stream);
+	uint32 remainingSize = m_stream.GetRemainingDmaTransferSize();
+	assert((remainingSize & 0x0F) == 0);
+	return size - remainingSize;
 }
 
 bool CVif::IsWaitingForProgramEnd() const
@@ -1004,6 +1021,16 @@ void CVif::CFifoStream::SetFifoParams(uint8* source, uint32 size)
 	m_nextAddress = 0;
 	m_endAddress = size;
 	m_tagIncluded = false;
+	SyncBuffer();
+}
+
+void CVif::CFifoStream::SetBufferParams(uint8* source, uint32 size, bool tagIncluded)
+{
+	m_source = source;
+	m_startAddress = 0;
+	m_nextAddress = 0;
+	m_endAddress = size;
+	m_tagIncluded = tagIncluded;
 	SyncBuffer();
 }
 

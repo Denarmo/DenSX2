@@ -144,6 +144,12 @@ public:
 		return result;
 	}
 
+	inline void* FindCodeAt(uint32 address) const
+	{
+		void* code = m_codeTable[address >> SUBTABLE_BITS][(address & SUBTABLE_MASK) / INSTRUCTION_SIZE];
+		return (code != m_emptyCode) ? code : reinterpret_cast<void*>(m_emptyBlock->GetCode());
+	}
+
 private:
 	enum
 	{

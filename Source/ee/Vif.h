@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <climits>
 #include <cstring>
 #include "Types.h"
@@ -13,6 +14,9 @@
 
 #ifdef FRAMEWORK_SIMD_USE_SSE
 #include <emmintrin.h>
+#endif
+#if defined(__aarch64__)
+#include <arm_neon.h>
 #endif
 
 #ifdef _MSC_VER
@@ -80,8 +84,13 @@ public:
 	virtual uint32 GetITOP() const;
 
 	virtual uint32 ReceiveDMA(uint32, uint32, uint32, bool);
+	uint32 ProcessBuffer(uint8*, uint32, bool);
 
 	bool IsWaitingForProgramEnd() const;
+	bool IsStalled() const
+	{
+		return (m_STAT.nVEW != 0) || (m_STAT.nVIS != 0);
+	}
 
 protected:
 	enum
@@ -209,10 +218,43 @@ protected:
 			return !m_tagIncluded && ((m_bufferPosition == 0) || (m_bufferPosition == BUFFERSIZE));
 		}
 
+		//Whether the next bytes at any buffer position can be read in place with GetDirectPointer and AdvanceBytes.
+		inline bool CanReadDirectAny() const
+		{
+			return !m_tagIncluded && (m_source != nullptr) &&
+			       ((m_bufferPosition == BUFFERSIZE) || ((m_nextAddress - m_startAddress) >= BUFFERSIZE));
+		}
+
+		inline void AdvanceBytes(uint32 size)
+		{
+			assert(!m_tagIncluded);
+			uint32 availInBuf = BUFFERSIZE - m_bufferPosition;
+			if(size <= availInBuf)
+			{
+				m_bufferPosition += size;
+				return;
+			}
+			size -= availInBuf;
+			m_nextAddress += (size & ~(BUFFERSIZE - 1U));
+			uint32 rem = size & (BUFFERSIZE - 1U);
+			if(rem != 0)
+			{
+				assert(m_nextAddress < m_endAddress);
+				m_buffer = *reinterpret_cast<uint128*>(&m_source[m_nextAddress]);
+				m_nextAddress += BUFFERSIZE;
+				m_bufferPosition = rem;
+			}
+			else
+			{
+				m_bufferPosition = BUFFERSIZE;
+			}
+		}
+
 		void Flush();
 		inline void Align32();
 		void SetDmaParams(uint32, uint32, bool);
 		void SetFifoParams(uint8*, uint32);
+		void SetBufferParams(uint8*, uint32, bool);
 
 		uint8* GetDirectPointer() const;
 		void Advance(uint32);
@@ -567,20 +609,227 @@ protected:
 
 		while(currentNum != 0)
 		{
-			if constexpr((dataType == 0x0C) && !useMask && (mode == 0) && clGreaterEqualWl)
+			if constexpr(((dataType == 0x08) || (dataType == 0x09) || (dataType == 0x0A) ||
+			              (dataType == 0x0C) || (dataType == 0x0D) || (dataType == 0x0E)) &&
+			             !useMask && (mode == 0) && clGreaterEqualWl)
 			{
-				//V4-32 written as read: copy the vectors straight from the stream.
-				if((cl == wl) && stream.CanReadDirect())
+				const bool contiguous = (cl == wl) || (cl == 0);
+				const bool strided = !contiguous && (wl == 1) && (cl > 1) && (m_readTick == 0);
+				if((contiguous || strided) && stream.CanReadDirectAny())
 				{
-					uint32 count = std::min<uint32>(currentNum, stream.GetAvailableReadBytes() / 0x10);
-					count = std::min<uint32>(count, (vuMemSize - nDstAddr) / 0x10);
-					if(count == 0) break;
-					memcpy(vuMem + nDstAddr, stream.GetDirectPointer(), count * 0x10);
-					stream.Advance(count * 0x10);
-					currentNum -= count;
-					m_writeTick = m_readTick = (m_writeTick + count) % cl;
-					nDstAddr = (nDstAddr + (count * 0x10)) & (vuMemSize - 1);
-					continue;
+					constexpr uint32 elemBytes =
+					    (dataType == 0x0C) ? 16 :
+					    (dataType == 0x08) ? 12 :
+					    (dataType == 0x0D) ? 8 :
+					    (dataType == 0x09) ? 6 :
+					    (dataType == 0x0E) ? 4 : 3;
+					const uint32 dstStride = contiguous ? 0x10U : (cl * 0x10U);
+					//For strided writes leave the last vector to the generic loop so m_readTick/m_writeTick match on exit.
+					uint32 maxCount = contiguous ? currentNum : (currentNum > 1 ? currentNum - 1 : 0);
+					uint32 count = std::min<uint32>(maxCount, stream.GetAvailableReadBytes() / elemBytes);
+					if(contiguous)
+					{
+						count = std::min<uint32>(count, (vuMemSize - nDstAddr) / 0x10U);
+					}
+					else if(dstStride <= vuMemSize)
+					{
+						count = std::min<uint32>(count, (vuMemSize - nDstAddr) / dstStride);
+					}
+					else
+					{
+						count = 0;
+					}
+					if(count != 0)
+					{
+						const uint8* src = stream.GetDirectPointer();
+						uint8* dst = vuMem + nDstAddr;
+						if constexpr(dataType == 0x0C)
+						{
+							if(contiguous)
+							{
+								memcpy(dst, src, count * 0x10U);
+							}
+							else
+							{
+								for(uint32 i = 0; i < count; i++, src += 16, dst += dstStride)
+								{
+									memcpy(dst, src, 16);
+								}
+							}
+						}
+						else if constexpr(dataType == 0x08)
+						{
+							for(uint32 i = 0; i < count; i++, src += 12, dst += dstStride)
+							{
+								memcpy(dst, src, 12);
+								reinterpret_cast<uint32*>(dst)[3] = 0;
+							}
+						}
+						else if constexpr(dataType == 0x0D)
+						{
+							uint32 i = 0;
+#if defined(__aarch64__)
+							for(; (i + 1) < count; i += 2, src += 16, dst += dstStride * 2)
+							{
+								if constexpr(usn)
+								{
+									uint16x8_t v = vld1q_u16(reinterpret_cast<const uint16*>(src));
+									vst1q_u32(reinterpret_cast<uint32*>(dst), vmovl_u16(vget_low_u16(v)));
+									vst1q_u32(reinterpret_cast<uint32*>(dst + dstStride), vmovl_high_u16(v));
+								}
+								else
+								{
+									int16x8_t v = vld1q_s16(reinterpret_cast<const int16*>(src));
+									vst1q_s32(reinterpret_cast<int32*>(dst), vmovl_s16(vget_low_s16(v)));
+									vst1q_s32(reinterpret_cast<int32*>(dst + dstStride), vmovl_high_s16(v));
+								}
+							}
+#endif
+							for(; i < count; i++, src += 8, dst += dstStride)
+							{
+#if defined(__aarch64__)
+								if constexpr(usn)
+								{
+									uint16x4_t v = vld1_u16(reinterpret_cast<const uint16*>(src));
+									vst1q_u32(reinterpret_cast<uint32*>(dst), vmovl_u16(v));
+								}
+								else
+								{
+									int16x4_t v = vld1_s16(reinterpret_cast<const int16*>(src));
+									vst1q_s32(reinterpret_cast<int32*>(dst), vmovl_s16(v));
+								}
+#else
+								uint32* out = reinterpret_cast<uint32*>(dst);
+								uint16 in[4];
+								memcpy(in, src, 8);
+								if constexpr(usn)
+								{
+									out[0] = in[0];
+									out[1] = in[1];
+									out[2] = in[2];
+									out[3] = in[3];
+								}
+								else
+								{
+									out[0] = static_cast<uint32>(static_cast<int32>(static_cast<int16>(in[0])));
+									out[1] = static_cast<uint32>(static_cast<int32>(static_cast<int16>(in[1])));
+									out[2] = static_cast<uint32>(static_cast<int32>(static_cast<int16>(in[2])));
+									out[3] = static_cast<uint32>(static_cast<int32>(static_cast<int16>(in[3])));
+								}
+#endif
+							}
+						}
+						else if constexpr(dataType == 0x09)
+						{
+							for(uint32 i = 0; i < count; i++, src += 6, dst += dstStride)
+							{
+								uint32* out = reinterpret_cast<uint32*>(dst);
+								uint16 in[3];
+								memcpy(in, src, 6);
+								if constexpr(usn)
+								{
+									out[0] = in[0];
+									out[1] = in[1];
+									out[2] = in[2];
+								}
+								else
+								{
+									out[0] = static_cast<uint32>(static_cast<int32>(static_cast<int16>(in[0])));
+									out[1] = static_cast<uint32>(static_cast<int32>(static_cast<int16>(in[1])));
+									out[2] = static_cast<uint32>(static_cast<int32>(static_cast<int16>(in[2])));
+								}
+								out[3] = 0;
+							}
+						}
+						else if constexpr(dataType == 0x0E)
+						{
+							uint32 i = 0;
+#if defined(__aarch64__)
+							for(; (i + 3) < count; i += 4, src += 16, dst += dstStride * 4)
+							{
+								if constexpr(usn)
+								{
+									uint8x16_t b = vld1q_u8(src);
+									uint16x8_t h0 = vmovl_u8(vget_low_u8(b));
+									uint16x8_t h1 = vmovl_high_u8(b);
+									vst1q_u32(reinterpret_cast<uint32*>(dst), vmovl_u16(vget_low_u16(h0)));
+									vst1q_u32(reinterpret_cast<uint32*>(dst + dstStride), vmovl_high_u16(h0));
+									vst1q_u32(reinterpret_cast<uint32*>(dst + dstStride * 2), vmovl_u16(vget_low_u16(h1)));
+									vst1q_u32(reinterpret_cast<uint32*>(dst + dstStride * 3), vmovl_high_u16(h1));
+								}
+								else
+								{
+									int8x16_t b = vld1q_s8(reinterpret_cast<const int8*>(src));
+									int16x8_t h0 = vmovl_s8(vget_low_s8(b));
+									int16x8_t h1 = vmovl_high_s8(b);
+									vst1q_s32(reinterpret_cast<int32*>(dst), vmovl_s16(vget_low_s16(h0)));
+									vst1q_s32(reinterpret_cast<int32*>(dst + dstStride), vmovl_high_s16(h0));
+									vst1q_s32(reinterpret_cast<int32*>(dst + dstStride * 2), vmovl_s16(vget_low_s16(h1)));
+									vst1q_s32(reinterpret_cast<int32*>(dst + dstStride * 3), vmovl_high_s16(h1));
+								}
+							}
+#endif
+							for(; i < count; i++, src += 4, dst += dstStride)
+							{
+								uint32* out = reinterpret_cast<uint32*>(dst);
+								if constexpr(usn)
+								{
+									out[0] = src[0];
+									out[1] = src[1];
+									out[2] = src[2];
+									out[3] = src[3];
+								}
+								else
+								{
+									const int8* in = reinterpret_cast<const int8*>(src);
+									out[0] = static_cast<uint32>(static_cast<int32>(in[0]));
+									out[1] = static_cast<uint32>(static_cast<int32>(in[1]));
+									out[2] = static_cast<uint32>(static_cast<int32>(in[2]));
+									out[3] = static_cast<uint32>(static_cast<int32>(in[3]));
+								}
+							}
+						}
+						else if constexpr(dataType == 0x0A)
+						{
+							for(uint32 i = 0; i < count; i++, src += 3, dst += dstStride)
+							{
+								uint32* out = reinterpret_cast<uint32*>(dst);
+								if constexpr(usn)
+								{
+									out[0] = src[0];
+									out[1] = src[1];
+									out[2] = src[2];
+								}
+								else
+								{
+									const int8* in = reinterpret_cast<const int8*>(src);
+									out[0] = static_cast<uint32>(static_cast<int32>(in[0]));
+									out[1] = static_cast<uint32>(static_cast<int32>(in[1]));
+									out[2] = static_cast<uint32>(static_cast<int32>(in[2]));
+								}
+								out[3] = 0;
+							}
+						}
+						stream.AdvanceBytes(count * elemBytes);
+						currentNum -= count;
+						if(contiguous)
+						{
+							if(cl != 0)
+							{
+								m_writeTick = m_readTick = (m_writeTick + count) % cl;
+							}
+							else
+							{
+								m_writeTick = std::min<uint32>(m_writeTick + count, wl);
+							}
+						}
+						nDstAddr = (nDstAddr + (count * dstStride)) & (vuMemSize - 1);
+						continue;
+					}
+					else if(contiguous && (stream.GetAvailableReadBytes() < elemBytes))
+					{
+						break;
+					}
 				}
 			}
 
@@ -749,7 +998,7 @@ protected:
 	uint32 m_writeTick;
 	uint32 m_pendingMicroProgram;
 	uint32 m_incomingFifoDelay;
-	int32 m_interruptDelayTicks;
+	std::atomic<int32> m_interruptDelayTicks{0};
 
 	CProfiler::ZoneHandle m_vifProfilerZone = 0;
 };

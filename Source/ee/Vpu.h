@@ -90,6 +90,11 @@ public:
 
 	void ProcessXgKick(uint32);
 
+	static void SetTimingStatsEnabled(bool enabled) { m_timingStatsEnabled = enabled; }
+	static uint64 TakeVu1ExecNs() { uint64 v = m_vu1ExecNs; m_vu1ExecNs = 0; return v; }
+	static uint64 TakeVu1XgKickNs() { uint64 v = m_vu1XgKickNs; m_vu1XgKickNs = 0; return v; }
+	static uint32 TakeVu1MicroPrograms() { uint32 v = m_vu1MicroPrograms; m_vu1MicroPrograms = 0; return v; }
+
 #ifdef DEBUGGER_INCLUDED
 	void SaveMiniState();
 	const MIPSSTATE& GetVuMiniState() const;
@@ -98,6 +103,21 @@ public:
 	uint32 GetVuTopMiniState() const;
 	uint32 GetVuItopMiniState() const;
 #endif
+
+	typedef void (*StateChangedCallback)(void*, VU_STATE);
+	typedef void (*InterruptCallback)(void*);
+
+	void SetStateChangedCallback(StateChangedCallback cb, void* ctx)
+	{
+		m_stateChangedCallback = cb;
+		m_stateChangedCtx = ctx;
+	}
+
+	void SetInterruptCallback(InterruptCallback cb, void* ctx)
+	{
+		m_interruptCallback = cb;
+		m_interruptCtx = ctx;
+	}
 
 	VuStateChangedEvent VuStateChanged;
 	VuInterruptTriggeredEvent VuInterruptTriggered;
@@ -118,6 +138,10 @@ protected:
 	uint8* m_microMem = nullptr;
 	uint32 m_microMemSize = 0;
 	uint8* m_vuMem = nullptr;
+	static bool m_timingStatsEnabled;
+	static uint64 m_vu1ExecNs;
+	static uint64 m_vu1XgKickNs;
+	static uint32 m_vu1MicroPrograms;
 	uint32 m_vuMemSize = 0;
 	CMIPS* m_ctx = nullptr;
 	CGIF& m_gif;
@@ -132,6 +156,11 @@ protected:
 
 	VU_STATE m_vuState = VU_STATE_READY;
 	uint32 m_fbrst = 0;
+
+	StateChangedCallback m_stateChangedCallback = nullptr;
+	void* m_stateChangedCtx = nullptr;
+	InterruptCallback m_interruptCallback = nullptr;
+	void* m_interruptCtx = nullptr;
 
 	CProfiler::ZoneHandle m_vuProfilerZone = 0;
 };

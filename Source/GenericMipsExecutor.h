@@ -54,7 +54,24 @@ public:
 		    };
 	}
 
-	virtual ~CGenericMipsExecutor() = default;
+	virtual ~CGenericMipsExecutor()
+	{
+		if(m_blockLookup.GetCodeTable() && (m_context.m_blockCodeLookup == m_blockLookup.GetCodeTable()))
+		{
+			m_context.m_blockCodeLookup = nullptr;
+			m_context.m_blockCodeLookupMask = 0;
+		}
+	}
+
+	void EnableCodeTable()
+	{
+		if(m_context.m_fixedFrameExit && !m_blockLookup.GetCodeTable())
+		{
+			m_blockLookup.EnableCodeTable(m_context.m_fixedFrameExit);
+			m_context.m_blockCodeLookup = m_blockLookup.GetCodeTable();
+			m_context.m_blockCodeLookupMask = m_addressMask;
+		}
+	}
 
 	int Execute(int cycles) override
 	{
@@ -63,17 +80,28 @@ public:
 		m_mustBreak = false;
 		m_initQuota = cycles;
 #endif
-		while(m_context.m_State.nHasException == 0)
+		if(auto entry = m_context.m_fixedFrameEntry; entry && m_blockLookup.GetCodeTable())
 		{
-			uint32 address = m_context.m_State.nPC & m_addressMask;
-			auto block = m_blockLookup.FindBlockAt(address);
-			if(m_context.m_fixedFrameEntry)
+			while(m_context.m_State.nHasException == 0)
 			{
-				m_context.m_fixedFrameEntry(&m_context, reinterpret_cast<void*>(block->GetCode()));
+				uint32 address = m_context.m_State.nPC & m_addressMask;
+				entry(&m_context, m_blockLookup.FindCodeAt(address));
 			}
-			else
+		}
+		else if(auto entry = m_context.m_fixedFrameEntry)
+		{
+			while(m_context.m_State.nHasException == 0)
 			{
-				block->GetCode()(&m_context);
+				uint32 address = m_context.m_State.nPC & m_addressMask;
+				entry(&m_context, reinterpret_cast<void*>(m_blockLookup.FindBlockAt(address)->GetCode()));
+			}
+		}
+		else
+		{
+			while(m_context.m_State.nHasException == 0)
+			{
+				uint32 address = m_context.m_State.nPC & m_addressMask;
+				m_blockLookup.FindBlockAt(address)->GetCode()(&m_context);
 			}
 		}
 		m_context.m_State.nHasException &= ~MIPS_EXCEPTION_STATUS_QUOTADONE;
@@ -86,6 +114,31 @@ public:
 		m_breakpointsDisabledOnce = false;
 #endif
 		return m_context.m_State.cycleQuota;
+	}
+
+	size_t GetActiveBlockCount() const
+	{
+		return m_blocks.size();
+	}
+
+	void DumpJitMap(const char* path) const
+	{
+		if(!path || !*path) return;
+		FILE* f = fopen(path, "w");
+		if(!f) return;
+		for(const auto& blk : m_blocks)
+		{
+			if(!blk || blk->IsEmpty()) continue;
+			auto code = reinterpret_cast<uintptr_t>(blk->GetCode());
+			size_t sz = blk->GetCodeSize();
+			if(code && sz)
+			{
+				fprintf(f, "%llx %zx ee_0x%08X_0x%08X\n",
+				        static_cast<unsigned long long>(code), sz,
+				        blk->GetBeginAddress(), blk->GetEndAddress());
+			}
+		}
+		fclose(f);
 	}
 
 	CBasicBlock* FindBlockStartingAt(uint32 address) const
@@ -168,6 +221,7 @@ protected:
 	{
 		auto block = m_blockLookup.FindBlockAt(startAddress);
 
+		if(block->HasLinkSlot(LINK_SLOT_NEXT))
 		{
 			uint32 nextBlockAddress = (endAddress + 4) & m_addressMask;
 			const auto linkSlot = LINK_SLOT_NEXT;
@@ -180,6 +234,10 @@ protected:
 				block->LinkBlock(linkSlot, nextBlock);
 				link->second.live = true;
 			}
+		}
+		else
+		{
+			block->SetOutLink(LINK_SLOT_NEXT, std::end(m_blockOutLinks));
 		}
 
 		if((branchAddress != MIPS_INVALID_PC) && block->HasLinkSlot(LINK_SLOT_BRANCH))
@@ -316,6 +374,12 @@ protected:
 				referringBlock->UnlinkBlock(blockLink.slot);
 				blockLink.live = false;
 			}
+		}
+
+		if(!clearedBlocks.empty() && protectedBlock)
+		{
+			//Force exit from the fixed frame so any hardware-RAS return addresses into cleared callers are unwound.
+			m_context.m_State.nHasException |= MIPS_EXCEPTION_STATUS_QUOTADONE;
 		}
 
 		for(auto* clearedBlock : clearedBlocks)

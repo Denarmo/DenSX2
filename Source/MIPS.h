@@ -170,6 +170,7 @@ public:
 
 	void* m_vuMem = nullptr;
 	void** m_pageLookup = nullptr;
+	uint8* m_ramBase = nullptr;
 	//Block code by address ((address & m_blockCodeLookupMask) >> 16, then (address & 0xFFFF) / 4), set by
 	//executors that let blocks jump to dynamic targets directly.
 	void*** m_blockCodeLookup = nullptr;
