@@ -3,6 +3,7 @@
 #include <cmath>
 #include <climits>
 #include <algorithm>
+#include <vector>
 #include "string_format.h"
 #include "Log.h"
 #include "../states/RegisterStateCollectionFile.h"

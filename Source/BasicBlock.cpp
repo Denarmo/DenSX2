@@ -1,3 +1,4 @@
+#include <cstring>
 #include "BasicBlock.h"
 #include "MemStream.h"
 #include "offsetof_def.h"
